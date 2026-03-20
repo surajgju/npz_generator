@@ -1,0 +1,15 @@
+torch
+torchvision
+torchaudio
+transformers
+librosa
+numpy
+tqdm
+omegaconf
+smplx
+pyrender
+trimesh
+imageio
+matplotlib
+scipy
+opencv-python

@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--save_folder", type=str, default="./output")
     parser.add_argument("--no_visualization", action="store_true", help="Disable visualization")
     parser.add_argument("--nopytorch3d", action="store_true")
-    parser.add_argument("--model_folder", type=str, default="./emage_evaltools/smplx_models/")
+    parser.add_argument("--model_folder", type=str, default="./models/")
     args = parser.parse_args()
 
     os.makedirs(args.save_folder, exist_ok=True)

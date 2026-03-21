@@ -108,3 +108,4 @@ output/
 .Trashes
 ehthumbs.db
 Thumbs.db
+models/smplx/SMPLX_NEUTRAL.npz

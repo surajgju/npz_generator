@@ -43,22 +43,27 @@ def inference(model, motion_vq, audio_path, device, save_folder, sr, pose_fps,):
     motion_pred = motion_pred.cpu().numpy().reshape(t, -1)
     face_pred = all_pred["expression"].cpu().numpy().reshape(t, -1)
     trans_pred = all_pred["trans"].cpu().numpy().reshape(t, -1)
-    beat_format_save(os.path.join(save_folder, f"{os.path.splitext(os.path.basename(audio_path))[0]}_output.npz"),
+    # Standardize filename so render.py and visualize_web.py find it automatically
+    output_filename = os.path.join(save_folder, "intro_output.npz")
+    beat_format_save(output_filename,
                      motion_pred, upsample=30//pose_fps, expressions=face_pred, trans=trans_pred)
     return t
 
 def visualize_one(save_folder, audio_path, nopytorch3d=False, model_folder="./emage_evaltools/smplx_models/"):  
-    npz_path = os.path.join(save_folder, f"{os.path.splitext(os.path.basename(audio_path))[0]}_output.npz")
+    npz_path = os.path.join(save_folder, "intro_output.npz")
     motion_dict = np.load(npz_path, allow_pickle=True)
     if not nopytorch3d:
-        from emage_utils.npz2pose import render2d
-        v2d_face = render2d(motion_dict, (512, 512), face_only=True, remove_global=True)
-        write_video(npz_path.replace(".npz", "_2dface.mp4"), v2d_face.permute(0, 2, 3, 1), fps=30)
-        fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dface.mp4"), audio_path, npz_path.replace(".npz", "_2dface_audio.mp4"))
-        v2d_body = render2d(motion_dict, (720, 480), face_only=False, remove_global=True)
-        write_video(npz_path.replace(".npz", "_2dbody.mp4"), v2d_body.permute(0, 2, 3, 1), fps=30)
-        fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dbody.mp4"), audio_path, npz_path.replace(".npz", "_2dbody_audio.mp4"))
-    fast_render.render_one_sequence_with_face(npz_path, os.path.dirname(npz_path), audio_path, model_folder=model_folder)  
+        try:
+            from emage_utils.npz2pose import render2d
+            v2d_face = render2d(motion_dict, (512, 512), face_only=True, remove_global=True)
+            write_video(npz_path.replace(".npz", "_2dface.mp4"), v2d_face.permute(0, 2, 3, 1), fps=30)
+            fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dface.mp4"), audio_path, npz_path.replace(".npz", "_2dface_audio.mp4"))
+            v2d_body = render2d(motion_dict, (720, 480), face_only=False, remove_global=True)
+            write_video(npz_path.replace(".npz", "_2dbody.mp4"), v2d_body.permute(0, 2, 3, 1), fps=30)
+            fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dbody.mp4"), audio_path, npz_path.replace(".npz", "_2dbody_audio.mp4"))
+        except ImportError as e:
+            print(f"Skipping 2D rendering as pytorch3d is not installed: {e}")
+    fast_render.render_one_sequence_with_face(npz_path, os.path.dirname(npz_path), audio_path, model_folder=model_folder)
 
 def main():
     parser = argparse.ArgumentParser()

@@ -14,6 +14,11 @@ import trimesh
 import pyrender
 import imageio
 from PIL import Image, ImageDraw, ImageFont
+from npz_logging import setup_logging
+import logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 # ── CONFIG ───────────────────────────────────────────────────────────────
 OUTPUT_DIR    = "expr_debug"
@@ -34,11 +39,11 @@ trans       = data["trans"]             # (T, 3)
 expressions = data["expressions"]       # (T, 100)
 betas       = data["betas"][:10]
 T           = poses.shape[0]
-print(f"Total frames: {T}")
+logger.info("Total frames: %d", T)
 
 # ── SMPL-X BATCHED INFERENCE (all frames at once) ─────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+logger.info("Using device: %s", device)
 
 model = smplx.create(
     model_path="models",
@@ -54,7 +59,7 @@ trans_t = torch.tensor(trans,       dtype=torch.float32).to(device)
 expr_t  = torch.tensor(expressions, dtype=torch.float32).to(device)
 beta_t  = torch.tensor(betas,       dtype=torch.float32).unsqueeze(0).expand(T, -1).to(device)
 
-print("Running batched SMPL-X inference...")
+logger.info("Running batched SMPL-X inference...")
 t0 = time.time()
 with torch.no_grad():
     output = model(
@@ -72,7 +77,7 @@ with torch.no_grad():
 
 all_verts = output.vertices.cpu().numpy()   # (T, V, 3)
 faces     = model.faces
-print(f"✅ Inference done in {time.time() - t0:.1f}s")
+logger.info("Inference done in %.1fs", time.time() - t0)
 
 # ── PYRENDER SCENE ────────────────────────────────────────────────────────
 scene    = pyrender.Scene(ambient_light=np.array([0.3, 0.3, 0.3, 1.0]))
@@ -106,7 +111,7 @@ def render_frame(verts):
     return color
 
 # ── FULL VIDEO ────────────────────────────────────────────────────────────
-print(f"\nRendering {T} frames → {VIDEO_PATH}")
+logger.info("Rendering %d frames -> %s", T, VIDEO_PATH)
 t1 = time.time()
 
 writer = imageio.get_writer(VIDEO_PATH, fps=FPS, format="FFMPEG",
@@ -116,16 +121,16 @@ for i in range(T):
         elapsed = time.time() - t1
         fps_now = i / elapsed if elapsed > 0 else 0
         eta     = (T - i) / fps_now if fps_now > 0 else 0
-        print(f"  Frame {i}/{T}  |  {fps_now:.1f} fps  |  ETA {eta:.0f}s")
+        logger.info("Frame %d/%d | %.1f fps | ETA %.0fs", i, T, fps_now, eta)
 
     frame = render_frame(all_verts[i])
     writer.append_data(frame)
 
 writer.close()
-print(f"✅ Video saved in {time.time() - t1:.1f}s → {VIDEO_PATH}")
+logger.info("Video saved in %.1fs -> %s", time.time() - t1, VIDEO_PATH)
 
 # ── PNG OVERVIEW GRID ─────────────────────────────────────────────────────
-print(f"\nBuilding {N_SAMPLES}-frame overview grid...")
+logger.info("Building %d-frame overview grid...", N_SAMPLES)
 sample_idx = np.linspace(0, T - 1, N_SAMPLES, dtype=int)
 grid_frames = [render_frame(all_verts[i]) for i in sample_idx]
 
@@ -147,7 +152,5 @@ for j, (fi, img_arr) in enumerate(zip(sample_idx, grid_frames)):
     grid.paste(cell, (col * IMG_SIZE, row * (IMG_SIZE + LABEL_H)))
 
 grid.save(GRID_PATH)
-print(f"✅ Grid saved → {GRID_PATH}")
-print(f"\n🎬 All done!")
-print(f"   Video : {VIDEO_PATH}")
-print(f"   Grid  : {GRID_PATH}")
+logger.info("Grid saved -> %s", GRID_PATH)
+logger.info("All done. Video: %s | Grid: %s", VIDEO_PATH, GRID_PATH)

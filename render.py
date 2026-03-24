@@ -5,6 +5,11 @@ import smplx
 import trimesh
 import pyrender
 import imageio
+from npz_logging import setup_logging
+import logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 # -----------------------------
 # LOAD MOTION DATA
@@ -22,7 +27,7 @@ T = poses.shape[0]
 # LOAD SMPL-X MODEL
 # -----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+logger.info("Using device: %s", device)
 
 model = smplx.create(
     model_path="models",
@@ -36,7 +41,7 @@ model = smplx.create(
 # -------------------------------------------------------
 # PRE-COMPUTE ALL VERTICES IN ONE BATCHED FORWARD PASS
 # -------------------------------------------------------
-print(f"Running batched SMPL-X inference for {T} frames...")
+logger.info("Running batched SMPL-X inference for %d frames...", T)
 t0 = time.time()
 
 poses_t  = torch.tensor(poses, dtype=torch.float32).to(device)         # (T, 165)
@@ -60,7 +65,7 @@ with torch.no_grad():
 
 all_vertices = output.vertices.cpu().numpy()  # (T, V, 3)
 faces = model.faces
-print(f"✅ Batched inference done in {time.time() - t0:.1f}s")
+logger.info("Batched inference done in %.1fs", time.time() - t0)
 
 # -----------------------------
 # SETUP RENDERER
@@ -86,7 +91,7 @@ frames = []
 # -----------------------------
 # RENDER LOOP  (body-tracking camera)
 # -----------------------------
-print("Rendering frames...")
+logger.info("Rendering frames...")
 t1 = time.time()
 
 for i in range(T):
@@ -94,7 +99,7 @@ for i in range(T):
         elapsed = time.time() - t1
         fps_so_far = i / elapsed if elapsed > 0 else 0
         eta = (T - i) / fps_so_far if fps_so_far > 0 else 0
-        print(f"Frame {i}/{T}  |  {fps_so_far:.1f} fps  |  ETA {eta:.0f}s")
+        logger.info("Frame %d/%d | %.1f fps | ETA %.0fs", i, T, fps_so_far, eta)
 
     scene.clear()
 
@@ -117,7 +122,7 @@ for i in range(T):
     color, _ = renderer.render(scene)
     frames.append(color)
 
-print(f"✅ Render loop done in {time.time() - t1:.1f}s")
+logger.info("Render loop done in %.1fs", time.time() - t1)
 
 # -----------------------------
 # SAVE VIDEO  (MP4 via ffmpeg — much faster than GIF)
@@ -127,4 +132,4 @@ for frame in frames:
     writer.append_data(frame)
 writer.close()
 
-print("✅ Done! Saved as output.mp4")
+logger.info("Done. Saved as output.mp4")

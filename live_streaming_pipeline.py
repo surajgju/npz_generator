@@ -4,7 +4,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import librosa
-from collections import deque
+from typing import Optional, Dict
+import logging
+from npz_logging import setup_logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 # Import models
 from models.emage_audio import EmageAudioModel, EmageVQVAEConv, EmageVAEConv, EmageVQModel
@@ -15,102 +20,207 @@ try:
 except ImportError:
     sd = None
 
-class GeminiLivePipeline:
+class LiveMotionGenerator:
     """
-    A unified, streaming-ready pipeline designed to accept audio chunks 
-    (e.g., PCM/Base64 from Gemini Multimodal Live API) and generate 
-    SMPL-X coefficients on the fly in chunks.
+    Streaming-ready generator that accepts audio chunks and returns SMPL-X coefficients.
+    Models are loaded once and kept on device to avoid cold starts.
     """
-    def __init__(self, device=None, model_folder="./models/"):
+    def __init__(self, device=None, model_folder="./models/", overlap_sec: float = 0.25):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Initializing GeminiLivePipeline on {self.device}...")
-        
-        # Load VQ Models
+        logger.info("Initializing LiveMotionGenerator on %s...", self.device)
+
         face_motion_vq = EmageVQVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/face").to(self.device)
         upper_motion_vq = EmageVQVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/upper").to(self.device)
         lower_motion_vq = EmageVQVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/lower").to(self.device)
         hands_motion_vq = EmageVQVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/hands").to(self.device)
         global_motion_ae = EmageVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/global").to(self.device)
-        
+
         self.motion_vq = EmageVQModel(
-            face_model=face_motion_vq, upper_model=upper_motion_vq,
-            lower_model=lower_motion_vq, hands_model=hands_motion_vq,
-            global_model=global_motion_ae
+            face_model=face_motion_vq,
+            upper_model=upper_motion_vq,
+            lower_model=lower_motion_vq,
+            hands_model=hands_motion_vq,
+            global_model=global_motion_ae,
         ).to(self.device)
         self.motion_vq.eval()
 
-        # Load Audio Model
         self.model = EmageAudioModel.from_pretrained("H-Liu1997/emage_audio").to(self.device)
         self.model.eval()
-        
+
         self.sr = self.model.cfg.audio_sr
         self.pose_fps = self.model.cfg.pose_fps
         self.speaker_id = torch.zeros(1, 1).long().to(self.device)
-        
-        print(f"Pipeline ready. Expected Audio SR: {self.sr}, Output Pose FPS: {self.pose_fps}")
+        self.overlap_sec = float(overlap_sec)
+        self._prev_overlap: Optional[np.ndarray] = None
+        self._prev_tail_pose: Optional[np.ndarray] = None
+        self._prev_tail_expr: Optional[np.ndarray] = None
+        self._prev_tail_trans: Optional[np.ndarray] = None
+        self.target_fps = 30
 
-    def process_audio_chunk(self, audio_chunk: np.ndarray):
+        logger.info("Generator ready. Audio SR: %s, Pose FPS: %s", self.sr, self.pose_fps)
+
+    def _prepare_audio(self, audio_chunk: np.ndarray, sample_rate: int) -> np.ndarray:
+        if audio_chunk is None or len(audio_chunk) == 0:
+            return np.array([], dtype=np.float32)
+        if audio_chunk.ndim > 1:
+            audio_chunk = np.mean(audio_chunk, axis=1)
+        if audio_chunk.dtype != np.float32:
+            if np.issubdtype(audio_chunk.dtype, np.integer):
+                audio_chunk = audio_chunk.astype(np.float32) / 32768.0
+            else:
+                audio_chunk = audio_chunk.astype(np.float32)
+        if sample_rate != self.sr:
+            audio_chunk = librosa.resample(audio_chunk, orig_sr=sample_rate, target_sr=self.sr)
+        return audio_chunk
+
+    def process_audio_chunk(self, audio_chunk: np.ndarray, sample_rate: int, chunk_id: Optional[str] = None) -> Optional[Dict[str, np.ndarray]]:
         """
-        Process a chunk of audio (numpy array) into SMPL-X coefficients.
-        Args:
-            audio_chunk: 1D numpy array of audio PCM data sampled at self.sr (16000)
-        Returns:
-            dict containing:
-                - poses: (T, 165)
-                - expressions: (T, 100)
-                - trans: (T, 3)
-                - betas: (10,)
+        Convert a short audio chunk into SMPL-X coefficients.
+        Returns dict with poses/expressions/trans at 30 FPS.
         """
+        audio_chunk = self._prepare_audio(audio_chunk, sample_rate)
         if len(audio_chunk) == 0:
+            logger.warning("Chunk %s: empty audio after prepare", chunk_id)
             return None
-            
-        # Convert to tensor and add batch/channel dims
+
+        overlap_samples = int(self.overlap_sec * self.sr)
+        has_prev = self._prev_overlap is not None and len(self._prev_overlap) > 0
+        if has_prev:
+            audio_chunk = np.concatenate([self._prev_overlap, audio_chunk], axis=0)
+        logger.debug(
+            "Chunk %s: audio_len=%.3fs (samples=%d) overlap_sec=%.3f has_prev=%s",
+            chunk_id,
+            len(audio_chunk) / float(self.sr),
+            len(audio_chunk),
+            self.overlap_sec,
+            has_prev,
+        )
+
+        if overlap_samples > 0 and len(audio_chunk) >= overlap_samples:
+            self._prev_overlap = audio_chunk[-overlap_samples:].copy()
+        else:
+            self._prev_overlap = audio_chunk.copy()
+
         audio_ts = torch.from_numpy(audio_chunk).float().to(self.device).unsqueeze(0)
-        
+
         with torch.no_grad():
             trans_zero = torch.zeros(1, 1, 3).to(self.device)
             latent_dict = self.model.inference(audio_ts, self.speaker_id, self.motion_vq, masked_motion=None, mask=None)
-            
+
             face_latent = latent_dict["rec_face"] if self.model.cfg.lf > 0 and self.model.cfg.cf == 0 else None
             upper_latent = latent_dict["rec_upper"] if self.model.cfg.lu > 0 and self.model.cfg.cu == 0 else None
             hands_latent = latent_dict["rec_hands"] if self.model.cfg.lh > 0 and self.model.cfg.ch == 0 else None
             lower_latent = latent_dict["rec_lower"] if self.model.cfg.ll > 0 and self.model.cfg.cl == 0 else None
-            
+
             face_index = torch.max(F.log_softmax(latent_dict["cls_face"], dim=2), dim=2)[1] if self.model.cfg.cf > 0 else None
             upper_index = torch.max(F.log_softmax(latent_dict["cls_upper"], dim=2), dim=2)[1] if self.model.cfg.cu > 0 else None
             hands_index = torch.max(F.log_softmax(latent_dict["cls_hands"], dim=2), dim=2)[1] if self.model.cfg.ch > 0 else None
             lower_index = torch.max(F.log_softmax(latent_dict["cls_lower"], dim=2), dim=2)[1] if self.model.cfg.cl > 0 else None
 
             all_pred = self.motion_vq.decode(
-                face_latent=face_latent, upper_latent=upper_latent, 
-                lower_latent=lower_latent, hands_latent=hands_latent,
-                face_index=face_index, upper_index=upper_index, 
-                lower_index=lower_index, hands_index=hands_index,
-                get_global_motion=True, ref_trans=trans_zero[:,0]
+                face_latent=face_latent,
+                upper_latent=upper_latent,
+                lower_latent=lower_latent,
+                hands_latent=hands_latent,
+                face_index=face_index,
+                upper_index=upper_index,
+                lower_index=lower_index,
+                hands_index=hands_index,
+                get_global_motion=True,
+                ref_trans=trans_zero[:, 0],
             )
-            
-        # Extract the shapes and sequence length
+
         motion_pred = all_pred["motion_axis_angle"]
         t = motion_pred.shape[1]
-        
         motion_pred = motion_pred.cpu().numpy().reshape(t, -1)
         face_pred = all_pred["expression"].cpu().numpy().reshape(t, -1)
         trans_pred = all_pred["trans"].cpu().numpy().reshape(t, -1)
-        
-        # Upsample logic (if model output is lower FPS than target 30fps)
+
         upsample = 30 // self.pose_fps
         if upsample > 1:
             from emage_utils.motion_io import time_upsample_numpy
             motion_pred = time_upsample_numpy(motion_pred, upsample)
             face_pred = time_upsample_numpy(face_pred, upsample)
             trans_pred = time_upsample_numpy(trans_pred, upsample)
-            
+
+        overlap_frames = int(round(self.overlap_sec * self.target_fps))
+        if has_prev and overlap_frames > 0 and overlap_frames < motion_pred.shape[0]:
+            motion_pred = motion_pred[overlap_frames:]
+            face_pred = face_pred[overlap_frames:]
+            trans_pred = trans_pred[overlap_frames:]
+
+        if has_prev and overlap_frames > 0 and self._prev_tail_pose is not None:
+            k = min(overlap_frames, motion_pred.shape[0], self._prev_tail_pose.shape[0])
+            if k > 0:
+                if k > 1:
+                    alpha = np.linspace(0.0, 1.0, k, endpoint=True, dtype=np.float32).reshape(-1, 1)
+                else:
+                    alpha = np.array([[1.0]], dtype=np.float32)
+                motion_pred[:k] = self._prev_tail_pose[:k] * (1.0 - alpha) + motion_pred[:k] * alpha
+                face_pred[:k] = self._prev_tail_expr[:k] * (1.0 - alpha) + face_pred[:k] * alpha
+                trans_pred[:k] = self._prev_tail_trans[:k] * (1.0 - alpha) + trans_pred[:k] * alpha
+
+        if overlap_frames > 0 and motion_pred.shape[0] > 0:
+            tail_len = min(overlap_frames, motion_pred.shape[0])
+            self._prev_tail_pose = motion_pred[-tail_len:].copy()
+            self._prev_tail_expr = face_pred[-tail_len:].copy()
+            self._prev_tail_trans = trans_pred[-tail_len:].copy()
+
+        logger.debug(
+            "Chunk %s: output frames=%d overlap_frames=%d",
+            chunk_id,
+            int(motion_pred.shape[0]),
+            overlap_frames,
+        )
+
         return {
             "poses": motion_pred,
             "expressions": face_pred,
             "trans": trans_pred,
-            "betas": np.zeros(10) # default neutral betas
+            "betas": np.zeros(10, dtype=np.float32),
         }
+
+
+class SmplxVertexStreamer:
+    """Compute SMPL-X vertices from coefficients on the server."""
+    def __init__(self, device=None, model_path="models", gender="neutral"):
+        import smplx
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = smplx.create(
+            model_path=model_path,
+            model_type="smplx",
+            gender=gender,
+            use_pca=False,
+            num_expression_coeffs=100,
+        ).to(self.device)
+        self.faces = self.model.faces
+
+    def vertices_from_coeffs(self, poses: np.ndarray, expressions: np.ndarray, trans: np.ndarray, betas: Optional[np.ndarray] = None) -> np.ndarray:
+        if betas is None:
+            betas = np.zeros(10, dtype=np.float32)
+        T = poses.shape[0]
+        poses_t = torch.tensor(poses, dtype=torch.float32, device=self.device)
+        trans_t = torch.tensor(trans, dtype=torch.float32, device=self.device)
+        expr_t = torch.tensor(expressions, dtype=torch.float32, device=self.device)
+        beta_t = torch.tensor(betas, dtype=torch.float32, device=self.device).unsqueeze(0).expand(T, -1)
+        with torch.no_grad():
+            output = self.model(
+                betas=beta_t,
+                global_orient=poses_t[:, :3],
+                body_pose=poses_t[:, 3:66],
+                jaw_pose=poses_t[:, 66:69],
+                leye_pose=poses_t[:, 69:72],
+                reye_pose=poses_t[:, 72:75],
+                left_hand_pose=poses_t[:, 75:120],
+                right_hand_pose=poses_t[:, 120:165],
+                expression=expr_t,
+                transl=trans_t,
+            )
+        return output.vertices.detach().cpu().numpy()
+
+
+# Backward-compatible alias for older imports
+GeminiLivePipeline = LiveMotionGenerator
 
 
 def simulate_live_stream(audio_path, chunk_duration_sec=1.0):
@@ -118,14 +228,14 @@ def simulate_live_stream(audio_path, chunk_duration_sec=1.0):
     Simulates a live streaming environment by reading an audio file, 
     processing it in chunks, and queuing the generated coefficients.
     """
-    print(f"\n--- Starting Streaming Simulation for {audio_path} ---")
-    pipeline = GeminiLivePipeline()
+    logger.info("--- Starting Streaming Simulation for %s ---", audio_path)
+    pipeline = LiveMotionGenerator()
     
     # Load entire audio to simulate incoming network stream
     audio_full, sr = librosa.load(audio_path, sr=pipeline.sr)
     chunk_size = int(sr * chunk_duration_sec)
     
-    print(f"Loaded audio: {len(audio_full)/sr:.2f}s. Chunking by {chunk_duration_sec}s.")
+    logger.info("Loaded audio: %.2fs. Chunking by %.2fs.", len(audio_full) / sr, chunk_duration_sec)
     
     # Stats tracking
     total_frames = 0
@@ -133,7 +243,7 @@ def simulate_live_stream(audio_path, chunk_duration_sec=1.0):
     
     # To demonstrate live playback alongside generation
     if sd is not None:
-        print("\nSounddevice detected! Simulating synchronized playback...")
+        logger.info("Sounddevice detected. Simulating synchronized playback...")
         # Since sounddevice plays async, we write chunks to an async output stream
         stream = sd.OutputStream(samplerate=sr, channels=1)
         stream.start()
@@ -148,13 +258,13 @@ def simulate_live_stream(audio_path, chunk_duration_sec=1.0):
              
         # 1. GENERATION: Parse audio chunk -> NPZ coefficients
         gen_start = time.time()
-        coefficients = pipeline.process_audio_chunk(chunk)
+        coefficients = pipeline.process_audio_chunk(chunk, pipeline.sr, chunk_idx)
         gen_time = time.time() - gen_start
         
         num_frames = coefficients['poses'].shape[0]
         total_frames += num_frames
         
-        print(f"[Chunk {chunk_idx:03d}] Generated {num_frames} frames in {gen_time:.3f}s. (Realtime factor: {chunk_duration_sec/gen_time:.2f}x)")
+        logger.info("Chunk %03d: %d frames in %.3fs (RT factor %.2fx)", chunk_idx, num_frames, gen_time, chunk_duration_sec / gen_time)
         
         # 2. PLAYBACK (if sounddevice is installed to simulate "live" sync)
         if sd is not None:
@@ -174,9 +284,9 @@ def simulate_live_stream(audio_path, chunk_duration_sec=1.0):
         stream.stop()
         stream.close()
         
-    print(f"\n--- Simulation Complete ---")
-    print(f"Total processed frames: {total_frames}")
-    print(f"Total time elapsed: {time.time() - start_time:.2f}s")
+    logger.info("--- Simulation Complete ---")
+    logger.info("Total processed frames: %d", total_frames)
+    logger.info("Total time elapsed: %.2fs", time.time() - start_time)
 
 
 if __name__ == "__main__":
@@ -187,6 +297,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if not os.path.exists(args.audio):
-         print(f"Warning: Default audio {args.audio} not found. Please provide a valid file via --audio.")
+         logger.warning("Default audio %s not found. Provide a valid file via --audio.", args.audio)
     else:
          simulate_live_stream(args.audio, args.chunk_size)

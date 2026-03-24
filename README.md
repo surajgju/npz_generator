@@ -1,95 +1,161 @@
 # NPZ Generator 🕺
 
-A standalone tool for generating expressive 3D motion data (SMPL-X) from audio files and visualizing them interactively.
+Generate expressive SMPL‑X motion from audio, visualize offline, and run a real‑time streaming 3D avatar pipeline (Gemini Live ready).
 
 ---
 
 ## 🚀 Quick Start
 
 ### 1. Install Dependencies
-Ensure you have the required libraries installed:
 ```bash
-python3 -m pip install streamlit plotly opencv-python torch librosa tqdm smplx trimesh pyrender
+python3 -m pip install -r requirements.txt
 ```
 
-### 2. Generate Motion
-Place your audio files (mp3, wav, m4a, etc.) in the `./input` folder, then run:
+### 2. Generate Motion (Offline)
+Put audio files in `./input`, then run:
 ```bash
 python3 generate_npz.py
 ```
-*This will process the audio and save the resulting motion data to `output/intro_output.npz`.*
+This writes `output/intro_output.npz`.
 
----
-
-## 📽️ Visualization Options
-
-### Option A: Interactive Web Visualizer (Recommended)
-Explore the 3D model, rotate, zoom, and scrub through frames in your browser.
+### 3. Visualize (Offline)
+Streamlit viewer:
 ```bash
-streamlit run visualize_web.py
+python3 -m streamlit run visualize_web.py
 ```
-
-### Option B: Render to Video (MP4)
-Generate a high-quality video of the motion synced with the original audio.
+MP4 render:
 ```bash
 python3 render.py
 ```
-*Result will be saved as `output.mp4`.*
+This writes `output.mp4`.
 
 ---
 
-## ✨ Features & Defaults
+## ⚡ Real‑Time Streaming (Live Pipeline)
 
-- **Standardized Workflow**: `generate_npz.py` now automatically saves to a consistent filename (`output/intro_output.npz`) that both visualizers read by default.
-- **Smart Audio Detection**: Supports `.mp3`, `.m4a`, `.flac`, `.ogg`, and `.wav`.
-- **Automatic Configuration**: Defaults to `./input` for audio and `./output` for results.
-- **Expressive Motion**: Generates full SMPL-X data including body poses, hand movements, and facial expressions.
+This repo now includes a real‑time pipeline that:
+1. Accepts audio chunks over WebSocket.
+2. Generates SMPL‑X coefficients in chunks.
+3. Computes SMPL‑X vertices server‑side.
+4. Streams vertices to a Three.js live viewer.
+
+### Start the WebSocket Server
+```bash
+uvicorn server.app:app --reload --port 8000
+```
+
+### Open the Live Viewer
+Open:
+```
+http://localhost:8000/
+```
+
+### Stream Audio (Simulator)
+```bash
+python3 scripts/stream_audio_to_ws.py --audio input/your_audio.wav --chunk 0.5
+```
+
+### Export Faces (One‑Time)
+Three.js needs the SMPL‑X faces index list:
+```bash
+python3 scripts/export_faces.py
+```
+This writes `web/faces.json`.
+
+---
+
+## 🧠 System Architecture
+
+```mermaid
+flowchart LR
+    A["Gemini Live API (audio stream)"] -->|PCM/Base64| B["FastAPI /ws/audio"]
+    B --> C["LiveMotionGenerator (GPU)"]
+    C --> D["SMPL‑X Vertex Streamer"]
+    D -->|Float32 vertices| E["/ws/verts"]
+    E --> F["Three.js Live Viewer"]
+    C --> G["(Optional) NPZ buffer / storage"]
+
+    subgraph Offline
+        H["generate_npz.py"] --> I["output/intro_output.npz"]
+        I --> J["visualize_web.py (Streamlit)"]
+        I --> K["render.py (output.mp4)"]
+    end
+```
+
+---
+
+## 🧩 Key Components
+
+**Streaming core**
+- `live_streaming_pipeline.py`
+- `LiveMotionGenerator`: loads models once, processes audio chunks at ~30 FPS.
+- `SmplxVertexStreamer`: computes SMPL‑X vertices server‑side.
+
+**WebSocket server**
+- `server/app.py`
+- `/ws/audio` receives `{chunk_id, sr, dtype, audio_b64}`
+- `/ws/verts` streams vertex frames as binary float32 arrays
+
+**Gemini adapter (stub)**
+- `server/gemini_adapter.py`
+- `GeminiAudioBridge` formats PCM for `/ws/audio`
+
+**Live viewer**
+- `web/index.html`, `web/app.js`
+- Three.js viewer with white background and soft lighting (matches `output.mp4`)
+
+---
+
+## ✅ Visual Style (Matches `output.mp4`)
+
+The live viewer and Streamlit viewer are configured to:
+- Use a clean white background.
+- Disable axes/grids by default.
+- Use soft, front‑biased lighting.
+- Render a light gray mesh with smooth shading.
 
 ---
 
 ## 🛠️ Advanced Configuration
 
-If you need to customize paths, you can use these arguments with `generate_npz.py`:
+**Offline generation**
+- `generate_npz.py --audio_folder ./input --save_folder ./output`
+- `--no_visualization` to skip rendering during generation
+- `--model_folder ./models`
 
-- `--audio_folder`: Folder containing audio files (default: `./input`).
-- `--save_folder`: Folder for NPZ and MP4 results (default: `./output`).
-- `--no_visualization`: Skip the automatic rendering step during generation.
-- `--model_folder`: Path to SMPL-X models (default: `./models/`).
+**Streaming**
+- `LiveMotionGenerator(overlap_sec=0.25)` controls overlap smoothing
+- `stream_audio_to_ws.py --chunk 0.5` controls chunk duration
 
 ---
 
-## 🌩️ Gemini API Live Streaming Integration
+## 🌩️ Gemini Live Integration (Stub)
 
-In preparation for real-time 3D motion rendering powered by **Gemini Multimodal Live API**, a new extensible pipeline has been provided: `live_streaming_pipeline.py`.
-
-### Overview
-This script is designed to accept audio chunks (such as PCM bytes streamed from a WebRTC or WebSocket connection) and generates the SMPL-X coefficients on-the-fly, at faster-than-realtime speeds.
-
-### Usage
-Run the simulation to see chunked processing in action:
-```bash
-python3 live_streaming_pipeline.py --audio input/11_nidal_0_114_114.wav --chunk_size 2.0
-```
-
-### Implementing in your Gemini Live Server
-You can simply import the core pipeline into your backend Node/Python server where you receive Gemini's Base64/PCM streams:
-
+Real Gemini API integration is stubbed and ready to wire:
 ```python
-from live_streaming_pipeline import GeminiLivePipeline
+from server.gemini_adapter import GeminiAudioBridge
 
-# 1. Initialize once
-pipeline = GeminiLivePipeline()
-
-# 2. Inside your Gemini Live Websocket / WebRTC stream receiver...
-async def on_audio_chunk_received(pcm_chunk_bytes):
-    # Convert incoming PCM bytes to numpy float array
-    numpy_audio = ... 
-    
-    # 3. Generate SMPL-X frames exactly for that audio chunk
-    coefficients = pipeline.process_audio_chunk(numpy_audio)
-    
-    # 4. coefficients["poses"], coefficients["expressions"] are ready!
-    # Send them to your client (e.g. Three.js / Streamlit) for immediate playback
-    await websocket.send({"poses": coefficients["poses"].tolist()})
+bridge = GeminiAudioBridge(sample_rate=16000)
+payload = bridge.build_audio_payload(pcm_bytes, chunk_id="42")
+# Send payload to /ws/audio
 ```
 
+---
+
+## 🧪 Testing Checklist
+
+1. `python3 generate_npz.py` generates `output/intro_output.npz`
+2. `python3 render.py` writes `output.mp4`
+3. Streamlit viewer runs without flicker or dark artifacts
+4. `uvicorn server.app:app --reload --port 8000`
+5. `python3 scripts/stream_audio_to_ws.py --audio input/your_audio.wav --chunk 0.5`
+6. Viewer updates smoothly and matches `output.mp4` tone
+
+---
+
+## 📦 Requirements
+
+All dependencies are captured in `requirements.txt`:
+```bash
+python3 -m pip install -r requirements.txt
+```

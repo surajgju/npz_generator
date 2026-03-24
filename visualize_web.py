@@ -5,6 +5,11 @@ import smplx
 import plotly.graph_objects as go
 import time
 import os
+from npz_logging import setup_logging
+import logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="NPZ Motion Visualizer", layout="wide")
@@ -17,6 +22,7 @@ npz_path = st.sidebar.text_input("NPZ File Path", "output/intro_output.npz")
 
 if not os.path.exists(npz_path):
     st.error(f"File not found: {npz_path}")
+    logger.error("NPZ file not found: %s", npz_path)
     st.stop()
 
 @st.cache_resource
@@ -70,6 +76,7 @@ def load_and_compute_data(path):
 # --- CACHED COMPUTATION ---
 with st.spinner("Processing motion data and computing 3D mesh..."):
     all_vertices, faces, T, trans = load_and_compute_data(npz_path)
+    logger.info("Loaded NPZ %s with %d frames, %d verts", npz_path, T, all_vertices.shape[1])
 
 # Precompute global bounds for world-space view
 global_min = all_vertices.min(axis=(0, 1))
@@ -96,7 +103,7 @@ with col1:
     performance = st.selectbox(
         "Performance",
         ["Balanced", "Best quality", "Fastest"],
-        index=0
+        index=1
     )
     animate_client = st.toggle("Animate in browser", value=True)
 
@@ -118,25 +125,27 @@ def build_fig(verts, faces_display, axis_min, axis_max, pad, frames=None, frame_
             color='lightgray',
             opacity=1.0,
             flatshading=False,
-            lighting=dict(ambient=0.45, diffuse=0.9, specular=0.2, roughness=0.9),
-            lightposition=dict(x=6, y=10, z=6)
+            lighting=dict(ambient=0.6, diffuse=0.8, specular=0.1, roughness=0.95),
+            lightposition=dict(x=2.0, y=3.0, z=2.0)
         )
     ])
     fig.update_layout(
         scene=dict(
-            xaxis=dict(nticks=4, range=[axis_min[0] - pad[0], axis_max[0] + pad[0]]),
-            yaxis=dict(nticks=4, range=[axis_min[1] - pad[1], axis_max[1] + pad[1]]),
-            zaxis=dict(nticks=4, range=[axis_min[2] - pad[2], axis_max[2] + pad[2]]),
+            xaxis=dict(visible=False, showgrid=False, zeroline=False, showbackground=False, range=[axis_min[0] - pad[0], axis_max[0] + pad[0]]),
+            yaxis=dict(visible=False, showgrid=False, zeroline=False, showbackground=False, range=[axis_min[1] - pad[1], axis_max[1] + pad[1]]),
+            zaxis=dict(visible=False, showgrid=False, zeroline=False, showbackground=False, range=[axis_min[2] - pad[2], axis_max[2] + pad[2]]),
             aspectmode='data',
             dragmode='orbit',
             camera=dict(
                 up=dict(x=0, y=1, z=0),
                 eye=dict(x=1.5, y=1.0, z=1.8),
                 projection=dict(type='perspective')
-            )
+            ),
+            bgcolor="white"
         ),
         margin=dict(r=0, l=0, b=0, t=0),
-        height=700
+        height=700,
+        uirevision="static"
     )
     if frames:
         fig.frames = frames
@@ -152,7 +161,7 @@ def build_fig(verts, faces_display, axis_min, axis_max, pad, frames=None, frame_
                         "label": "Play",
                         "method": "animate",
                         "args": [None, {
-                            "frame": {"duration": frame_duration, "redraw": True},
+                            "frame": {"duration": frame_duration, "redraw": False},
                             "transition": {"duration": 0},
                             "fromcurrent": True,
                             "mode": "immediate"
@@ -184,12 +193,15 @@ def get_display_vertices(frame_i):
 if performance == "Best quality":
     face_stride = 1
     frame_stride = 1
+    max_frames = None
 elif performance == "Fastest":
     face_stride = 2
     frame_stride = 4
+    max_frames = 300
 else:
     face_stride = 1
     frame_stride = 2
+    max_frames = 300
 
 faces_display = faces[::face_stride]
 
@@ -225,8 +237,7 @@ pad = np.where(pad == 0, 0.1, pad)
 if animate_client:
     import math
     indices = list(range(frame_idx, T, frame_stride))
-    max_frames = 300
-    if len(indices) > max_frames:
+    if max_frames is not None and len(indices) > max_frames:
         step = math.ceil(len(indices) / max_frames)
         indices = indices[::step]
     frames = []

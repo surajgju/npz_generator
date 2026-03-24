@@ -12,6 +12,11 @@ from tqdm import tqdm
 from emage_utils.motion_io import beat_format_save
 from emage_utils import fast_render
 from models.emage_audio import EmageAudioModel, EmageVQVAEConv, EmageVAEConv, EmageVQModel
+from npz_logging import setup_logging
+import logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 
 def inference(model, motion_vq, audio_path, device, save_folder, sr, pose_fps,):
@@ -62,7 +67,7 @@ def visualize_one(save_folder, audio_path, nopytorch3d=False, model_folder="./em
             write_video(npz_path.replace(".npz", "_2dbody.mp4"), v2d_body.permute(0, 2, 3, 1), fps=30)
             fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dbody.mp4"), audio_path, npz_path.replace(".npz", "_2dbody_audio.mp4"))
         except ImportError as e:
-            print(f"Skipping 2D rendering as pytorch3d is not installed: {e}")
+            logger.warning("Skipping 2D rendering as pytorch3d is not installed: %s", e)
     fast_render.render_one_sequence_with_face(npz_path, os.path.dirname(npz_path), audio_path, model_folder=model_folder)
 
 def main():
@@ -103,7 +108,7 @@ def main():
         all_t += inference(model, motion_vq, audio_path, device, args.save_folder, sr, pose_fps)
         if visualization_enabled:
             visualize_one(args.save_folder, audio_path, args.nopytorch3d, model_folder=args.model_folder)
-    print(f"generate total {all_t/pose_fps:.2f} seconds motion in {time.time()-start_time:.2f} seconds")
+    logger.info("Generated %.2f seconds motion in %.2f seconds", all_t / pose_fps, time.time() - start_time)
 
 if __name__ == "__main__":
     main()

@@ -15,6 +15,11 @@ import subprocess
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from npz_logging import setup_logging
+import logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 args = {
     'render_video_fps': 30,
@@ -59,7 +64,7 @@ def create_scene_with_mesh(vertices, faces, uniform_color, pose_camera, pose_lig
 
 def do_render_one_frame(renderer, frame_idx, vertices, vertices1, faces):
     if frame_idx % 100 == 0:
-        print('processed', frame_idx, 'frames')
+        logger.info("processed %d frames", frame_idx)
     uniform_color = [220, 220, 220, 255]
     pose_camera = create_pose_camera(angle_deg=-2)
     pose_light = create_pose_light(angle_deg=-30)
@@ -72,7 +77,7 @@ def do_render_one_frame(renderer, frame_idx, vertices, vertices1, faces):
 
 def do_render_one_frame_no_gt(renderer, frame_idx, vertices, faces):
     if frame_idx % 100 == 0:
-        print('processed', frame_idx, 'frames')
+        logger.info("processed %d frames", frame_idx)
     uniform_color = [220, 220, 220, 255]
     pose_camera = create_pose_camera(angle_deg=-2)
     pose_light = create_pose_light(angle_deg=-30)
@@ -91,7 +96,7 @@ def write_images_from_queue(fig_queue, output_dir, img_filetype):
         try:
             imageio.imwrite(fn, merged_fig)
         except Exception as ex:
-            print(f"Error writing image {fn}: {ex}")
+            logger.error("Error writing image %s: %s", fn, ex)
             raise ex
 
 def write_images_from_queue_no_gt(fig_queue, output_dir, img_filetype):
@@ -104,7 +109,7 @@ def write_images_from_queue_no_gt(fig_queue, output_dir, img_filetype):
         try:
             imageio.imwrite(fn, fig1)
         except Exception as ex:
-            print(f"Error writing image {fn}: {ex}")
+            logger.error("Error writing image %s: %s", fn, ex)
             raise ex
 
 def render_frames_and_enqueue(fids, frame_vertex_pairs, faces, render_width, render_height, fig_queue):
@@ -125,7 +130,7 @@ def render_frames_and_enqueue_no_gt(fids, frame_vertex_pairs, faces, render_widt
 
 def sub_process_process_frame(subprocess_index, render_video_width, render_video_height, render_tmp_img_filetype, fids, frame_vertex_pairs, faces, output_dir):
     t0 = time.time()
-    print(f"subprocess_index={subprocess_index} begin_ts={t0}")
+    logger.info("subprocess_index=%d begin_ts=%.3f", subprocess_index, t0)
     fig_queue = queue.Queue()
     render_frames_and_enqueue(fids, frame_vertex_pairs, faces, render_video_width, render_video_height, fig_queue)
     fig_queue.put(None)
@@ -134,11 +139,11 @@ def sub_process_process_frame(subprocess_index, render_video_width, render_video
     thr.start()
     thr.join()
     t2 = time.time()
-    print(f"subprocess_index={subprocess_index} render={t1 - t0:.2f} all={t2 - t0:.2f}")
+    logger.info("subprocess_index=%d render=%.2f all=%.2f", subprocess_index, t1 - t0, t2 - t0)
 
 def sub_process_process_frame_no_gt(subprocess_index, render_video_width, render_video_height, render_tmp_img_filetype, fids, frame_vertex_pairs, faces, output_dir):
     t0 = time.time()
-    print(f"subprocess_index={subprocess_index} begin_ts={t0}")
+    logger.info("subprocess_index=%d begin_ts=%.3f", subprocess_index, t0)
     fig_queue = queue.Queue()
     render_frames_and_enqueue_no_gt(fids, frame_vertex_pairs, faces, render_video_width, render_video_height, fig_queue)
     fig_queue.put(None)
@@ -147,7 +152,7 @@ def sub_process_process_frame_no_gt(subprocess_index, render_video_width, render
     thr.start()
     thr.join()
     t2 = time.time()
-    print(f"subprocess_index={subprocess_index} render={t1 - t0:.2f} all={t2 - t0:.2f}")
+    logger.info("subprocess_index=%d render=%.2f all=%.2f", subprocess_index, t1 - t0, t2 - t0)
 
 def distribute_frames(frames, vertices_all, vertices1_all):
     sample_interval = max(1, int(30 // args['render_video_fps']))
@@ -227,17 +232,17 @@ def add_audio_to_video(silent_video_path, audio_path, output_video_path):
     ]
     try:
         subprocess.run(cmd, check=True)
-        print(f"Video with audio generated: {output_video_path}")
+        logger.info("Video with audio generated: %s", output_video_path)
     except subprocess.CalledProcessError as e:
-        print(f"Error: {e}")
+        logger.error("Error: %s", e)
 
 def convert_img_to_mp4(input_pattern, output_file, framerate=30):
     cmd = ['ffmpeg','-framerate', str(framerate),'-i', input_pattern,'-c:v','libx264','-pix_fmt','yuv420p',output_file,'-y']
     try:
         subprocess.run(cmd, check=True)
-        print(f"Video conversion: {output_file}")
+        logger.info("Video conversion: %s", output_file)
     except subprocess.CalledProcessError as e:
-        print(f"Error: {e}")
+        logger.error("Error: %s", e)
 
 def process_frame(i, vertices_all, vertices1_all, faces, output_dir, filenames):
     uniform_color = [220, 220, 220, 255]
@@ -248,7 +253,7 @@ def process_frame(i, vertices_all, vertices1_all, faces, output_dir, filenames):
     vertices1 = vertices1_all[i]
     fn = f"{output_dir}frame_{i}.png"
     if i % 100 == 0:
-        print('processed', i, 'frames')
+        logger.info("processed %d frames", i)
     angle_rad = deg_to_rad(-2)
     pose_camera = np.array([
         [1.0, 0.0, 0.0, 0.0],

@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
 
 const statusEl = document.getElementById("status");
 const bufferSecEl = document.getElementById("bufferSec");
@@ -14,6 +15,21 @@ const audioBufferEl = document.getElementById("audioBuffer");
 const playStateEl = document.getElementById("playState");
 const lodLevelEl = document.getElementById("lodLevel");
 const bufferFillEl = document.getElementById("bufferFill");
+const fitViewBtn = document.getElementById("fitView");
+const viewFaceBtn = document.getElementById("viewFace");
+const viewFrontBtn = document.getElementById("viewFront");
+const viewBackBtn = document.getElementById("viewBack");
+const viewLeftBtn = document.getElementById("viewLeft");
+const viewRightBtn = document.getElementById("viewRight");
+const viewTopBtn = document.getElementById("viewTop");
+const viewIsoBtn = document.getElementById("viewIso");
+const faceOffsetEl = document.getElementById("faceOffset");
+const faceOffsetValEl = document.getElementById("faceOffsetVal");
+const toggleGridEl = document.getElementById("toggleGrid");
+const toggleAxesEl = document.getElementById("toggleAxes");
+const toggleWireframeEl = document.getElementById("toggleWireframe");
+const toggleAutoRotateEl = document.getElementById("toggleAutoRotate");
+const toggleTranslateEl = document.getElementById("toggleTranslate");
 const enableAudioBtn = document.getElementById("enableAudio");
 const togglePlayBtn = document.getElementById("togglePlay");
 const clearBufferBtn = document.getElementById("clearBuffer");
@@ -23,7 +39,7 @@ const log = (...args) => console.log("[Viewer]", ...args);
 const warn = (...args) => console.warn("[Viewer]", ...args);
 const error = (...args) => console.error("[Viewer]", ...args);
 const DEBUG = true;
-const APP_VERSION = "audio9";
+const APP_VERSION = "audio15";
 let lastDebugSummary = 0;
 
 const scene = new THREE.Scene();
@@ -42,6 +58,8 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.target.set(0, 1.0, 0);
+controls.autoRotate = false;
+controls.autoRotateSpeed = 0.6;
 controls.update();
 
 const ambient = new THREE.AmbientLight(0xffffff, 0.7);
@@ -66,6 +84,16 @@ const maxBufferSeconds = 10;
 let currentFrameIndex = 0;
 let manualPaused = false;
 let playCount = 0;
+
+let gridHelper = null;
+let axesHelper = null;
+let lastBounds = null;
+let faceOffset = 0.0;
+let userOffset = new THREE.Vector3();
+let basePos = new THREE.Vector3();
+let transformControls = null;
+let gizmoAnchor = null;
+let isDragging = false;
 let lastRateTime = performance.now();
 let currentPlayFps = streamFps;
 
@@ -134,6 +162,9 @@ function initMesh(nverts) {
   mesh.frustumCulled = false;
   scene.add(mesh);
   log("Mesh initialized:", { nverts, faces: lodFaces[0].length });
+  if (toggleTranslateEl && toggleTranslateEl.checked) {
+    setTranslateEnabled(true);
+  }
 }
 
 function applyLod(level) {
@@ -187,14 +218,20 @@ function updateVertices(floatArray, bounds) {
       const cx = (minX + maxX) * 0.5;
       const cy = (minY + maxY) * 0.5;
       const cz = (minZ + maxZ) * 0.5;
-      mesh.position.set(-cx, -cy, -cz);
-      controls.target.set(0, 0, 0);
+      basePos.set(-cx, -cy, -cz);
+      mesh.position.copy(basePos).add(userOffset);
+      controls.target.copy(userOffset);
     }
     if (AUTO_SCALE) {
       const height = Math.max(1e-6, maxY - minY);
       let scale = TARGET_HEIGHT / height;
       scale = Math.min(20, Math.max(0.05, scale));
       mesh.scale.setScalar(scale);
+    }
+    lastBounds = { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
+    if (transformControls && gizmoAnchor && !isDragging) {
+      gizmoAnchor.position.copy(userOffset);
+      transformControls.update();
     }
     if (!cameraFitted) {
       const dx = maxX - minX;
@@ -553,6 +590,13 @@ clearBufferBtn.addEventListener("click", () => {
   workerFrameIndex = -1;
   workerFrame = null;
   frameDirty = false;
+  userOffset.set(0, 0, 0);
+  if (mesh) {
+    mesh.position.copy(basePos);
+  }
+  if (gizmoAnchor) {
+    gizmoAnchor.position.copy(userOffset);
+  }
   if (worker) {
     worker.postMessage({ type: "reset" });
   }
@@ -560,8 +604,170 @@ clearBufferBtn.addEventListener("click", () => {
 
 resetCamBtn.addEventListener("click", () => {
   camera.position.set(1.2, 1.4, 2.5);
+  userOffset.set(0, 0, 0);
+  if (mesh) {
+    mesh.position.copy(basePos);
+  }
+  if (gizmoAnchor) {
+    gizmoAnchor.position.copy(userOffset);
+  }
   controls.target.set(0, 1.0, 0);
   controls.update();
+});
+
+function ensureHelpers() {
+  if (!gridHelper) {
+    gridHelper = new THREE.GridHelper(5, 10, 0xcccccc, 0xeeeeee);
+  }
+  if (!axesHelper) {
+    axesHelper = new THREE.AxesHelper(1.2);
+  }
+}
+
+function setHelperVisible(helper, visible) {
+  if (!helper) return;
+  if (visible) {
+    if (!scene.children.includes(helper)) scene.add(helper);
+  } else {
+    scene.remove(helper);
+  }
+}
+
+function ensureTransformControls() {
+  if (transformControls) return;
+  if (!gizmoAnchor) {
+    gizmoAnchor = new THREE.Object3D();
+    gizmoAnchor.position.copy(userOffset);
+    scene.add(gizmoAnchor);
+  }
+  transformControls = new TransformControls(camera, renderer.domElement);
+  transformControls.setMode("translate");
+  transformControls.setSpace("world");
+  transformControls.addEventListener("dragging-changed", (event) => {
+    controls.enabled = !event.value;
+    isDragging = event.value;
+    if (!isDragging && gizmoAnchor) {
+      userOffset.copy(gizmoAnchor.position);
+      if (mesh) {
+        mesh.position.copy(basePos).add(userOffset);
+      }
+      controls.target.copy(userOffset);
+    }
+  });
+  transformControls.addEventListener("objectChange", () => {
+    if (!mesh || !gizmoAnchor) return;
+    userOffset.copy(gizmoAnchor.position);
+    mesh.position.copy(basePos).add(userOffset);
+    controls.target.copy(userOffset);
+  });
+}
+
+function setTranslateEnabled(enabled) {
+  if (!mesh) return;
+  if (enabled) {
+    ensureTransformControls();
+    if (gizmoAnchor) {
+      gizmoAnchor.position.copy(userOffset);
+      transformControls.attach(gizmoAnchor);
+    }
+    if (!scene.children.includes(transformControls)) scene.add(transformControls);
+  } else if (transformControls) {
+    transformControls.detach();
+    scene.remove(transformControls);
+  }
+}
+
+function fitCameraToModel() {
+  if (!mesh || !lastBounds) return;
+  const min = lastBounds.min;
+  const max = lastBounds.max;
+  const cx = (min[0] + max[0]) * 0.5;
+  const cy = (min[1] + max[1]) * 0.5;
+  const cz = (min[2] + max[2]) * 0.5;
+  const dx = max[0] - min[0];
+  const dy = max[1] - min[1];
+  const dz = max[2] - min[2];
+  const size = Math.max(dx, dy, dz) * (mesh.scale.x || 1.0);
+  const dist = Math.max(1.0, size * 2.2);
+  controls.target.copy(userOffset);
+  const dir = new THREE.Vector3(1, 0.8, 1).normalize().multiplyScalar(dist);
+  camera.position.set(controls.target.x + dir.x, controls.target.y + dir.y, controls.target.z + dir.z);
+  camera.near = Math.max(0.01, dist / 100);
+  camera.far = dist * 10;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function setCameraPreset(dir) {
+  if (!mesh) return;
+  const target = controls.target.clone();
+  const dist = camera.position.distanceTo(target);
+  const v = dir.clone().normalize().multiplyScalar(dist);
+  camera.position.set(target.x + v.x, target.y + v.y, target.z + v.z);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function focusFaceView() {
+  if (!mesh || !lastBounds) return;
+  const min = lastBounds.min;
+  const max = lastBounds.max;
+  const height = Math.max(1e-6, max[1] - min[1]);
+  const headX = (min[0] + max[0]) * 0.5;
+  const base = 0.12;
+  const factor = Math.min(0.45, Math.max(-0.2, base + faceOffset));
+  const headY = max[1] - height * factor;
+  const headZ = (min[2] + max[2]) * 0.5;
+  const target = new THREE.Vector3(
+    mesh.position.x + mesh.scale.x * headX,
+    mesh.position.y + mesh.scale.y * headY,
+    mesh.position.z + mesh.scale.z * headZ
+  );
+  controls.target.copy(target);
+  const worldHeight = height * mesh.scale.y;
+  const dist = Math.max(0.3, worldHeight * 0.6);
+  const dir = new THREE.Vector3(0.6, 0.2, 1).normalize().multiplyScalar(dist);
+  camera.position.copy(target.clone().add(dir));
+  camera.near = Math.max(0.01, dist / 100);
+  camera.far = dist * 10;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+fitViewBtn.addEventListener("click", () => fitCameraToModel());
+viewFaceBtn.addEventListener("click", () => focusFaceView());
+viewFrontBtn.addEventListener("click", () => setCameraPreset(new THREE.Vector3(0, 0, 1)));
+viewBackBtn.addEventListener("click", () => setCameraPreset(new THREE.Vector3(0, 0, -1)));
+viewLeftBtn.addEventListener("click", () => setCameraPreset(new THREE.Vector3(-1, 0, 0)));
+viewRightBtn.addEventListener("click", () => setCameraPreset(new THREE.Vector3(1, 0, 0)));
+viewTopBtn.addEventListener("click", () => setCameraPreset(new THREE.Vector3(0, 1, 0)));
+viewIsoBtn.addEventListener("click", () => setCameraPreset(new THREE.Vector3(1, 0.8, 1)));
+
+faceOffsetEl.addEventListener("input", () => {
+  faceOffset = parseFloat(faceOffsetEl.value) || 0;
+  if (faceOffsetValEl) faceOffsetValEl.textContent = faceOffset.toFixed(2);
+  focusFaceView();
+});
+
+toggleGridEl.addEventListener("change", () => {
+  ensureHelpers();
+  setHelperVisible(gridHelper, toggleGridEl.checked);
+});
+toggleAxesEl.addEventListener("change", () => {
+  ensureHelpers();
+  setHelperVisible(axesHelper, toggleAxesEl.checked);
+});
+toggleWireframeEl.addEventListener("change", () => {
+  if (mesh && mesh.material) {
+    mesh.material.wireframe = toggleWireframeEl.checked;
+  }
+});
+toggleAutoRotateEl.addEventListener("change", () => {
+  controls.autoRotate = toggleAutoRotateEl.checked;
+});
+
+toggleTranslateEl.addEventListener("change", () => {
+  setTranslateEnabled(toggleTranslateEl.checked);
 });
 
 enableAudioBtn.addEventListener("click", async () => {

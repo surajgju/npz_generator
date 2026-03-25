@@ -249,7 +249,20 @@ function connectVerts() {
         ensureCapacity();
       }
       const idx = rawFrame - baseFrame;
-      const arr = new Float32Array(event.data);
+      let arr;
+      if (header.dtype === "int16" && header.quant === "minmax") {
+        const q = new Int16Array(event.data);
+        const min = header.min || [0, 0, 0];
+        const scale = header.scale || [1, 1, 1];
+        const out = new Float32Array(q.length);
+        for (let i = 0; i < q.length; i++) {
+          const axis = i % 3;
+          out[i] = (q[i] + 32768) * scale[axis] + min[axis];
+        }
+        arr = out;
+      } else {
+        arr = new Float32Array(event.data);
+      }
       if (!nverts) {
         nverts = header.nverts;
         initSharedBuffers();

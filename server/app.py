@@ -49,21 +49,30 @@ inference_lock = asyncio.Lock()
 async def broadcast_loop():
     global frame_counter
     while True:
-        v = await queue.get()
-        if v is None:
+        item = await queue.get()
+        if item is None:
             logger.debug("Broadcast loop received None frame")
             continue
-        if v.ndim != 2:
-            logger.warning("Broadcast loop received invalid frame shape: %s", getattr(v, "shape", None))
+        try:
+            q_frame, vmin, scale = item
+        except Exception:
+            logger.warning("Broadcast loop received invalid payload: %s", type(item))
+            continue
+        if q_frame.ndim != 2:
+            logger.warning("Broadcast loop received invalid frame shape: %s", getattr(q_frame, "shape", None))
             continue
         logger.debug("Broadcasting frame %d to %d clients (queue=%d)", frame_counter, len(clients), queue.qsize())
         header = {
             "type": "verts",
             "frame": frame_counter,
-            "nverts": int(v.shape[0]),
+            "nverts": int(q_frame.shape[0]),
             "fps": STREAM_FPS,
+            "dtype": "int16",
+            "quant": "minmax",
+            "min": vmin.tolist(),
+            "scale": scale.tolist(),
         }
-        payload = v.astype(np.float32).tobytes()
+        payload = q_frame.astype(np.int16, copy=False).tobytes()
         dead = []
         for ws in clients:
             try:
@@ -98,15 +107,30 @@ async def inference_worker():
                 idx = np.round(np.arange(target_count) * step).astype(np.int32)
             verts = verts[idx]
             frames_count = int(verts.shape[0])
+        verts = verts.astype(np.float32, copy=False)
+        vmin = verts.min(axis=(0, 1))
+        vmax = verts.max(axis=(0, 1))
+        vrange = vmax - vmin
+        vmin = vmin - vrange * 0.02
+        vmax = vmax + vrange * 0.02
+        scale = (vmax - vmin) / 65535.0
+        scale = np.where(scale == 0, 1e-6, scale)
+        logger.info("Chunk quant: id=%s vmin=%s vmax=%s scale=%s", chunk_id, vmin.tolist(), vmax.tolist(), scale.tolist())
         dropped = 0
         for i in range(frames_count):
             try:
-                queue.put_nowait(verts[i])
+                q = np.rint((verts[i] - vmin) / scale)
+                q = np.clip(q, 0, 65535).astype(np.int32) - 32768
+                q = q.astype(np.int16)
+                queue.put_nowait((q, vmin, scale))
             except asyncio.QueueFull:
                 try:
                     _ = queue.get_nowait()
                     dropped += 1
-                    queue.put_nowait(verts[i])
+                    q = np.rint((verts[i] - vmin) / scale)
+                    q = np.clip(q, 0, 65535).astype(np.int32) - 32768
+                    q = q.astype(np.int16)
+                    queue.put_nowait((q, vmin, scale))
                 except Exception:
                     break
         if dropped > 0:

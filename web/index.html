@@ -57,6 +57,15 @@
         border-radius: 4px;
         cursor: pointer;
       }
+      #hud input[type="range"] {
+        width: 90px;
+        vertical-align: middle;
+      }
+      #faceOffsetVal {
+        display: inline-block;
+        width: 36px;
+        text-align: right;
+      }
       #hud .btns {
         display: flex;
         gap: 6px;
@@ -84,6 +93,29 @@
       <div class="row"><span>Audio Buf</span><span id="audioBuffer">0.0s</span></div>
       <div class="row"><span>Playback</span><span id="playState">buffering</span></div>
       <div class="row"><span>LOD</span><span id="lodLevel">LOD0</span></div>
+      <div class="row"><strong>View</strong><span></span></div>
+      <div class="btns">
+        <button id="fitView">Fit</button>
+        <button id="viewFace">Face</button>
+        <button id="viewFront">Front</button>
+        <button id="viewBack">Back</button>
+        <button id="viewLeft">Left</button>
+        <button id="viewRight">Right</button>
+        <button id="viewTop">Top</button>
+        <button id="viewIso">Iso</button>
+      </div>
+      <div class="row">
+        <span>Face Y</span>
+        <span>
+          <input type="range" id="faceOffset" min="-0.25" max="0.25" step="0.01" value="0">
+          <span id="faceOffsetVal">0.00</span>
+        </span>
+      </div>
+      <div class="row"><label><input type="checkbox" id="toggleGrid"> Grid</label><span></span></div>
+      <div class="row"><label><input type="checkbox" id="toggleAxes"> Axes</label><span></span></div>
+      <div class="row"><label><input type="checkbox" id="toggleWireframe"> Wireframe</label><span></span></div>
+      <div class="row"><label><input type="checkbox" id="toggleAutoRotate"> Auto-Rotate</label><span></span></div>
+      <div class="row"><label><input type="checkbox" id="toggleTranslate"> Translate</label><span></span></div>
       <div class="btns">
         <button id="enableAudio">Enable Audio</button>
         <button id="togglePlay">Pause</button>
@@ -100,6 +132,6 @@
         }
       }
     </script>
-    <script type="module" src="./app.js?v=audio9"></script>
+    <script type="module" src="./app.js?v=audio15"></script>
   </body>
 </html>

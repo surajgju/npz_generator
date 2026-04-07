@@ -109,3 +109,9 @@ output/
 ehthumbs.db
 Thumbs.db
 models/smplx/SMPLX_NEUTRAL.npz
+
+# Large assets
+*.glb
+*.bin
+*.mp4
+*.npz

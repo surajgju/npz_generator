@@ -1,0 +1,236 @@
+import { useEffect, useMemo, useState } from "react";
+import { destroyViewer, initViewer } from "./viewer/ViewerController.js";
+
+function App() {
+  const [view, setView] = useState("viewer");
+  const commands = useMemo(
+    () => [
+      {
+        label: "Install Dependencies",
+        cmd: "python3 -m pip install -r requirements.txt",
+      },
+      {
+        label: "Generate Motion (Offline)",
+        cmd: "python3 generate_npz.py",
+      },
+      {
+        label: "Streamlit Viewer",
+        cmd: "python3 -m streamlit run visualize_web.py",
+      },
+      {
+        label: "Render MP4",
+        cmd: "python3 render.py",
+      },
+      {
+        label: "Start WebSocket Server",
+        cmd: "STREAM_FPS=15 python3 -m uvicorn server.app:app --reload --port 8000",
+      },
+      {
+        label: "Stream Audio (Simulator)",
+        cmd: "python3 scripts/stream_audio_to_ws.py --audio input/viseme.mp3 --chunk 0.5",
+      },
+      {
+        label: "Export Faces (One-Time)",
+        cmd: "python3 scripts/export_faces.py",
+      },
+    ],
+    []
+  );
+
+  useEffect(() => {
+    if (view === "viewer") {
+      initViewer();
+      return () => {
+        destroyViewer();
+      };
+    }
+    destroyViewer();
+  }, [view]);
+
+  const copyCommand = async (cmd) => {
+    try {
+      await navigator.clipboard.writeText(cmd);
+    } catch (err) {
+      console.warn("Clipboard copy failed", err);
+    }
+  };
+
+  return (
+    <div id="app">
+      <div id="topbar">
+        <div className="tabs">
+          <button
+            className={view === "viewer" ? "active" : ""}
+            onClick={() => setView("viewer")}
+          >
+            Viewer
+          </button>
+          <button
+            className={view === "utilities" ? "active" : ""}
+            onClick={() => setView("utilities")}
+          >
+            Utilities
+          </button>
+        </div>
+      </div>
+
+      <div id="hud" className={view === "viewer" ? "" : "hidden"}>
+        <div className="row">
+          <span>Status</span>
+          <span id="status">Connecting...</span>
+        </div>
+        <div className="row">
+          <span>Buffer</span>
+          <span id="bufferSec">0.0s</span>
+        </div>
+        <div id="bufferBar">
+          <div id="bufferFill"></div>
+        </div>
+        <div className="row">
+          <span>Queue</span>
+          <span id="queueLen">0</span>
+        </div>
+        <div className="row">
+          <span>In FPS</span>
+          <span id="inFps">0</span>
+        </div>
+        <div className="row">
+          <span>Out FPS</span>
+          <span id="outFps">0</span>
+        </div>
+        <div className="row">
+          <span>Play FPS</span>
+          <span id="playFps">30</span>
+        </div>
+        <div className="row">
+          <span>Stream FPS</span>
+          <span id="streamFps">20</span>
+        </div>
+        <div className="row">
+          <span>Pipeline</span>
+          <span id="pipelineMode">Worker</span>
+        </div>
+        <div className="row">
+          <span>Audio</span>
+          <span id="audioStatus">disabled</span>
+        </div>
+        <div className="row">
+          <span>Audio Buf</span>
+          <span id="audioBuffer">0.0s</span>
+        </div>
+        <div className="row">
+          <span>Playback</span>
+          <span id="playState">buffering</span>
+        </div>
+        <div className="row">
+          <span>LOD</span>
+          <span id="lodLevel">LOD0</span>
+        </div>
+        <div className="row section-title">
+          <span>Expressions</span>
+          <span></span>
+        </div>
+        <div className="row">
+          <span>Exp000 (Jaw)</span>
+          <span id="expVal0">0.00</span>
+        </div>
+        <div className="row">
+          <span>Exp010</span>
+          <span id="expVal1">0.00</span>
+        </div>
+        <div className="row">
+          <span>Exp020</span>
+          <span id="expVal2">0.00</span>
+        </div>
+        <div className="row">
+          <strong>View</strong>
+          <span></span>
+        </div>
+        <div className="btns">
+          <button id="fitView">Fit</button>
+          <button id="viewFace">Face</button>
+          <button id="viewFront">Front</button>
+          <button id="viewBack">Back</button>
+          <button id="viewLeft">Left</button>
+          <button id="viewRight">Right</button>
+          <button id="viewTop">Top</button>
+          <button id="viewIso">Iso</button>
+        </div>
+        <div className="row">
+          <span>Face Y</span>
+          <span>
+            <input
+              type="range"
+              id="faceOffset"
+              min="-0.25"
+              max="0.25"
+              step="0.01"
+              defaultValue="0"
+            />
+            <span id="faceOffsetVal">0.00</span>
+          </span>
+        </div>
+        <div className="row">
+          <label>
+            <input type="checkbox" id="toggleGrid" /> Grid
+          </label>
+          <span></span>
+        </div>
+        <div className="row">
+          <label>
+            <input type="checkbox" id="toggleAxes" /> Axes
+          </label>
+          <span></span>
+        </div>
+        <div className="row">
+          <label>
+            <input type="checkbox" id="toggleWireframe" /> Wireframe
+          </label>
+          <span></span>
+        </div>
+        <div className="row">
+          <label>
+            <input type="checkbox" id="toggleAutoRotate" /> Auto-Rotate
+          </label>
+          <span></span>
+        </div>
+        <div className="row">
+          <label>
+            <input type="checkbox" id="toggleTranslate" /> Translate
+          </label>
+          <span></span>
+        </div>
+        <div className="btns">
+          <button id="enableAudio">Enable Audio</button>
+          <button id="togglePlay">Pause</button>
+          <button id="clearBuffer">Clear Buffer</button>
+          <button id="resetCam">Reset Cam</button>
+        </div>
+      </div>
+      <canvas id="canvas" className={view === "viewer" ? "" : "hidden"}></canvas>
+
+      <div id="utilities" className={view === "utilities" ? "" : "hidden"}>
+        <h2>Command Runner (Copy to Terminal)</h2>
+        <p>
+          Browser cannot run shell commands directly. Use the buttons below to
+          copy commands, then paste in your terminal.
+        </p>
+        <div className="command-list">
+          {commands.map((item) => (
+            <div key={item.label} className="command-card">
+              <div className="command-title">{item.label}</div>
+              <div className="command-row">
+                <code>{item.cmd}</code>
+                <button onClick={() => copyCommand(item.cmd)}>
+                  Copy Command
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;

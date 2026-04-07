@@ -26,6 +26,7 @@ async def stream_audio(audio_path: str, ws_url: str, chunk_sec: float):
     chunk_size = int(sr * chunk_sec)
     async with websockets.connect(ws_url, max_size=2**24) as ws:
         chunk_id = 0
+        start_t = time.perf_counter()
         for i in range(0, len(audio), chunk_size):
             chunk = audio[i:i + chunk_size]
             if len(chunk) == 0:
@@ -41,7 +42,11 @@ async def stream_audio(audio_path: str, ws_url: str, chunk_sec: float):
             ack = await ws.recv()
             logger.info("Sent chunk %d (%d samples). Ack: %s", chunk_id, len(chunk), ack)
             chunk_id += 1
-            await asyncio.sleep(chunk_sec * 0.95)
+            # Keep sender in real-time pace to avoid overfilling server queues.
+            target_elapsed = chunk_id * chunk_sec
+            sleep_for = target_elapsed - (time.perf_counter() - start_t)
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
 
 
 def main():

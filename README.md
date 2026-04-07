@@ -1,161 +1,163 @@
-# NPZ Generator 🕺
+# 🕺 NPZ Generator & Real-Time SMPL-X Streaming Pipeline
 
-Generate expressive SMPL‑X motion from audio, visualize offline, and run a real‑time streaming 3D avatar pipeline (Gemini Live ready).
+[![Gemini Ready](https://img.shields.io/badge/Gemini-Live%20Ready-blue?style=for-the-badge&logo=google-gemini&logoColor=white)](https://ai.google.dev/)
+[![React](https://img.shields.io/badge/Frontend-React%20%2B%20Three.js-61DAFB?style=for-the-badge&logo=react&logoColor=white)](https://reactjs.org/)
+[![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+
+An end-to-end pipeline for generating expressive SMPL-X motion from audio. This repository supports high-fidelity **offline NPZ generation**, **MP4 rendering**, and a **real-time WebSocket pipeline** for 3D avatar streaming (Gemini Live ready).
+
+---
+
+## ✨ Features
+
+- **🎭 Expressive Motion Generation**: Uses the **EMAGE** (Expressive Motion Generation) architecture for synchronized body, face, hand, and global translation from raw audio.
+- **⚡ Real-Time Streaming Pipeline**: A low-latency system that processes audio chunks via WebSockets and streams SMPL‑X vertices directly to a Three.js viewer.
+- **📦 Offline NPZ Generation**: Batch process audio files in `./input` to high-fidelity animation coefficients.
+- **📊 Advanced Post-Processing**: Features automatic gain control (AGC) for expressions, EMA smoothing for jitter-free motion, and jaw-scaling for crisp lip-sync.
+- **🌐 Dual Visualization Suite**:
+    - **Offline (Streamlit)**: High-performance local NPZ viewer.
+    - **Live (Vite/React)**: Modern Three.js viewer for real-time streaming and interactive debugging.
+- **🔗 Gemini Live Integration**: Pre-wired adapters to bridge Gemini PCM audio streams with the motion synthesis pipeline.
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Install Dependencies
+### 1. Environment Setup
+Install the core Python dependencies (requires PyTorch and SMPL-X):
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-### 2. Generate Motion (Offline)
-Put audio files in `./input`, then run:
+### 2. Frontend Build (Optional for Live Streaming)
+The live viewer resides in the `/frontend` directory and needs a production build:
 ```bash
-python3 generate_npz.py
-```
-This writes `output/intro_output.npz`.
+# Export SMPL-X faces (requires smplx weights in 'models/')
+python3 scripts/export_faces.py
 
-### 3. Visualize (Offline)
-Streamlit viewer:
-```bash
-python3 -m streamlit run visualize_web.py
+# Build frontend
+cd frontend && npm install && npm run build && cd ..
 ```
-MP4 render:
+*Note: Exporting faces ensures that the Three.js viewer can render the avatar mesh correctly. The build command creates the `web/` directory that the FastAPI server uses for static hosting.*
+
+### 3. Generate Motion (Offline)
+Generate high-fidelity motion from your audio files in the `./input` folder:
 ```bash
-python3 render.py
+python3 generate_npz.py --audio_folder ./input --save_folder ./output
 ```
-This writes `output.mp4`.
+
+### 4. Visualize Offline
+Prefer a quick local view? Use the Streamlit or MP4 render paths:
+- **Streamlit**: `python3 -m streamlit run visualize_web.py`
+- **MP4 Render**: `python3 render.py` (Outputs `output.mp4`)
 
 ---
 
-## ⚡ Real‑Time Streaming (Live Pipeline)
+## ⚡ Real-Time Streaming Pipeline
 
-This repo now includes a real‑time pipeline that:
-1. Accepts audio chunks over WebSocket.
-2. Generates SMPL‑X coefficients in chunks.
-3. Computes SMPL‑X vertices server‑side.
-4. Streams vertices to a Three.js live viewer.
+Our streaming architecture allows you to live-stream audio to a server and get back animated vertices for immediate rendering.
 
-### Start the WebSocket Server
+### 1. Start the Live Server
 ```bash
-uvicorn server.app:app --reload --port 8000
+# Set base FPS via environment variable
+STREAM_FPS=15 python3 -m uvicorn server.app:app --reload --port 8000
 ```
 
-### Open the Live Viewer
-Open:
-```
-http://localhost:8000/
-```
+### 2. Open the Live Viewer
+The Three.js viewer will be live at: `http://localhost:8000/`.
 
-### Stream Audio (Simulator)
+### 3. Stream Audio (Example Simulator)
+Use our utility script to simulate a live audio stream from a file:
 ```bash
-python3 scripts/stream_audio_to_ws.py --audio input/your_audio.wav --chunk 0.5
+python3 scripts/stream_audio_to_ws.py --audio ./input/your_audio.wav --chunk 0.5
 ```
-
-### Export Faces (One‑Time)
-Three.js needs the SMPL‑X faces index list:
-```bash
-python3 scripts/export_faces.py
-```
-This writes `web/faces.json`.
 
 ---
 
 ## 🧠 System Architecture
 
 ```mermaid
-flowchart LR
-    A["Gemini Live API (audio stream)"] -->|PCM/Base64| B["FastAPI /ws/audio"]
-    B --> C["LiveMotionGenerator (GPU)"]
-    C --> D["SMPL‑X Vertex Streamer"]
-    D -->|Float32 vertices| E["/ws/verts"]
-    E --> F["Three.js Live Viewer"]
-    C --> G["(Optional) NPZ buffer / storage"]
-
-    subgraph Offline
-        H["generate_npz.py"] --> I["output/intro_output.npz"]
-        I --> J["visualize_web.py (Streamlit)"]
-        I --> K["render.py (output.mp4)"]
+flowchart TD
+    subgraph AudioSource ["Audio Ingestion (Real-Time)"]
+        A[Gemini Live API Bridge]
+        B[Simulated WAV Streamer]
     end
+
+    subgraph Backend ["Python Backend (FastAPI)"]
+        C["/ws/audio Receiver"]
+        D["EMAGE Inference (GPU)"]
+        E["SmplxRetargeter (Signal Processing)"]
+        F["Anim Loop /ws/anim"]
+        
+        C --> D
+        D --> E
+        E --> F
+    end
+
+    subgraph Frontend ["WebGL Frontend (Three.js)"]
+        G[Animation Worker]
+        H[Three.js Live Viewer]
+        I[HUD Statistics Panel]
+        
+        F -->|Binary Floats| G
+        G --> H
+        H -.-> I
+    end
+
+    A --> C
+    B --> C
 ```
 
 ---
 
-## 🧩 Key Components
+## 📂 Project Structure
 
-**Streaming core**
-- `live_streaming_pipeline.py`
-- `LiveMotionGenerator`: loads models once, processes audio chunks at ~30 FPS.
-- `SmplxVertexStreamer`: computes SMPL‑X vertices server‑side.
-
-**WebSocket server**
-- `server/app.py`
-- `/ws/audio` receives `{chunk_id, sr, dtype, audio_b64}`
-- `/ws/verts` streams vertex frames as binary float32 arrays
-
-**Gemini adapter (stub)**
-- `server/gemini_adapter.py`
-- `GeminiAudioBridge` formats PCM for `/ws/audio`
-
-**Live viewer**
-- `web/index.html`, `web/app.js`
-- Three.js viewer with white background and soft lighting (matches `output.mp4`)
-
----
-
-## ✅ Visual Style (Matches `output.mp4`)
-
-The live viewer and Streamlit viewer are configured to:
-- Use a clean white background.
-- Disable axes/grids by default.
-- Use soft, front‑biased lighting.
-- Render a light gray mesh with smooth shading.
+| Directory/File | Description |
+| :--- | :--- |
+| `frontend/` | React + Three.js application source code. |
+| `web/` | Target for frontend build. Served by FastAPI. |
+| `server/` | FastAPI server, WebSocket handlers, and Gemini adapters. |
+| `emage_utils/` | Core EMAGE model implementation and VQ-VAE utils. |
+| `scripts/` | Export utilities and audio streaming simulators. |
+| `models/` | SMPL-X and EMAGE model weight storage path. |
 
 ---
 
 ## 🛠️ Advanced Configuration
 
-**Offline generation**
-- `generate_npz.py --audio_folder ./input --save_folder ./output`
-- `--no_visualization` to skip rendering during generation
-- `--model_folder ./models`
+Fine-tune your animation quality via CLI or config files:
 
-**Streaming**
-- `LiveMotionGenerator(overlap_sec=0.25)` controls overlap smoothing
-- `stream_audio_to_ws.py --chunk 0.5` controls chunk duration
+- **Signal Processing**:
+  - `expression_target`: Scales facial PCA coefficients for quiet audio.
+  - `expression_smooth_alpha`: Alpha value for EMA smoothing (default: `1.0`).
+- **Pipeline Performance**:
+  - `overlap_sec`: Controls chunk overlap for seamless motion blending (default: `0.25s`).
+  - `STREAM_FPS`: Sets the target animation rate for real-time vertex streaming (default: `20`).
 
 ---
 
 ## 🌩️ Gemini Live Integration (Stub)
-
-Real Gemini API integration is stubbed and ready to wire:
+Integration for high-fidelity audio/motion bridges is pre-wired:
 ```python
 from server.gemini_adapter import GeminiAudioBridge
 
 bridge = GeminiAudioBridge(sample_rate=16000)
 payload = bridge.build_audio_payload(pcm_bytes, chunk_id="42")
-# Send payload to /ws/audio
+# Send the payload to the /ws/audio endpoint
 ```
 
 ---
 
 ## 🧪 Testing Checklist
-
-1. `python3 generate_npz.py` generates `output/intro_output.npz`
-2. `python3 render.py` writes `output.mp4`
-3. Streamlit viewer runs without flicker or dark artifacts
-4. `uvicorn server.app:app --reload --port 8000`
-5. `python3 scripts/stream_audio_to_ws.py --audio input/your_audio.wav --chunk 0.5`
-6. Viewer updates smoothly and matches `output.mp4` tone
+1. [ ] Run `python3 generate_npz.py` and verify `output/intro_output.npz`.
+2. [ ] Run `python3 render.py` and check `output.mp4`.
+3. [ ] Run `npm run build` in the frontend directory.
+4. [ ] Start the uvicorn server and open the live viewer at `localhost:8000`.
+5. [ ] Run `stream_audio_to_ws.py` and observe smooth 3D motion in the browser.
 
 ---
 
-## 📦 Requirements
-
-All dependencies are captured in `requirements.txt`:
-```bash
-python3 -m pip install -r requirements.txt
-```
+## 📜 Credits & References
+- **EMAGE**: Expressive Motion Generation from Audio via Latent Cross-Modal Transformer.
+- **SMPL-X**: A joint body, face, and hand model for human motion research.
+- **Three.js**: The rendering system for the real-time WebGL viewer.

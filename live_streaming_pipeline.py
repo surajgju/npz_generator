@@ -52,9 +52,9 @@ class LiveMotionGenerator:
         self.speaker_id = torch.zeros(1, 1).long().to(self.device)
         self.overlap_sec = float(overlap_sec)
         self._prev_overlap: Optional[np.ndarray] = None
-        self._prev_tail_pose: Optional[np.ndarray] = None
-        self._prev_tail_expr: Optional[np.ndarray] = None
-        self._prev_tail_trans: Optional[np.ndarray] = None
+        self._prev_last_pose: Optional[np.ndarray] = None
+        self._prev_last_expr: Optional[np.ndarray] = None
+        self._prev_last_trans: Optional[np.ndarray] = None
         self.target_fps = 30
 
         logger.info("Generator ready. Audio SR: %s, Pose FPS: %s", self.sr, self.pose_fps)
@@ -149,22 +149,23 @@ class LiveMotionGenerator:
             face_pred = face_pred[overlap_frames:]
             trans_pred = trans_pred[overlap_frames:]
 
-        if has_prev and overlap_frames > 0 and self._prev_tail_pose is not None:
-            k = min(overlap_frames, motion_pred.shape[0], self._prev_tail_pose.shape[0])
+        # Boundary continuity: preserve the last emitted pose at chunk joins, then
+        # quickly fade to the newly predicted chunk to avoid visual popping.
+        if has_prev and self._prev_last_pose is not None and motion_pred.shape[0] > 0:
+            k = min(max(2, overlap_frames), motion_pred.shape[0])
             if k > 0:
                 if k > 1:
                     alpha = np.linspace(0.0, 1.0, k, endpoint=True, dtype=np.float32).reshape(-1, 1)
                 else:
                     alpha = np.array([[1.0]], dtype=np.float32)
-                motion_pred[:k] = self._prev_tail_pose[:k] * (1.0 - alpha) + motion_pred[:k] * alpha
-                face_pred[:k] = self._prev_tail_expr[:k] * (1.0 - alpha) + face_pred[:k] * alpha
-                trans_pred[:k] = self._prev_tail_trans[:k] * (1.0 - alpha) + trans_pred[:k] * alpha
+                motion_pred[:k] = self._prev_last_pose.reshape(1, -1) * (1.0 - alpha) + motion_pred[:k] * alpha
+                face_pred[:k] = self._prev_last_expr.reshape(1, -1) * (1.0 - alpha) + face_pred[:k] * alpha
+                trans_pred[:k] = self._prev_last_trans.reshape(1, -1) * (1.0 - alpha) + trans_pred[:k] * alpha
 
-        if overlap_frames > 0 and motion_pred.shape[0] > 0:
-            tail_len = min(overlap_frames, motion_pred.shape[0])
-            self._prev_tail_pose = motion_pred[-tail_len:].copy()
-            self._prev_tail_expr = face_pred[-tail_len:].copy()
-            self._prev_tail_trans = trans_pred[-tail_len:].copy()
+        if motion_pred.shape[0] > 0:
+            self._prev_last_pose = motion_pred[-1].copy()
+            self._prev_last_expr = face_pred[-1].copy()
+            self._prev_last_trans = trans_pred[-1].copy()
 
         logger.debug(
             "Chunk %s: output frames=%d overlap_frames=%d",

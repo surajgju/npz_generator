@@ -24,8 +24,9 @@ def main():
         num_expression_coeffs=100,
     )
     faces = model.faces.tolist()
-    os.makedirs("web", exist_ok=True)
-    out_path = os.path.join("web", "faces.json")
+    out_dir = os.path.join(ROOT_DIR, "frontend", "public")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "faces.json")
     with open(out_path, "w") as f:
         json.dump(faces, f)
     logger.info("Wrote %s with %d faces", out_path, len(faces))

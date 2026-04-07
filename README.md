@@ -11,7 +11,11 @@ An end-to-end pipeline for generating expressive SMPL-X motion from audio. This 
 ## ✨ Features
 
 - **🎭 Expressive Motion Generation**: Uses the **EMAGE** (Expressive Motion Generation) architecture for synchronized body, face, hand, and global translation from raw audio.
-- **⚡ Real-Time Streaming Pipeline**: A low-latency system that processes audio chunks via WebSockets and streams SMPL‑X vertices directly to a Three.js viewer.
+- **⚡ Real-Time Streaming Pipeline**: A low-latency system that processes audio chunks via WebSockets and streams SMPL‑X animation directly to a Three.js viewer.
+- **🧭 Sessionized Streaming (Protocol v2)**: Per-session ring buffers and reconnect-aware handshake (`anim_subscribe`) with `session_id`, `server_boot_id`, and monotonic `server_time_ms`.
+- **🔁 Snapshot Recovery**: Reconnecting clients receive a short snapshot window (2-3s), then jump to live edge without replay burst.
+- **🛡️ Drift/Freeze Protection**: Worker tail-lock alignment with timeout and resync request; viewer has explicit stall states (`stalled_hold`, `stalled_ease`, `resyncing`).
+- **🧹 Session Lifecycle GC**: Deprecated/idle sessions are evicted by TTL and LRU caps to prevent buffer leaks.
 - **📦 Offline NPZ Generation**: Batch process audio files in `./input` to high-fidelity animation coefficients.
 - **📊 Advanced Post-Processing**: Features automatic gain control (AGC) for expressions, EMA smoothing for jitter-free motion, and jaw-scaling for crisp lip-sync.
 - **🌐 Dual Visualization Suite**:
@@ -55,12 +59,12 @@ Prefer a quick local view? Use the Streamlit or MP4 render paths:
 
 ## ⚡ Real-Time Streaming Pipeline
 
-Our streaming architecture allows you to live-stream audio to a server and get back animated vertices for immediate rendering.
+Our streaming architecture allows you to live-stream audio to a server and get back animation frames for immediate rendering.
 
 ### 1. Start the Live Server
 ```bash
 # Set base FPS via environment variable
-STREAM_FPS=15 python3 -m uvicorn server.app:app --reload --port 8000
+STREAM_FPS=20 python3 -m uvicorn server.app:app --reload --port 8000
 ```
 
 ### 2. Open the Live Viewer
@@ -71,6 +75,30 @@ Use our utility script to simulate a live audio stream from a file:
 ```bash
 python3 scripts/stream_audio_to_ws.py --audio ./input/your_audio.wav --chunk 0.5
 ```
+
+### 4. Protocol v2 Reconnect Flow (Implemented)
+- Client connects `/ws/anim`, sends:
+  - `anim_subscribe { protocol_version: 2, known_boot_id, known_session_id, last_applied_frame }`
+- Server responds:
+  - `anim_subscribe_ack` with `mode: resume|live_only|reset_required`
+- If `resume`, server sends:
+  - `anim_snapshot_start`
+  - snapshot `anim` frames (`phase: "snapshot"`)
+  - `anim_snapshot_end` with precise anchors:
+    - `snapshot_end_frame`, `snapshot_end_server_time_ms`
+    - `live_head_frame`, `live_head_server_time_ms`
+    - `audio_live_edge_frame`, `audio_live_edge_server_time_ms`
+- Server then sends live `anim` frames (`phase: "live"`).
+- Worker treats snapshot frames as historical context only and does **not** replay snapshot history at accelerated speed.
+- Reconnect playhead is seeded from live edge (`max(expected_frame, live_head_frame, audio_live_edge_frame)`), then transitions to normal live playback.
+
+### 5. Audio Channel Metadata
+`/ws/audio_out` now includes:
+- `session_id`
+- `chunk_id`
+- `audio_sample_cursor` (absolute samples in session)
+- `server_time_ms`
+- `server_boot_id`
 
 ---
 
@@ -84,18 +112,20 @@ flowchart TD
     end
 
     subgraph Backend ["Python Backend (FastAPI)"]
-        C["/ws/audio Receiver"]
+        C["/ws/audio Receiver (Session Producer)"]
         D["EMAGE Inference (GPU)"]
         E["SmplxRetargeter (Signal Processing)"]
-        F["Anim Loop /ws/anim"]
+        F["Session Ring Buffer + Broadcast /ws/anim"]
+        J["Session GC (TTL + LRU)"]
         
         C --> D
         D --> E
         E --> F
+        F --> J
     end
 
     subgraph Frontend ["WebGL Frontend (Three.js)"]
-        G[Animation Worker]
+        G[Animation Worker (Protocol v2)]
         H[Three.js Live Viewer]
         I[HUD Statistics Panel]
         
@@ -114,9 +144,9 @@ flowchart TD
 
 | Directory/File | Description |
 | :--- | :--- |
-| `frontend/` | React + Three.js application source code. |
+| `frontend/` | React + Three.js application source code. Worker source is `frontend/src/viewer/anim_worker.js`. |
 | `web/` | Target for frontend build. Served by FastAPI. |
-| `server/` | FastAPI server, WebSocket handlers, and Gemini adapters. |
+| `server/` | FastAPI server, sessionized WebSocket handlers, inference/broadcast loops, and Gemini adapters. |
 | `emage_utils/` | Core EMAGE model implementation and VQ-VAE utils. |
 | `scripts/` | Export utilities and audio streaming simulators. |
 | `models/` | SMPL-X and EMAGE model weight storage path. |
@@ -133,6 +163,27 @@ Fine-tune your animation quality via CLI or config files:
 - **Pipeline Performance**:
   - `overlap_sec`: Controls chunk overlap for seamless motion blending (default: `0.25s`).
   - `STREAM_FPS`: Sets the target animation rate for real-time vertex streaming (default: `20`).
+- **Session/Recovery**:
+  - `SNAPSHOT_SECONDS` (default: `3.0`)
+  - `MAX_SESSIONS` (default: `8`)
+  - `SESSION_IDLE_TTL_MS` (default: `45000`)
+  - `DEPRECATED_TTL_MS` (default: `15000`)
+  - `SESSION_GC_INTERVAL_MS` (default: `5000`)
+
+### Reconnect & Stall Defaults (Implemented)
+- `STREAM_FPS=20`
+- Worker:
+  - `MAX_TAIL_LOCK_MS=350` (bounded wait for first live frame after snapshot tail alignment)
+- Viewer:
+  - `STARTUP_SUPPRESS_MS=4000` (suppresses expected startup watchdog noise)
+  - `STALL_HOLD_MS=300` then `STALL_EASE_MS=700` (freeze-then-ease behavior)
+
+### Edge-Case Handling (Current)
+- Snapshot tail behind audio live edge: initialize at live edge immediately (no tail freeze on missing historical frames).
+- No live frames after snapshot: bounded tail lock timeout, then `resync_request`.
+- Session mismatch between `/ws/anim` and `/ws/audio_out`: viewer enters resync/reset path.
+- Server restart (`server_boot_id` change): client receives reset semantics and reboots playback state.
+- Deprecated sessions: retained briefly for resumability, then evicted by session GC.
 
 ---
 
@@ -154,6 +205,9 @@ payload = bridge.build_audio_payload(pcm_bytes, chunk_id="42")
 3. [ ] Run `npm run build` in the frontend directory.
 4. [ ] Start the uvicorn server and open the live viewer at `localhost:8000`.
 5. [ ] Run `stream_audio_to_ws.py` and observe smooth 3D motion in the browser.
+6. [ ] Reload browser mid-stream and verify reconnect does not burst/replay old frames.
+7. [ ] Simulate network stall (2-3s) and verify `stalled_hold -> stalled_ease -> smooth resume`.
+8. [ ] Verify session turnover (new `/ws/audio` producer) does not leak stale sessions.
 
 ---
 

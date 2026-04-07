@@ -45,8 +45,8 @@ let resizeHandler = null;
 const log = (...args) => console.log("[Viewer]", ...args);
 const warn = (...args) => console.warn("[Viewer]", ...args);
 const error = (...args) => console.error("[Viewer]", ...args);
-const DEBUG = true;
-const APP_VERSION = "audio46";
+const DEBUG = false;
+const BUILD_ID = import.meta.env.VITE_BUILD_ID || import.meta.env.MODE || "dev";
 const IDLE_START_MS = 2000;
 let lastDebugSummary = 0;
 let lastHudLog = null;
@@ -1103,6 +1103,9 @@ let animOffsetSet = false;
 const AUDIO_JITTER_SEC = 0.08;
 const AUDIO_START_BUFFER_SEC = 0.6;
 const AUDIO_LOW_BUFFER_SEC = 0.3;
+const STARTUP_SUPPRESS_MS = 4000;
+const STALL_HOLD_MS = 300;
+const STALL_EASE_MS = 700;
 const workerEnabled = typeof Worker !== "undefined";
 const WS_HOST =
   (import.meta && import.meta.env && import.meta.env.VITE_WS_HOST) ||
@@ -1115,7 +1118,9 @@ let workerFrame = null;
 let workerBounds = null;
 let workerFrameIndex = -1;
 let workerQueueLen = 0;
-let workerDropped = 0;
+let workerSnapshotDropped = 0;
+let workerLiveDropped = 0;
+let workerResyncSkipped = 0;
 let workerInFps = 0;
 let workerPlaybackFps = 0;
 let frameDirty = false;
@@ -1130,6 +1135,17 @@ const RESYNC_GRACE_MS = 1500;
 let pendingInit = null;
 let loggedFirstFrame = false;
 let smoothedMorphs = null;
+let startupSuppressUntilMs = 0;
+let stallSinceMs = null;
+let workerSessionId = null;
+let audioSessionId = null;
+let serverBootId = null;
+let serverClockId = null;
+let protocolVersion = 1;
+let resyncing = false;
+let buildLogged = false;
+let sessionMismatchWarned = false;
+let lastSessionResetAt = 0;
 
 const MORPH_EMA_ALPHA = 0.35;
 const MORPH_CLAMP = 2.5;
@@ -1765,7 +1781,9 @@ window.testMorph = function(name, value) {
 function initWorker() {
   if (!workerEnabled) return;
   pipelineModeEl.textContent = "Worker";
-  worker = new Worker(`./anim_worker.js?v=${APP_VERSION}`);
+  worker = new Worker(new URL("./anim_worker.js", import.meta.url), { type: "module" });
+  startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+  const known = loadKnownSessionState();
   worker.onmessage = (event) => {
     const msg = event.data;
     if (msg.type === "init") {
@@ -1775,26 +1793,79 @@ function initWorker() {
         pendingInit = msg;
       }
     } else if (msg.type === "frame") {
+      const incomingIndex = Number.isFinite(msg.frameIndex) ? msg.frameIndex : -1;
+      if (incomingIndex >= 0 && lastWorkerFrameIndexSeen >= 0 && incomingIndex < lastWorkerFrameIndexSeen) {
+        if (DEBUG) warn("Dropping out-of-order frame", { incomingIndex, lastWorkerFrameIndexSeen });
+        return;
+      }
       streamFps = msg.streamFps || streamFps;
       streamFpsEl.textContent = `${streamFps}`;
       workerQueueLen = msg.queueLen ?? workerQueueLen;
-      workerDropped = msg.dropped ?? workerDropped;
+      workerSnapshotDropped = msg.snapshotDropCount ?? workerSnapshotDropped;
+      workerLiveDropped = msg.liveDropCount ?? workerLiveDropped;
+      workerResyncSkipped = msg.resyncSkipped ?? workerResyncSkipped;
       workerFrameIndex = msg.frameIndex ?? workerFrameIndex;
       workerFrame = new Float32Array(msg.buffer);
       frameDirty = true;
       lastWorkerFrameIndexSeen = workerFrameIndex;
       lastWorkerFrameAt = performance.now();
       lastWorkerFrameBytes = msg.buffer ? msg.buffer.byteLength : null;
+      if (msg.sessionId) workerSessionId = msg.sessionId;
+      if (msg.serverBootId) serverBootId = msg.serverBootId;
+      if (msg.serverClockId) serverClockId = msg.serverClockId;
+      if (Number.isFinite(msg.protocolVersion)) protocolVersion = msg.protocolVersion;
+      persistKnownSessionState();
+      resyncing = false;
+      sessionMismatchWarned = false;
+    } else if (msg.type === "handshake") {
+      if (msg.sessionId) workerSessionId = msg.sessionId;
+      if (msg.serverBootId) serverBootId = msg.serverBootId;
+      if (msg.serverClockId) serverClockId = msg.serverClockId;
+      if (Number.isFinite(msg.protocolVersion)) protocolVersion = msg.protocolVersion;
+      if (!buildLogged) {
+        buildLogged = true;
+        log("Worker handshake", {
+          buildId: msg.buildId || BUILD_ID,
+          protocolVersion,
+          serverBootId,
+          serverClockId,
+          sessionId: workerSessionId,
+          mode: msg.mode,
+        });
+      }
+      persistKnownSessionState();
+    } else if (msg.type === "snapshot_anchor") {
+      startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+      resyncing = true;
+    } else if (msg.type === "resync") {
+      resyncing = true;
+      startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+      if (DEBUG) warn("Worker requested resync", msg);
+    } else if (msg.type === "session_switch") {
+      if (msg.sessionId) workerSessionId = msg.sessionId;
+      resyncing = false;
+      sessionMismatchWarned = false;
+      startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+      persistKnownSessionState();
     } else if (msg.type === "status") {
       if (msg.status === "connected") {
         statusEl.textContent = "Connected";
         pipelineModeEl.textContent = "Worker";
         workerReady = true;
         workerAlive = true;
+        resyncing = false;
         if (workerFallbackTimer) {
           clearTimeout(workerFallbackTimer);
           workerFallbackTimer = null;
         }
+      } else if (msg.status === "reset_required") {
+        warn("Worker requested reset", msg);
+        pipelineModeEl.textContent = "Resync";
+        statusEl.textContent = "Resyncing";
+        workerAlive = false;
+        workerReady = false;
+        resyncing = true;
+        startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
       } else if (msg.status === "error" || msg.status === "closed") {
         warn("Worker status:", msg);
         pipelineModeEl.textContent = "Error";
@@ -1807,10 +1878,16 @@ function initWorker() {
     } else if (msg.type === "stats") {
       workerInFps = msg.inFps ?? workerInFps;
       workerQueueLen = msg.queueLen ?? workerQueueLen;
-      workerDropped = msg.dropped ?? workerDropped;
+      workerSnapshotDropped = msg.snapshotDropCount ?? workerSnapshotDropped;
+      workerLiveDropped = msg.liveDropCount ?? workerLiveDropped;
+      workerResyncSkipped = msg.resyncSkipped ?? workerResyncSkipped;
       streamFps = msg.streamFps || streamFps;
       workerMaxIndex = Number.isFinite(msg.maxIndex) ? msg.maxIndex : workerMaxIndex;
       workerMinIndex = Number.isFinite(msg.minIndexEstimate) ? msg.minIndexEstimate : workerMinIndex;
+      if (msg.sessionId) workerSessionId = msg.sessionId;
+      if (msg.playbackState) {
+        resyncing = msg.playbackState === "resyncing" || msg.playbackState === "snapshot_loading";
+      }
       if ((audioStarted || silentStartTime !== null) && !animOffsetSet) {
         maybeSetAnimOffset();
       }
@@ -1820,11 +1897,14 @@ function initWorker() {
           {
             inFps: workerInFps,
             queueLen: workerQueueLen,
-            dropped: workerDropped,
-            baseFrame: msg.baseFrame,
+            snapshotDropped: workerSnapshotDropped,
+            liveDropped: workerLiveDropped,
+            resyncSkipped: workerResyncSkipped,
             maxIndex: msg.maxIndex,
             minIndex: msg.minIndexEstimate,
             streamFps,
+            state: msg.playbackState,
+            sessionId: workerSessionId,
           },
           lastStatsLog
         );
@@ -1838,7 +1918,14 @@ function initWorker() {
     workerAlive = false;
   };
   statusEl.textContent = "Connecting...";
-  worker.postMessage({ type: "init", host: WS_HOST });
+  worker.postMessage({
+    type: "init",
+    host: WS_HOST,
+    knownBootId: known.knownBootId,
+    knownSessionId: known.knownSessionId,
+    lastAppliedFrame: known.knownLastAppliedFrame,
+    buildId: BUILD_ID,
+  });
   workerFallbackTimer = setTimeout(() => {
     if (!workerReady) {
       warn("Worker not ready");
@@ -1873,6 +1960,13 @@ function connectAudioSocket() {
       } catch {
         audioHeader = null;
       }
+      if (audioHeader && audioHeader.type === "audio" && audioHeader.session_id) {
+        const nextAudioSessionId = audioHeader.session_id;
+        if (audioSessionId && nextAudioSessionId !== audioSessionId) {
+          beginSessionRecovery("audio_session_switch");
+        }
+        audioSessionId = nextAudioSessionId;
+      }
       return;
     }
     if (!audioHeader || !audioCtx) return;
@@ -1889,9 +1983,23 @@ function connectAudioSocket() {
     const buffer = audioCtx.createBuffer(1, floats.length, sr);
     buffer.copyToChannel(floats, 0);
     const duration = buffer.duration;
+    if (hasSessionMismatch()) {
+      if (!sessionMismatchWarned) {
+        sessionMismatchWarned = true;
+        warn("Session mismatch between anim/audio", { workerSessionId, audioSessionId });
+        beginSessionRecovery("anim_audio_mismatch");
+      }
+      queueAudioChunk(buffer, duration);
+      audioHeader = null;
+      return;
+    }
+    if (resyncing) {
+      queueAudioChunk(buffer, duration);
+      audioHeader = null;
+      return;
+    }
     if (!audioStarted) {
-      audioQueue.push({ buffer, duration });
-      audioQueuedSec += duration;
+      queueAudioChunk(buffer, duration);
     } else {
       scheduleAudioBuffer(buffer, duration);
     }
@@ -1921,6 +2029,81 @@ function audioBufferedSeconds() {
 
 function meshBufferedSeconds() {
   return workerQueueLen / streamFps;
+}
+
+function loadKnownSessionState() {
+  try {
+    const knownBootId = sessionStorage.getItem("viewer_known_boot_id");
+    const knownSessionId = sessionStorage.getItem("viewer_known_session_id");
+    const rawFrame = sessionStorage.getItem("viewer_last_applied_frame");
+    const knownLastAppliedFrame = rawFrame !== null ? Number(rawFrame) : -1;
+    return {
+      knownBootId: knownBootId || null,
+      knownSessionId: knownSessionId || null,
+      knownLastAppliedFrame: Number.isFinite(knownLastAppliedFrame) ? knownLastAppliedFrame : -1,
+    };
+  } catch {
+    return { knownBootId: null, knownSessionId: null, knownLastAppliedFrame: -1 };
+  }
+}
+
+function persistKnownSessionState() {
+  try {
+    if (serverBootId) sessionStorage.setItem("viewer_known_boot_id", serverBootId);
+    if (workerSessionId) sessionStorage.setItem("viewer_known_session_id", workerSessionId);
+    if (Number.isFinite(lastWorkerFrameIndexSeen)) {
+      sessionStorage.setItem("viewer_last_applied_frame", String(lastWorkerFrameIndexSeen));
+    }
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function applyStallEase(progress) {
+  const p = Math.max(0, Math.min(1, progress));
+  const scale = 1 - p;
+  for (const m of skinnedMeshes) {
+    if (!m.morphTargetInfluences) continue;
+    for (let i = 0; i < m.morphTargetInfluences.length; i++) {
+      m.morphTargetInfluences[i] *= scale;
+    }
+  }
+}
+
+function hasSessionMismatch() {
+  return !!(workerSessionId && audioSessionId && workerSessionId !== audioSessionId);
+}
+
+function queueAudioChunk(buffer, duration) {
+  audioQueue.push({ buffer, duration });
+  audioQueuedSec += duration;
+}
+
+function beginSessionRecovery(reason) {
+  const now = performance.now();
+  if (now - lastSessionResetAt < 250) return;
+  lastSessionResetAt = now;
+  resyncing = true;
+  startupSuppressUntilMs = now + STARTUP_SUPPRESS_MS;
+  sessionMismatchWarned = false;
+  animOffsetSec = 0;
+  animOffsetSet = false;
+  audioStarted = false;
+  audioStartTime = null;
+  audioScheduledTime = audioCtx ? audioCtx.currentTime + AUDIO_JITTER_SEC : 0;
+  audioQueue = [];
+  audioQueuedSec = 0;
+  workerFrame = null;
+  workerFrameIndex = -1;
+  workerMaxIndex = -1;
+  workerMinIndex = -1;
+  workerQueueLen = 0;
+  frameDirty = false;
+  lastWorkerFrameIndexSeen = -1;
+  if (worker) worker.postMessage({ type: "reset" });
+  if (DEBUG) {
+    warn("Session recovery started", { reason, workerSessionId, audioSessionId });
+  }
 }
 
 function computeAnimOffsetSec() {
@@ -1958,6 +2141,7 @@ function computePlaybackFps(bufferSec) {
 
 function tryStartPlayback() {
   if (audioStarted || !audioEnabled || !audioCtx) return;
+  if (resyncing || hasSessionMismatch()) return;
   const meshBuf = Math.max(workerQueueLen / streamFps, (workerMaxIndex + 1) / streamFps);
   const audioBuf = audioQueuedSec;
   if (meshBuf >= 0.6 && audioBuf >= AUDIO_START_BUFFER_SEC) {
@@ -1980,6 +2164,7 @@ function tryStartPlayback() {
 
 function updatePlaybackFrameWorker() {
   const nowSec = performance.now() / 1000;
+  const nowMs = performance.now();
   if (!workerEnabled) {
     pipelineModeEl.textContent = "Unsupported";
     playStateEl.textContent = "holding";
@@ -1999,47 +2184,10 @@ function updatePlaybackFrameWorker() {
     playStateEl.textContent = "paused";
     return;
   }
-  /* TEMPORARY DEBUG BLOCK: Start - Disabling silent playback when audio/backend isn't active */
-  /*
-  // Silent playback when audio is disabled or not yet started: drive frames from wall clock.
-  if (!audioEnabled || !audioCtx || !audioStarted) {
-    const meshBuf = Math.max(workerQueueLen / streamFps, (workerMaxIndex + 1) / streamFps);
-    if (meshBuf < 1.0) {
-      playStateEl.textContent = "buffering";
-      return;
-    }
-    if (silentStartTime === null) {
-      silentStartTime = performance.now() / 1000;
-    }
-    maybeSetAnimOffset();
-    const elapsed = performance.now() / 1000 - silentStartTime + animOffsetSec;
-    if (worker) {
-      worker.postMessage({ type: "tick", elapsed });
-    }
-    if (frameDirty && workerFrame) {
-      if (DEBUG && playCount % 30 === 0) log("Applying silent frame", { playCount, workerFrameIndex });
-      resetAllMorphsToBase();
-      applyAnimFrame(workerFrame);
-      frameDirty = false;
-      playCount += 1;
-      playStateEl.textContent = "playing";
-      lastFrameUpdate = performance.now();
-    } else {
-      playStateEl.textContent = "holding";
-    }
-    if (workerFrameIndex >= 0) {
-      currentFrameIndex = workerFrameIndex;
-    }
-    const bufferSec = meshBufferedSeconds();
-    updateHud(bufferSec);
-    // If audio is enabled, keep attempting to start playback in the background.
-    if (audioEnabled && audioCtx && !audioStarted) {
-      tryStartPlayback();
-    }
+  if (resyncing || hasSessionMismatch()) {
+    playStateEl.textContent = "resyncing";
     return;
   }
-  */
-  /* TEMPORARY DEBUG BLOCK: End */
   tryStartPlayback();
   if (!audioStarted || !audioCtx || audioStartTime === null) {
     playStateEl.textContent = "buffering";
@@ -2070,11 +2218,23 @@ function updatePlaybackFrameWorker() {
     playCount += 1;
     playStateEl.textContent = "playing";
     lastFrameUpdate = performance.now();
+    stallSinceMs = null;
   } else {
-    if (DEBUG && !frameDirty) {
-      log("Audio holding - no new worker frame", { elapsed: elapsed.toFixed(3) });
+    if (stallSinceMs === null) stallSinceMs = nowMs;
+    const stalledForMs = nowMs - stallSinceMs;
+    if (stalledForMs <= STALL_HOLD_MS) {
+      playStateEl.textContent = "stalled_hold";
+    } else {
+      const easeT = Math.min(1, (stalledForMs - STALL_HOLD_MS) / STALL_EASE_MS);
+      applyStallEase(easeT);
+      playStateEl.textContent = "stalled_ease";
     }
-    playStateEl.textContent = "holding";
+    if (DEBUG && !frameDirty && playCount % 30 === 0) {
+      log("Audio holding - no new worker frame", {
+        elapsed: elapsed.toFixed(3),
+        stalledForMs: Math.round(stalledForMs),
+      });
+    }
   }
 
   if (manualOverride.active) {
@@ -2111,7 +2271,7 @@ function updatePlaybackFrameWorker() {
   }
   if (DEBUG && audioStarted) {
     const now = performance.now();
-    if (now - lastFrameUpdate > 2000) {
+    if (now > startupSuppressUntilMs && now - lastFrameUpdate > 2000) {
       warn("No frames applied for >2s", { workerQueueLen, workerReady, streamFps });
       lastFrameUpdate = now;
     }
@@ -2155,6 +2315,13 @@ function updateHud() {
           audioBuf: audioBufferedSeconds().toFixed(2),
           audioStarted,
           workerReady,
+          workerSessionId,
+          audioSessionId,
+          serverBootId,
+          protocolVersion,
+          snapshotDropped: workerSnapshotDropped,
+          liveDropped: workerLiveDropped,
+          resyncSkipped: workerResyncSkipped,
         },
         lastHudLog
       );
@@ -2292,6 +2459,10 @@ function onClearBuffer() {
   workerFrameIndex = -1;
   workerFrame = null;
   frameDirty = false;
+  stallSinceMs = null;
+  resyncing = false;
+  sessionMismatchWarned = false;
+  startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
   animOffsetSec = 0;
   animOffsetSet = false;
   userOffset.set(0, 0, 0);
@@ -2394,6 +2565,7 @@ async function onEnableAudio() {
   audioEnabled = true;
   if (audioStatusEl) audioStatusEl.textContent = "enabled";
   silentStartTime = null;
+  startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   await audioCtx.resume();
   connectAudioSocket();

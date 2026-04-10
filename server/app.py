@@ -870,7 +870,7 @@ class GoogleAdkLiveAudioEngine:
         assert self._types is not None
         kwargs = {
             "streaming_mode": self._streaming_mode.BIDI,
-            "response_modalities": ["AUDIO"],
+            "response_modalities": [self._types.Modality.AUDIO],
             "input_audio_transcription": None,
             "output_audio_transcription": None,
         }
@@ -1031,6 +1031,12 @@ class ConversationRuntime:
             await self.interrupt(reason="new_turn")
         pcm_bytes = b"".join(self._user_audio_chunks)
         self._user_audio_chunks = []
+        logger.info(
+            "Conversation PTT end: received %d bytes of audio (%.2f sec at sr=%d)",
+            len(pcm_bytes),
+            len(pcm_bytes) / (max(1, self._user_audio_sr) * 2),
+            self._user_audio_sr
+        )
         self._reply_task = asyncio.create_task(self._run_turn(pcm_bytes, self._user_audio_sr))
 
     async def interrupt(self, reason: str = "interrupt") -> None:

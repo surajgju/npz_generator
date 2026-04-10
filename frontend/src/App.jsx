@@ -216,6 +216,7 @@ function App() {
           <button id="enableAudio">Enable Audio</button>
           <button id="connectConversation">Connect Voice</button>
           <button id="pttButton">Push To Talk</button>
+          <button id="disconnectMic">Disconnect Mic</button>
           <button id="interruptReply">Interrupt</button>
           <button id="togglePlay">Pause</button>
           <button id="clearBuffer">Clear Buffer</button>

@@ -37,6 +37,7 @@ let toggleTranslateEl = null;
 let enableAudioBtn = null;
 let connectConversationBtn = null;
 let pttButton = null;
+let disconnectMicButton = null;
 let interruptReplyBtn = null;
 let togglePlayBtn = null;
 let clearBufferBtn = null;
@@ -2296,6 +2297,10 @@ function onInterruptReply() {
   beginSessionRecovery("manual_interrupt");
 }
 
+function onDisconnectMic() {
+  teardownMicCapture();
+}
+
 function teardownMicCapture() {
   pttActive = false;
   if (micProcessor) {
@@ -2939,6 +2944,7 @@ function bindUi() {
   if (enableAudioBtn) enableAudioBtn.addEventListener("click", onEnableAudio);
   if (connectConversationBtn) connectConversationBtn.addEventListener("click", onConnectConversation);
   if (interruptReplyBtn) interruptReplyBtn.addEventListener("click", onInterruptReply);
+  if (disconnectMicButton) disconnectMicButton.addEventListener("click", onDisconnectMic);
   if (pttButton) {
     pttButton.addEventListener("mousedown", onPttPointerDown);
     pttButton.addEventListener("mouseup", onPttPointerUp);
@@ -2974,6 +2980,7 @@ function unbindUi() {
   if (enableAudioBtn) enableAudioBtn.removeEventListener("click", onEnableAudio);
   if (connectConversationBtn) connectConversationBtn.removeEventListener("click", onConnectConversation);
   if (interruptReplyBtn) interruptReplyBtn.removeEventListener("click", onInterruptReply);
+  if (disconnectMicButton) disconnectMicButton.removeEventListener("click", onDisconnectMic);
   if (pttButton) {
     pttButton.removeEventListener("mousedown", onPttPointerDown);
     pttButton.removeEventListener("mouseup", onPttPointerUp);
@@ -3023,6 +3030,7 @@ function collectDom() {
   enableAudioBtn = document.getElementById("enableAudio");
   connectConversationBtn = document.getElementById("connectConversation");
   pttButton = document.getElementById("pttButton");
+  disconnectMicButton = document.getElementById("disconnectMic");
   interruptReplyBtn = document.getElementById("interruptReply");
   togglePlayBtn = document.getElementById("togglePlay");
   clearBufferBtn = document.getElementById("clearBuffer");

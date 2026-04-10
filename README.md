@@ -70,6 +70,7 @@ STREAM_FPS=20 python3 -m uvicorn server.app:app --reload --port 8000
 
 For browser Push-to-Talk conversation, set:
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) for ADK/Gemini Live audio
+export GEMINI_API_KEY=""
 
 ### 2. Open the Live Viewer
 The Three.js viewer will be live at: `http://localhost:8000/`.

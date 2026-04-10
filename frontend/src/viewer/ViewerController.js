@@ -523,11 +523,11 @@ function autoDetectBlinkMorphs() {
     const total = eye + v[2] + v[3];
     return [...v, total > 0 ? eye / total : 0]; // v[4] = ratio
   });
-  const leftRatios  = addRatio(leftScores).sort((a, b) => b[4] - a[4]);
+  const leftRatios = addRatio(leftScores).sort((a, b) => b[4] - a[4]);
   const rightRatios = addRatio(rightScores).sort((a, b) => b[4] - a[4]);
 
   // Pick top 2 by ratio; no hard rejection threshold needed
-  const leftTop  = leftRatios.slice(0, 2).map((v) => v[0]);
+  const leftTop = leftRatios.slice(0, 2).map((v) => v[0]);
   const rightTop = rightRatios.slice(0, 2).map((v) => v[0]);
   idleBlinkAutoNames = Array.from(new Set([...leftTop, ...rightTop]));
 
@@ -542,7 +542,7 @@ function autoDetectBlinkMorphs() {
     const key = idleBlinkAutoNames.join(",");
     if (key !== lastBlinkAutoNames) {
       lastBlinkAutoNames = key;
-      const bestLeft  = leftRatios[0]  ? `${leftRatios[0][0]}(ratio=${leftRatios[0][4].toFixed(2)})`  : "none";
+      const bestLeft = leftRatios[0] ? `${leftRatios[0][0]}(ratio=${leftRatios[0][4].toFixed(2)})` : "none";
       const bestRight = rightRatios[0] ? `${rightRatios[0][0]}(ratio=${rightRatios[0][4].toFixed(2)})` : "none";
       log("Auto blink morphs:", { leftTop, rightTop, bestLeft, bestRight, selected: idleBlinkAutoNames });
     }
@@ -930,7 +930,7 @@ function applyManualOverride(nowSec, overlayOnly = false) {
 
   if (manualOverride.type === "emotion") {
     const payload = manualOverride.payload || {};
-    
+
     // Legacy fallback parameters (if payload uses generic groups)
     const mouthUp = debugMorphTargets.mouthUp || [];
     const mouthDown = debugMorphTargets.mouthDown || [];
@@ -945,7 +945,7 @@ function applyManualOverride(nowSec, overlayOnly = false) {
     if (mDown && mouthDown.length) { applyMorphTargets(mouthDown, mDown); appliedAny = true; }
     if (bUp && browUp.length) { applyMorphTargets(browUp, bUp); appliedAny = true; }
     if (bDown && browDown.length) { applyMorphTargets(browDown, bDown); appliedAny = true; }
-    
+
     // Explicit FLAME / Blendshape explicit target names
     for (const [key, val] of Object.entries(payload)) {
       if (key.startsWith("Exp") || key.startsWith("Shape") || key.startsWith("Mouth")) {
@@ -1292,7 +1292,7 @@ async function loadAvatar() {
     controls.target.copy(userOffset);
     lastBounds = { min: [box.min.x, box.min.y, box.min.z], max: [box.max.x, box.max.y, box.max.z] };
     lodLevelEl.textContent = "Rig";
-  avatarLoaded = true;
+    avatarLoaded = true;
     cacheIdleBones();
     if (toggleTranslateEl && toggleTranslateEl.checked) {
       setTranslateEnabled(true);
@@ -1496,7 +1496,7 @@ function initMorphDebugPanel() {
     const type = typeSelect.value;
     const currentSelection = targetSelect.value;
     targetSelect.innerHTML = '';
-    
+
     const names = Array.from(morphTargetMap.keys())
       .filter(name => name.startsWith(type))
       .sort((a, b) => {
@@ -1504,7 +1504,7 @@ function initMorphDebugPanel() {
         const numB = parseInt(b.replace(/\D/g, '')) || 0;
         return numA - numB;
       });
-    
+
     if (names.length === 0) {
       const opt = document.createElement('option');
       opt.textContent = 'None found';
@@ -1524,7 +1524,7 @@ function initMorphDebugPanel() {
   }
 
   typeSelect.addEventListener('change', populateDropdown);
-  
+
   slider.addEventListener('input', (e) => {
     const val = parseFloat(e.target.value);
     valLabel.textContent = val.toFixed(2);
@@ -1534,16 +1534,16 @@ function initMorphDebugPanel() {
   applyBtn.addEventListener('click', () => {
     const name = targetSelect.value;
     if (!name || targetSelect.disabled) return;
-    
+
     const value = parseFloat(slider.value);
     const targets = morphTargetMap.get(name);
-    
+
     if (targets) {
       targets.forEach(t => {
         t.mesh.morphTargetInfluences[t.index] = value;
       });
       log(`[Debug] ${name} set to ${value}`);
-      
+
       // Feedback animation
       applyBtn.style.transform = 'scale(0.95)';
       setTimeout(() => applyBtn.style.transform = '', 100);
@@ -1557,14 +1557,14 @@ function initMorphDebugPanel() {
     slider.value = 0;
     valLabel.textContent = "0.00";
     valLabel.style.color = '#888';
-    
+
     const targets = morphTargetMap.get(name);
     if (targets) {
       targets.forEach(t => {
         t.mesh.morphTargetInfluences[t.index] = 0;
       });
       log(`[Debug] ${name} reset`);
-      
+
       // Feedback animation
       resetBtn.style.transform = 'scale(0.95)';
       setTimeout(() => resetBtn.style.transform = '', 100);
@@ -1680,10 +1680,10 @@ function applyAnimFrame(frame) {
   }
   // Offset already advanced inside the loop above.
   if (DEBUG) {
-    log("applyAnimFrame execute", { 
-      playCount, 
-      firstMorph: frame[3 + nb * 4], 
-      nmorphs: nm 
+    log("applyAnimFrame execute", {
+      playCount,
+      firstMorph: frame[3 + nb * 4],
+      nmorphs: nm
     });
   }
   let maxAbs = 0;
@@ -1788,7 +1788,7 @@ function startManualOverride(type, durationSec, payload) {
   refreshDebugMorphTargets();
 }
 
-window.testMorph = function(name, value) {
+window.testMorph = function (name, value) {
   const targets = morphTargetMap.get(name);
   if (!targets) {
     console.error(`Morph target ${name} not found in map.`);
@@ -2193,21 +2193,75 @@ async function ensureMicCapture() {
   await micCaptureCtx.resume();
   micSampleRate = micCaptureCtx.sampleRate || CONVERSATION_AUDIO_SAMPLE_RATE;
   micSource = micCaptureCtx.createMediaStreamSource(micStream);
-  micProcessor = micCaptureCtx.createScriptProcessor(CONVERSATION_PTT_BUFFER, 1, 1);
+  
+  let useWorklet = !!(micCaptureCtx.audioWorklet);
+  if (useWorklet) {
+    const workletCode = `
+      class MicProcessor extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.buffer = new Float32Array(${CONVERSATION_PTT_BUFFER});
+          this.offset = 0;
+        }
+        process(inputs, outputs, parameters) {
+          if (!inputs[0] || !inputs[0][0]) return true;
+          const input = inputs[0][0];
+          for (let i = 0; i < input.length; i++) {
+            this.buffer[this.offset++] = input[i];
+            if (this.offset >= ${CONVERSATION_PTT_BUFFER}) {
+              this.port.postMessage(this.buffer);
+              this.offset = 0;
+              this.buffer = new Float32Array(${CONVERSATION_PTT_BUFFER});
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor('mic-processor', MicProcessor);
+    `;
+    const blob = new Blob([workletCode], { type: 'application/javascript' });
+    const workletUrl = URL.createObjectURL(blob);
+    try {
+      await micCaptureCtx.audioWorklet.addModule(workletUrl);
+      micProcessor = new AudioWorkletNode(micCaptureCtx, 'mic-processor');
+      micProcessor.port.onmessage = (event) => {
+        if (!pttActive || !conversationConnected) return;
+        const samples = event.data;
+        const int16 = float32ToInt16(samples);
+        sendConversationMessage({
+          type: "user_audio",
+          seq: pttSeq++,
+          sr: micSampleRate,
+          dtype: "int16",
+          pcm_b64: int16ToBase64(int16),
+        });
+      };
+    } catch (e) {
+      console.warn("AudioWorklet failed, falling back to ScriptProcessor", e);
+      useWorklet = false;
+    } finally {
+      URL.revokeObjectURL(workletUrl);
+    }
+  }
+
+  if (!useWorklet) {
+    micProcessor = micCaptureCtx.createScriptProcessor(CONVERSATION_PTT_BUFFER, 1, 1);
+    micProcessor.onaudioprocess = (event) => {
+      if (!pttActive || !conversationConnected) return;
+      const samples = event.inputBuffer.getChannelData(0);
+      const int16 = float32ToInt16(samples);
+      sendConversationMessage({
+        type: "user_audio",
+        seq: pttSeq++,
+        sr: micSampleRate,
+        dtype: "int16",
+        pcm_b64: int16ToBase64(int16),
+      });
+    };
+  }
+
   micMuteGain = micCaptureCtx.createGain();
   micMuteGain.gain.value = 0;
-  micProcessor.onaudioprocess = (event) => {
-    if (!pttActive || !conversationConnected) return;
-    const samples = event.inputBuffer.getChannelData(0);
-    const int16 = float32ToInt16(samples);
-    sendConversationMessage({
-      type: "user_audio",
-      seq: pttSeq++,
-      sr: micSampleRate,
-      dtype: "int16",
-      pcm_b64: int16ToBase64(int16),
-    });
-  };
   micSource.connect(micProcessor);
   micProcessor.connect(micMuteGain);
   micMuteGain.connect(micCaptureCtx.destination);
@@ -2246,6 +2300,7 @@ function teardownMicCapture() {
   pttActive = false;
   if (micProcessor) {
     micProcessor.disconnect();
+    if (micProcessor.port) micProcessor.port.onmessage = null;
     micProcessor.onaudioprocess = null;
     micProcessor = null;
   }

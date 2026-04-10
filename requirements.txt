@@ -16,3 +16,5 @@ opencv-python
 fastapi
 uvicorn
 websockets
+google-adk
+google-genai

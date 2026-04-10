@@ -13,6 +13,9 @@ let streamFpsEl = null;
 let pipelineModeEl = null;
 let audioStatusEl = null;
 let audioBufferEl = null;
+let conversationStatusEl = null;
+let conversationStateEl = null;
+let conversationSessionEl = null;
 let playStateEl = null;
 let lodLevelEl = null;
 let bufferFillEl = null;
@@ -32,6 +35,9 @@ let toggleWireframeEl = null;
 let toggleAutoRotateEl = null;
 let toggleTranslateEl = null;
 let enableAudioBtn = null;
+let connectConversationBtn = null;
+let pttButton = null;
+let interruptReplyBtn = null;
 let togglePlayBtn = null;
 let clearBufferBtn = null;
 let resetCamBtn = null;
@@ -1097,12 +1103,28 @@ let audioStartTime = null;
 let audioScheduledTime = 0;
 let audioQueue = [];
 let audioQueuedSec = 0;
+let conversationWs = null;
+let conversationConnected = false;
+let conversationId = null;
+let conversationReplyId = null;
+let conversationStreamSessionId = null;
+let assistantLifecycleState = "idle";
+let micStream = null;
+let micCaptureCtx = null;
+let micSource = null;
+let micProcessor = null;
+let micMuteGain = null;
+let pttActive = false;
+let pttSeq = 0;
+let micSampleRate = 16000;
 let silentStartTime = null;
 let animOffsetSec = 0;
 let animOffsetSet = false;
 const AUDIO_JITTER_SEC = 0.08;
 const AUDIO_START_BUFFER_SEC = 0.6;
 const AUDIO_LOW_BUFFER_SEC = 0.3;
+const CONVERSATION_AUDIO_SAMPLE_RATE = 16000;
+const CONVERSATION_PTT_BUFFER = 2048;
 const STARTUP_SUPPRESS_MS = 4000;
 const STALL_HOLD_MS = 300;
 const STALL_EASE_MS = 700;
@@ -1922,6 +1944,7 @@ function initWorker() {
     type: "init",
     host: WS_HOST,
     knownBootId: known.knownBootId,
+    knownServerClockId: known.knownServerClockId,
     knownSessionId: known.knownSessionId,
     lastAppliedFrame: known.knownLastAppliedFrame,
     buildId: BUILD_ID,
@@ -1960,12 +1983,18 @@ function connectAudioSocket() {
       } catch {
         audioHeader = null;
       }
-      if (audioHeader && audioHeader.type === "audio" && audioHeader.session_id) {
-        const nextAudioSessionId = audioHeader.session_id;
+      if (audioHeader && audioHeader.type === "audio") {
+        const nextAudioSessionId =
+          audioHeader.stream_session_id || audioHeader.session_id || null;
+        if (nextAudioSessionId && conversationSessionEl) {
+          conversationSessionEl.textContent = nextAudioSessionId;
+        }
         if (audioSessionId && nextAudioSessionId !== audioSessionId) {
           beginSessionRecovery("audio_session_switch");
         }
-        audioSessionId = nextAudioSessionId;
+        if (nextAudioSessionId) audioSessionId = nextAudioSessionId;
+      } else if (audioHeader && audioHeader.type === "audio_control" && audioHeader.action === "stop") {
+        beginSessionRecovery("audio_control_stop");
       }
       return;
     }
@@ -2007,6 +2036,237 @@ function connectAudioSocket() {
   };
 }
 
+function updateConversationHud() {
+  if (conversationStatusEl) {
+    conversationStatusEl.textContent = conversationConnected ? "connected" : "disconnected";
+  }
+  if (conversationStateEl) {
+    conversationStateEl.textContent = assistantLifecycleState;
+  }
+  if (conversationSessionEl) {
+    conversationSessionEl.textContent = conversationStreamSessionId || "-";
+  }
+}
+
+function sendConversationMessage(payload) {
+  if (!conversationWs || conversationWs.readyState !== WebSocket.OPEN) return;
+  conversationWs.send(JSON.stringify(payload));
+}
+
+function connectConversationSocket() {
+  if (conversationWs) return;
+  conversationWs = new WebSocket(`ws://${WS_HOST}/ws/conversation`);
+  conversationWs.onopen = () => {
+    conversationConnected = true;
+    assistantLifecycleState = "idle";
+    updateConversationHud();
+    sendConversationMessage({ type: "hello", protocol_version: 1, build_id: BUILD_ID });
+  };
+  conversationWs.onclose = () => {
+    conversationConnected = false;
+    assistantLifecycleState = "idle";
+    updateConversationHud();
+    conversationWs = null;
+  };
+  conversationWs.onerror = () => {
+    conversationConnected = false;
+    assistantLifecycleState = "idle";
+    updateConversationHud();
+  };
+  conversationWs.onmessage = (event) => {
+    let msg = null;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "hello_ack") {
+      conversationId = msg.conversation_id || conversationId;
+      serverBootId = msg.server_boot_id || serverBootId;
+      serverClockId = msg.server_clock_id || serverClockId;
+      if (Number.isFinite(msg.protocol_version)) protocolVersion = msg.protocol_version;
+      updateConversationHud();
+      if (DEBUG) {
+        log("Conversation hello_ack", {
+          conversationId,
+          protocolVersion,
+          serverBootId,
+          serverClockId,
+        });
+      }
+      return;
+    }
+    if (msg.type === "listening") {
+      assistantLifecycleState = "listening";
+      updateConversationHud();
+      return;
+    }
+    if (msg.type === "assistant_thinking_start") {
+      assistantLifecycleState = "thinking";
+      updateConversationHud();
+      return;
+    }
+    if (msg.type === "assistant_thinking_end") {
+      if (assistantLifecycleState === "thinking") assistantLifecycleState = "idle";
+      updateConversationHud();
+      return;
+    }
+    if (msg.type === "assistant_speaking_start") {
+      assistantLifecycleState = "speaking";
+      conversationReplyId = msg.reply_id || conversationReplyId;
+      const nextSessionId = msg.stream_session_id || msg.session_id || null;
+      if (nextSessionId && conversationStreamSessionId && nextSessionId !== conversationStreamSessionId) {
+        beginSessionRecovery("conversation_stream_switch");
+      }
+      conversationStreamSessionId = nextSessionId || conversationStreamSessionId;
+      updateConversationHud();
+      return;
+    }
+    if (msg.type === "assistant_speaking_end") {
+      assistantLifecycleState = "idle";
+      updateConversationHud();
+      return;
+    }
+    if (msg.type === "interrupted") {
+      assistantLifecycleState = "idle";
+      updateConversationHud();
+      return;
+    }
+    if (msg.type === "error") {
+      warn("Conversation error", msg);
+      assistantLifecycleState = "idle";
+      updateConversationHud();
+    }
+  };
+}
+
+async function ensureConversationConnected(timeoutMs = 4000) {
+  if (conversationConnected && conversationWs && conversationWs.readyState === WebSocket.OPEN) return;
+  connectConversationSocket();
+  const start = performance.now();
+  while (!(conversationConnected && conversationWs && conversationWs.readyState === WebSocket.OPEN)) {
+    if (performance.now() - start > timeoutMs) {
+      throw new Error("Conversation socket timeout");
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+}
+
+function float32ToInt16(input) {
+  const out = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    out[i] = s < 0 ? s * 32768 : s * 32767;
+  }
+  return out;
+}
+
+function int16ToBase64(int16Array) {
+  const bytes = new Uint8Array(int16Array.buffer);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+async function ensureMicCapture() {
+  if (micCaptureCtx && micProcessor && micSource) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("getUserMedia is not supported in this browser");
+  }
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      sampleRate: CONVERSATION_AUDIO_SAMPLE_RATE,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+  });
+  micCaptureCtx = new (window.AudioContext || window.webkitAudioContext)({
+    sampleRate: CONVERSATION_AUDIO_SAMPLE_RATE,
+  });
+  await micCaptureCtx.resume();
+  micSampleRate = micCaptureCtx.sampleRate || CONVERSATION_AUDIO_SAMPLE_RATE;
+  micSource = micCaptureCtx.createMediaStreamSource(micStream);
+  micProcessor = micCaptureCtx.createScriptProcessor(CONVERSATION_PTT_BUFFER, 1, 1);
+  micMuteGain = micCaptureCtx.createGain();
+  micMuteGain.gain.value = 0;
+  micProcessor.onaudioprocess = (event) => {
+    if (!pttActive || !conversationConnected) return;
+    const samples = event.inputBuffer.getChannelData(0);
+    const int16 = float32ToInt16(samples);
+    sendConversationMessage({
+      type: "user_audio",
+      seq: pttSeq++,
+      sr: micSampleRate,
+      dtype: "int16",
+      pcm_b64: int16ToBase64(int16),
+    });
+  };
+  micSource.connect(micProcessor);
+  micProcessor.connect(micMuteGain);
+  micMuteGain.connect(micCaptureCtx.destination);
+}
+
+async function startPushToTalk() {
+  if (pttActive) return;
+  if (!audioEnabled) await onEnableAudio();
+  await ensureConversationConnected();
+  await ensureMicCapture();
+  pttActive = true;
+  pttSeq = 0;
+  assistantLifecycleState = "listening";
+  updateConversationHud();
+  sendConversationMessage({ type: "ptt_start" });
+  if (pttButton) pttButton.classList.add("active");
+}
+
+function stopPushToTalk() {
+  if (!pttActive) return;
+  pttActive = false;
+  sendConversationMessage({ type: "ptt_end" });
+  if (assistantLifecycleState === "listening") {
+    assistantLifecycleState = "thinking";
+    updateConversationHud();
+  }
+  if (pttButton) pttButton.classList.remove("active");
+}
+
+function onInterruptReply() {
+  sendConversationMessage({ type: "interrupt" });
+  beginSessionRecovery("manual_interrupt");
+}
+
+function teardownMicCapture() {
+  pttActive = false;
+  if (micProcessor) {
+    micProcessor.disconnect();
+    micProcessor.onaudioprocess = null;
+    micProcessor = null;
+  }
+  if (micSource) {
+    micSource.disconnect();
+    micSource = null;
+  }
+  if (micMuteGain) {
+    micMuteGain.disconnect();
+    micMuteGain = null;
+  }
+  if (micStream) {
+    for (const track of micStream.getTracks()) track.stop();
+    micStream = null;
+  }
+  if (micCaptureCtx) {
+    micCaptureCtx.close();
+    micCaptureCtx = null;
+  }
+}
+
 function scheduleAudioBuffer(buffer, duration) {
   const src = audioCtx.createBufferSource();
   src.buffer = buffer;
@@ -2034,22 +2294,25 @@ function meshBufferedSeconds() {
 function loadKnownSessionState() {
   try {
     const knownBootId = sessionStorage.getItem("viewer_known_boot_id");
+    const knownServerClockId = sessionStorage.getItem("viewer_known_server_clock_id");
     const knownSessionId = sessionStorage.getItem("viewer_known_session_id");
     const rawFrame = sessionStorage.getItem("viewer_last_applied_frame");
     const knownLastAppliedFrame = rawFrame !== null ? Number(rawFrame) : -1;
     return {
       knownBootId: knownBootId || null,
+      knownServerClockId: knownServerClockId || null,
       knownSessionId: knownSessionId || null,
       knownLastAppliedFrame: Number.isFinite(knownLastAppliedFrame) ? knownLastAppliedFrame : -1,
     };
   } catch {
-    return { knownBootId: null, knownSessionId: null, knownLastAppliedFrame: -1 };
+    return { knownBootId: null, knownServerClockId: null, knownSessionId: null, knownLastAppliedFrame: -1 };
   }
 }
 
 function persistKnownSessionState() {
   try {
     if (serverBootId) sessionStorage.setItem("viewer_known_boot_id", serverBootId);
+    if (serverClockId) sessionStorage.setItem("viewer_known_server_clock_id", serverClockId);
     if (workerSessionId) sessionStorage.setItem("viewer_known_session_id", workerSessionId);
     if (Number.isFinite(lastWorkerFrameIndexSeen)) {
       sessionStorage.setItem("viewer_last_applied_frame", String(lastWorkerFrameIndexSeen));
@@ -2571,6 +2834,25 @@ async function onEnableAudio() {
   connectAudioSocket();
 }
 
+function onConnectConversation() {
+  connectConversationSocket();
+  updateConversationHud();
+}
+
+function onPttPointerDown(event) {
+  event.preventDefault();
+  startPushToTalk().catch((err) => {
+    warn("PTT start failed", err);
+    pttActive = false;
+    if (pttButton) pttButton.classList.remove("active");
+  });
+}
+
+function onPttPointerUp(event) {
+  event.preventDefault();
+  stopPushToTalk();
+}
+
 function onResize() {
   if (!camera || !renderer) return;
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -2600,6 +2882,16 @@ function bindUi() {
   if (toggleAutoRotateEl) toggleAutoRotateEl.addEventListener("change", onToggleAutoRotate);
   if (toggleTranslateEl) toggleTranslateEl.addEventListener("change", onToggleTranslate);
   if (enableAudioBtn) enableAudioBtn.addEventListener("click", onEnableAudio);
+  if (connectConversationBtn) connectConversationBtn.addEventListener("click", onConnectConversation);
+  if (interruptReplyBtn) interruptReplyBtn.addEventListener("click", onInterruptReply);
+  if (pttButton) {
+    pttButton.addEventListener("mousedown", onPttPointerDown);
+    pttButton.addEventListener("mouseup", onPttPointerUp);
+    pttButton.addEventListener("mouseleave", onPttPointerUp);
+    pttButton.addEventListener("touchstart", onPttPointerDown, { passive: false });
+    pttButton.addEventListener("touchend", onPttPointerUp, { passive: false });
+    pttButton.addEventListener("touchcancel", onPttPointerUp, { passive: false });
+  }
   resizeHandler = onResize;
   window.addEventListener("resize", resizeHandler);
 }
@@ -2625,6 +2917,16 @@ function unbindUi() {
   if (toggleAutoRotateEl) toggleAutoRotateEl.removeEventListener("change", onToggleAutoRotate);
   if (toggleTranslateEl) toggleTranslateEl.removeEventListener("change", onToggleTranslate);
   if (enableAudioBtn) enableAudioBtn.removeEventListener("click", onEnableAudio);
+  if (connectConversationBtn) connectConversationBtn.removeEventListener("click", onConnectConversation);
+  if (interruptReplyBtn) interruptReplyBtn.removeEventListener("click", onInterruptReply);
+  if (pttButton) {
+    pttButton.removeEventListener("mousedown", onPttPointerDown);
+    pttButton.removeEventListener("mouseup", onPttPointerUp);
+    pttButton.removeEventListener("mouseleave", onPttPointerUp);
+    pttButton.removeEventListener("touchstart", onPttPointerDown);
+    pttButton.removeEventListener("touchend", onPttPointerUp);
+    pttButton.removeEventListener("touchcancel", onPttPointerUp);
+  }
   if (resizeHandler) {
     window.removeEventListener("resize", resizeHandler);
     resizeHandler = null;
@@ -2642,6 +2944,9 @@ function collectDom() {
   pipelineModeEl = document.getElementById("pipelineMode");
   audioStatusEl = document.getElementById("audioStatus");
   audioBufferEl = document.getElementById("audioBuffer");
+  conversationStatusEl = document.getElementById("conversationStatus");
+  conversationStateEl = document.getElementById("conversationState");
+  conversationSessionEl = document.getElementById("conversationSession");
   playStateEl = document.getElementById("playState");
   lodLevelEl = document.getElementById("lodLevel");
   bufferFillEl = document.getElementById("bufferFill");
@@ -2661,6 +2966,9 @@ function collectDom() {
   toggleAutoRotateEl = document.getElementById("toggleAutoRotate");
   toggleTranslateEl = document.getElementById("toggleTranslate");
   enableAudioBtn = document.getElementById("enableAudio");
+  connectConversationBtn = document.getElementById("connectConversation");
+  pttButton = document.getElementById("pttButton");
+  interruptReplyBtn = document.getElementById("interruptReply");
   togglePlayBtn = document.getElementById("togglePlay");
   clearBufferBtn = document.getElementById("clearBuffer");
   resetCamBtn = document.getElementById("resetCam");
@@ -2674,6 +2982,7 @@ export async function initViewer() {
   if (initialized) return;
   initialized = true;
   collectDom();
+  updateConversationHud();
   if (!canvas) {
     error("Canvas element not found (#canvas).");
     return;
@@ -2708,6 +3017,11 @@ export function destroyViewer() {
     audioWs.close();
     audioWs = null;
   }
+  if (conversationWs) {
+    conversationWs.close();
+    conversationWs = null;
+  }
+  teardownMicCapture();
   if (audioCtx) {
     audioCtx.close();
     audioCtx = null;

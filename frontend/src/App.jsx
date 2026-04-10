@@ -119,6 +119,18 @@ function App() {
           <span id="audioBuffer">0.0s</span>
         </div>
         <div className="row">
+          <span>Conversation</span>
+          <span id="conversationStatus">disconnected</span>
+        </div>
+        <div className="row">
+          <span>Assistant</span>
+          <span id="conversationState">idle</span>
+        </div>
+        <div className="row">
+          <span>Reply Stream</span>
+          <span id="conversationSession">-</span>
+        </div>
+        <div className="row">
           <span>Playback</span>
           <span id="playState">buffering</span>
         </div>
@@ -202,6 +214,9 @@ function App() {
         </div>
         <div className="btns">
           <button id="enableAudio">Enable Audio</button>
+          <button id="connectConversation">Connect Voice</button>
+          <button id="pttButton">Push To Talk</button>
+          <button id="interruptReply">Interrupt</button>
           <button id="togglePlay">Pause</button>
           <button id="clearBuffer">Clear Buffer</button>
           <button id="resetCam">Reset Cam</button>

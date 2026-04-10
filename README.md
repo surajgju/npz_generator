@@ -12,7 +12,8 @@ An end-to-end pipeline for generating expressive SMPL-X motion from audio. This 
 
 - **🎭 Expressive Motion Generation**: Uses the **EMAGE** (Expressive Motion Generation) architecture for synchronized body, face, hand, and global translation from raw audio.
 - **⚡ Real-Time Streaming Pipeline**: A low-latency system that processes audio chunks via WebSockets and streams SMPL‑X animation directly to a Three.js viewer.
-- **🧭 Sessionized Streaming (Protocol v2)**: Per-session ring buffers and reconnect-aware handshake (`anim_subscribe`) with `session_id`, `server_boot_id`, and monotonic `server_time_ms`.
+- **🎙️ Voice Conversation (Google ADK Live Audio)**: Browser Push-to-Talk (`/ws/conversation`) streams user PCM directly to ADK Live and routes assistant audio into the existing audio/anim streaming path.
+- **🧭 Sessionized Streaming (Protocol v2)**: Per-reply stream sessions with reconnect-aware handshake (`anim_subscribe`) using `stream_session_id`, `server_boot_id`, `server_clock_id`, and monotonic `server_time_ms`.
 - **🔁 Snapshot Recovery**: Reconnecting clients receive a short snapshot window (2-3s), then jump to live edge without replay burst.
 - **🛡️ Drift/Freeze Protection**: Worker tail-lock alignment with timeout and resync request; viewer has explicit stall states (`stalled_hold`, `stalled_ease`, `resyncing`).
 - **🧹 Session Lifecycle GC**: Deprecated/idle sessions are evicted by TTL and LRU caps to prevent buffer leaks.
@@ -67,18 +68,22 @@ Our streaming architecture allows you to live-stream audio to a server and get b
 STREAM_FPS=20 python3 -m uvicorn server.app:app --reload --port 8000
 ```
 
+For browser Push-to-Talk conversation, set:
+- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) for ADK/Gemini Live audio
+
 ### 2. Open the Live Viewer
 The Three.js viewer will be live at: `http://localhost:8000/`.
 
 ### 3. Stream Audio (Example Simulator)
 Use our utility script to simulate a live audio stream from a file:
 ```bash
-python3 scripts/stream_audio_to_ws.py --audio ./input/your_audio.wav --chunk 0.5
+python3 scripts/stream_audio_to_ws.py --audio ./input/romantic_narration.mp3 --chunk 0.5
+python3 scripts/stream_audio_to_ws.py --audio ./input/swara_2.mp3 --chunk 0.5
 ```
 
 ### 4. Protocol v2 Reconnect Flow (Implemented)
 - Client connects `/ws/anim`, sends:
-  - `anim_subscribe { protocol_version: 2, known_boot_id, known_session_id, last_applied_frame }`
+  - `anim_subscribe { protocol_version: 2, known_boot_id, known_server_clock_id, known_stream_session_id, last_applied_frame }`
 - Server responds:
   - `anim_subscribe_ack` with `mode: resume|live_only|reset_required`
 - If `resume`, server sends:
@@ -94,11 +99,24 @@ python3 scripts/stream_audio_to_ws.py --audio ./input/your_audio.wav --chunk 0.5
 
 ### 5. Audio Channel Metadata
 `/ws/audio_out` now includes:
-- `session_id`
+- `stream_session_id` (plus `session_id` fallback during rollout)
 - `chunk_id`
 - `audio_sample_cursor` (absolute samples in session)
 - `server_time_ms`
 - `server_boot_id`
+- `server_clock_id`
+
+### 6. Conversation Channel (`/ws/conversation`)
+- Handshake:
+  - `hello` -> `hello_ack { conversation_id, protocol_version, server_boot_id, server_clock_id, server_time_ms }`
+- Lifecycle:
+  - `listening`
+  - `assistant_thinking_start` / `assistant_thinking_end`
+  - `assistant_speaking_start { reply_id, stream_session_id }`
+  - `assistant_speaking_end { reply_id, stream_session_id }`
+  - `interrupted { reply_id, stream_session_id }`
+- User control:
+  - `ptt_start`, repeated `user_audio { seq, sr, dtype, pcm_b64 }`, `ptt_end`, `interrupt`
 
 ---
 
@@ -187,8 +205,8 @@ Fine-tune your animation quality via CLI or config files:
 
 ---
 
-## 🌩️ Gemini Live Integration (Stub)
-Integration for high-fidelity audio/motion bridges is pre-wired:
+## 🌩️ Streaming Integration
+The simulator path remains unchanged and still feeds the same inference/broadcast pipeline:
 ```python
 from server.gemini_adapter import GeminiAudioBridge
 

@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 PROTOCOL_VERSION = 2
+CONVERSATION_PROTOCOL_VERSION = 1
 SERVER_BOOT_ID = str(uuid.uuid4())
 SERVER_CLOCK_ID = "monotonic-ms-v1"
 BOOT_MONO_NS = time.monotonic_ns()
@@ -115,6 +116,9 @@ retargeter = SmplxRetargeter(os.path.join(os.path.dirname(__file__), "retarget_m
 STREAM_FPS = int(os.environ.get("STREAM_FPS", "20"))
 SLOW_MOTION_FACTOR = float(os.environ.get("SLOW_MOTION_FACTOR", "1.0"))
 BASE_FPS = 30
+CONVERSATION_AUDIO_SR = int(os.environ.get("CONVERSATION_AUDIO_SR", os.environ.get("CONVERSATION_STT_SR", "16000")))
+CONVERSATION_PCM_CHUNK_MS = int(os.environ.get("CONVERSATION_PCM_CHUNK_MS", "20"))
+CONVERSATION_PTT_MAX_SEC = float(os.environ.get("CONVERSATION_PTT_MAX_SEC", "20"))
 
 SNAPSHOT_SECONDS = float(os.environ.get("SNAPSHOT_SECONDS", "3.0"))
 SNAPSHOT_FRAMES = int(math.ceil(SNAPSHOT_SECONDS * STREAM_FPS))
@@ -150,16 +154,21 @@ class SessionState:
     deprecated_at_ms: Optional[int] = None
     frame_ring: Deque[SessionFrame] = field(default_factory=lambda: deque(maxlen=SNAPSHOT_FRAMES))
     latest_frame: int = -1
+    next_frame_index: int = 0
     latest_audio_cursor: int = 0
     latest_audio_sr: int = 16000
     latest_audio_server_time_ms: int = 0
     producer_connected: bool = False
     anim_subscriber_count: int = 0
+    generation_epoch: int = 0
+    conversation_id: Optional[str] = None
+    reply_id: Optional[str] = None
 
 
 sessions_lock = asyncio.Lock()
 sessions: Dict[str, SessionState] = {}
 active_session_id: Optional[str] = None
+epoch_drop_count = 0
 
 
 def _audio_frame_from_cursor(samples: int, sr: int) -> int:
@@ -179,7 +188,152 @@ def _drain_queue_nowait(q: asyncio.Queue) -> int:
     return drained
 
 
-async def _create_audio_session() -> str:
+def _resolve_stream_session_id(payload: Dict[str, Any]) -> Optional[str]:
+    return (
+        payload.get("stream_session_id")
+        or payload.get("streamsessionid")
+        or payload.get("session_id")
+    )
+
+
+def _pcm16_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
+    return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+async def _broadcast_audio_control(action: str, stream_session_id: str, reason: str) -> None:
+    if not audio_clients:
+        return
+    header = {
+        "type": "audio_control",
+        "action": action,
+        "stream_session_id": stream_session_id,
+        "session_id": stream_session_id,
+        "reason": reason,
+        "server_time_ms": _server_time_ms(),
+        "server_boot_id": SERVER_BOOT_ID,
+        "server_clock_id": SERVER_CLOCK_ID,
+    }
+    dead_audio: List[WebSocket] = []
+    for ws in list(audio_clients):
+        try:
+            await ws.send_text(json.dumps(header))
+        except Exception:
+            dead_audio.append(ws)
+    for ws in dead_audio:
+        audio_clients.discard(ws)
+
+
+async def ingest_audio_chunk(
+    *,
+    audio_np: np.ndarray,
+    sr: int,
+    chunk_id: Optional[str],
+    stream_session_id: str,
+    generation_epoch: int,
+    source: str,
+    conversation_id: Optional[str],
+    reply_id: Optional[str],
+) -> None:
+    global epoch_drop_count
+    sample_count = int(audio_np.shape[0])
+    now_ms = _server_time_ms()
+    async with sessions_lock:
+        st = sessions.get(stream_session_id)
+        if st is None:
+            logger.warning("Dropping audio chunk for missing stream session=%s", stream_session_id)
+            return
+        if generation_epoch != st.generation_epoch:
+            epoch_drop_count += 1
+            logger.info(
+                "Dropping stale audio chunk session=%s epoch=%d active_epoch=%d",
+                stream_session_id,
+                generation_epoch,
+                st.generation_epoch,
+            )
+            return
+        st.last_activity_ms = now_ms
+        st.latest_audio_sr = sr
+        st.latest_audio_cursor += sample_count
+        st.latest_audio_server_time_ms = now_ms
+        if conversation_id:
+            st.conversation_id = conversation_id
+        if reply_id:
+            st.reply_id = reply_id
+        audio_cursor = st.latest_audio_cursor
+    audio_int16 = np.clip(audio_np * 32768.0, -32768, 32767).astype(np.int16)
+    audio_bytes = audio_int16.tobytes()
+    if audio_clients:
+        header = {
+            "type": "audio",
+            "stream_session_id": stream_session_id,
+            "session_id": stream_session_id,
+            "conversation_id": conversation_id,
+            "reply_id": reply_id,
+            "chunk_id": chunk_id,
+            "sr": sr,
+            "channels": 1,
+            "dtype": "int16",
+            "samples": sample_count,
+            "audio_sample_cursor": audio_cursor,
+            "generation_epoch": generation_epoch,
+            "server_time_ms": now_ms,
+            "server_boot_id": SERVER_BOOT_ID,
+            "server_clock_id": SERVER_CLOCK_ID,
+        }
+        dead_audio: List[WebSocket] = []
+        for ws in list(audio_clients):
+            try:
+                await ws.send_text(json.dumps(header))
+                await ws.send_bytes(audio_bytes)
+            except Exception:
+                dead_audio.append(ws)
+        for ws in dead_audio:
+            audio_clients.discard(ws)
+        logger.info(
+            "Audio broadcast stream=%s chunk_id=%s samples=%d clients=%d source=%s",
+            stream_session_id,
+            chunk_id,
+            sample_count,
+            len(audio_clients),
+            source,
+        )
+    try:
+        audio_in_queue.put_nowait(
+            (
+                audio_np,
+                sr,
+                chunk_id,
+                stream_session_id,
+                generation_epoch,
+                source,
+                conversation_id,
+                reply_id,
+            )
+        )
+    except asyncio.QueueFull:
+        try:
+            old = audio_in_queue.get_nowait()
+            audio_in_queue.put_nowait(
+                (
+                    audio_np,
+                    sr,
+                    chunk_id,
+                    stream_session_id,
+                    generation_epoch,
+                    source,
+                    conversation_id,
+                    reply_id,
+                )
+            )
+            logger.warning("Audio queue full; dropped oldest chunk %s", old[2] if len(old) > 2 else "?")
+        except Exception:
+            logger.error("Audio queue overflow; dropping chunk %s", chunk_id)
+
+
+async def _create_audio_session(
+    conversation_id: Optional[str] = None,
+    reply_id: Optional[str] = None,
+) -> str:
     global active_session_id
     now_ms = _server_time_ms()
     sid = str(uuid.uuid4())
@@ -199,8 +353,12 @@ async def _create_audio_session() -> str:
             created_ms=now_ms,
             last_activity_ms=now_ms,
             latest_audio_server_time_ms=now_ms,
+            next_frame_index=0,
             producer_connected=True,
             anim_subscriber_count=protocol2_clients,
+            generation_epoch=0,
+            conversation_id=conversation_id,
+            reply_id=reply_id,
         )
         active_session_id = sid
     # Switching streams: clear queued old work so new session starts clean.
@@ -269,11 +427,15 @@ async def _session_snapshot(session_id: str) -> Tuple[Optional[SessionState], Li
             deprecated_at_ms=st.deprecated_at_ms,
             frame_ring=deque(maxlen=SNAPSHOT_FRAMES),
             latest_frame=st.latest_frame,
+            next_frame_index=st.next_frame_index,
             latest_audio_cursor=st.latest_audio_cursor,
             latest_audio_sr=st.latest_audio_sr,
             latest_audio_server_time_ms=st.latest_audio_server_time_ms,
             producer_connected=st.producer_connected,
             anim_subscriber_count=st.anim_subscriber_count,
+            generation_epoch=st.generation_epoch,
+            conversation_id=st.conversation_id,
+            reply_id=st.reply_id,
         )
         return snap, frames
 
@@ -292,7 +454,9 @@ async def _send_snapshot(ws: WebSocket, session_id: str) -> None:
         json.dumps(
             {
                 "type": "anim_snapshot_start",
+                "stream_session_id": session_id,
                 "session_id": session_id,
+                "server_clock_id": SERVER_CLOCK_ID,
                 "start_frame": start_frame,
                 "end_frame": end_frame,
                 "fps": STREAM_FPS,
@@ -302,11 +466,13 @@ async def _send_snapshot(ws: WebSocket, session_id: str) -> None:
     for fr in frames:
         header = {
             "type": "anim",
+            "stream_session_id": session_id,
             "session_id": session_id,
             "phase": "snapshot",
             "frame": fr.frame,
             "fps": STREAM_FPS,
             "server_time_ms": fr.server_time_ms,
+            "server_clock_id": SERVER_CLOCK_ID,
             "nbones": int(fr.bone_quats.shape[0]),
             "nmorphs": int(fr.morphs.shape[0]),
             "dtype": "f32",
@@ -320,7 +486,9 @@ async def _send_snapshot(ws: WebSocket, session_id: str) -> None:
         json.dumps(
             {
                 "type": "anim_snapshot_end",
+                "stream_session_id": session_id,
                 "session_id": session_id,
+                "server_clock_id": SERVER_CLOCK_ID,
                 "snapshot_end_frame": end_frame,
                 "snapshot_end_server_time_ms": live_head_server_time_ms,
                 "live_head_frame": live_head_frame,
@@ -334,11 +502,17 @@ async def _send_snapshot(ws: WebSocket, session_id: str) -> None:
 
 
 async def broadcast_anim_loop():
+    global epoch_drop_count
     while True:
         item = await anim_queue.get()
         if item is None:
             continue
-        session_id, root_pos, bone_quats, morphs = item
+        if len(item) >= 6:
+            session_id, generation_epoch, frame_id_hint, root_pos, bone_quats, morphs = item
+        else:
+            session_id, root_pos, bone_quats, morphs = item
+            generation_epoch = 0
+            frame_id_hint = None
         if bone_quats.ndim != 2:
             logger.warning("Anim broadcast invalid bone shape: %s", getattr(bone_quats, "shape", None))
             continue
@@ -347,7 +521,14 @@ async def broadcast_anim_loop():
             st = sessions.get(session_id)
             if st is None:
                 continue
-            frame_id = st.latest_frame + 1
+            if generation_epoch != st.generation_epoch:
+                epoch_drop_count += 1
+                continue
+            next_frame = st.latest_frame + 1
+            frame_id = int(frame_id_hint) if frame_id_hint is not None else next_frame
+            if frame_id <= st.latest_frame:
+                # Reject out-of-order/duplicate frames per stream session.
+                continue
             st.latest_frame = frame_id
             st.last_activity_ms = now_ms
             st.frame_ring.append(
@@ -369,11 +550,14 @@ async def broadcast_anim_loop():
             try:
                 header = {
                     "type": "anim",
+                    "stream_session_id": session_id,
                     "session_id": session_id,
                     "phase": "live",
                     "frame": frame_id,
                     "fps": STREAM_FPS,
                     "server_time_ms": now_ms,
+                    "server_clock_id": SERVER_CLOCK_ID,
+                    "generation_epoch": generation_epoch,
                     "nbones": int(bone_quats.shape[0]),
                     "nmorphs": int(morphs.shape[0]),
                     "dtype": "f32",
@@ -396,8 +580,40 @@ async def broadcast_anim_loop():
 
 
 async def inference_worker():
+    global epoch_drop_count
     while True:
-        audio_np, sr, chunk_id, session_id = await audio_in_queue.get()
+        item = await audio_in_queue.get()
+        if len(item) >= 8:
+            (
+                audio_np,
+                sr,
+                chunk_id,
+                session_id,
+                generation_epoch,
+                source,
+                conversation_id,
+                reply_id,
+            ) = item
+        else:
+            audio_np, sr, chunk_id, session_id = item
+            generation_epoch = 0
+            source = "legacy"
+            conversation_id = None
+            reply_id = None
+        async with sessions_lock:
+            st = sessions.get(session_id)
+            if st is None:
+                continue
+            if generation_epoch != st.generation_epoch:
+                epoch_drop_count += 1
+                logger.info(
+                    "Skipping stale inference chunk session=%s epoch=%d active_epoch=%d source=%s",
+                    session_id,
+                    generation_epoch,
+                    st.generation_epoch,
+                    source,
+                )
+                continue
         try:
             async with inference_lock:
                 coeffs = await asyncio.to_thread(_process_chunk, audio_np, sr, chunk_id)
@@ -509,14 +725,42 @@ async def inference_worker():
                 if underactive:
                     logger.warning("Face semantic mismatch chunk=%s underactive=%s", chunk_id, underactive)
         dropped = 0
+        async with sessions_lock:
+            st = sessions.get(session_id)
+            if st is None:
+                continue
+            if generation_epoch != st.generation_epoch:
+                epoch_drop_count += 1
+                continue
+            start_frame_idx = st.next_frame_index
+            st.next_frame_index += frames_count
         for i in range(frames_count):
+            frame_index = start_frame_idx + i
             try:
-                anim_queue.put_nowait((session_id, root_pos[i], bone_quats[i], morphs[i]))
+                anim_queue.put_nowait(
+                    (
+                        session_id,
+                        generation_epoch,
+                        frame_index,
+                        root_pos[i],
+                        bone_quats[i],
+                        morphs[i],
+                    )
+                )
             except asyncio.QueueFull:
                 try:
                     _ = anim_queue.get_nowait()
                     dropped += 1
-                    anim_queue.put_nowait((session_id, root_pos[i], bone_quats[i], morphs[i]))
+                    anim_queue.put_nowait(
+                        (
+                            session_id,
+                            generation_epoch,
+                            frame_index,
+                            root_pos[i],
+                            bone_quats[i],
+                            morphs[i],
+                        )
+                    )
                 except Exception:
                     break
         if dropped > 0:
@@ -530,6 +774,425 @@ async def inference_worker():
         )
 
 
+class GoogleAdkLiveAudioEngine:
+    def __init__(self) -> None:
+        self.model = os.environ.get(
+            "GOOGLE_ADK_MODEL",
+            "gemini-2.5-flash-native-audio-preview-12-2025",
+        )
+        self.system_instruction = os.environ.get(
+            "GOOGLE_ADK_SYSTEM_PROMPT",
+            "You are a concise helpful voice assistant.",
+        )
+        self._runner = None
+        self._session_service = None
+        self._types = None
+        self._run_config_cls = None
+        self._streaming_mode = None
+        self._live_request_queue_cls = None
+
+    def _ensure_runtime(self) -> None:
+        if self._runner is not None:
+            return
+        try:
+            from google.adk.agents import Agent  # type: ignore
+            from google.adk.agents.live_request_queue import LiveRequestQueue  # type: ignore
+            from google.adk.agents.run_config import RunConfig, StreamingMode  # type: ignore
+            from google.adk.runners import Runner  # type: ignore
+            from google.adk.sessions import InMemorySessionService  # type: ignore
+            from google.genai import types  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Missing ADK/Gemini dependencies. Install with: "
+                "python3 -m pip install google-adk google-genai"
+            ) from exc
+        self._types = types
+        self._run_config_cls = RunConfig
+        self._streaming_mode = StreamingMode
+        self._live_request_queue_cls = LiveRequestQueue
+        self._session_service = InMemorySessionService()
+        agent = Agent(
+            name="voice_assistant",
+            model=self.model,
+            instruction=self.system_instruction,
+        )
+        self._runner = Runner(
+            app_name="npz_generator",
+            agent=agent,
+            session_service=self._session_service,
+        )
+
+    async def _ensure_session(self, conversation_id: str) -> None:
+        assert self._session_service is not None
+        session = await self._session_service.get_session(
+            app_name="npz_generator",
+            user_id=conversation_id,
+            session_id=conversation_id,
+        )
+        if not session:
+            await self._session_service.create_session(
+                app_name="npz_generator",
+                user_id=conversation_id,
+                session_id=conversation_id,
+            )
+
+    @staticmethod
+    def _parse_pcm_rate_from_mime(mime_type: str) -> int:
+        m = re.search(r"rate=(\d+)", mime_type or "")
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return 24000
+        return 24000
+
+    @staticmethod
+    def _decode_base64url(data: str) -> bytes:
+        raw = data.strip().replace("-", "+").replace("_", "/")
+        while len(raw) % 4:
+            raw += "="
+        return base64.b64decode(raw)
+
+    @staticmethod
+    def _resample_int16_linear(audio_i16: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+        if audio_i16.size == 0 or src_sr <= 0 or dst_sr <= 0 or src_sr == dst_sr:
+            return audio_i16
+        src = audio_i16.astype(np.float32) / 32768.0
+        dst_count = max(1, int(round(src.shape[0] * (dst_sr / float(src_sr)))))
+        dst_index = np.linspace(0, src.shape[0] - 1, num=dst_count, dtype=np.float32)
+        src_index = np.arange(src.shape[0], dtype=np.float32)
+        resampled = np.interp(dst_index, src_index, src)
+        return np.clip(resampled * 32768.0, -32768, 32767).astype(np.int16)
+
+    def _build_run_config(self):
+        assert self._run_config_cls is not None
+        assert self._streaming_mode is not None
+        assert self._types is not None
+        kwargs = {
+            "streaming_mode": self._streaming_mode.BIDI,
+            "response_modalities": ["AUDIO"],
+            "input_audio_transcription": None,
+            "output_audio_transcription": None,
+        }
+        if hasattr(self._types, "SessionResumptionConfig"):
+            kwargs["session_resumption"] = self._types.SessionResumptionConfig()
+        try:
+            return self._run_config_cls(**kwargs)
+        except TypeError:
+            kwargs.pop("session_resumption", None)
+            return self._run_config_cls(**kwargs)
+
+    @staticmethod
+    def _event_to_dict(event: Any) -> Dict[str, Any]:
+        if isinstance(event, dict):
+            return event
+        if hasattr(event, "model_dump"):
+            try:
+                return event.model_dump(exclude_none=True, by_alias=True)
+            except Exception:
+                return event.model_dump(exclude_none=True)
+        return {}
+
+    def _extract_audio_chunks(self, event: Any) -> List[Tuple[bytes, int]]:
+        payload = self._event_to_dict(event)
+        content = payload.get("content") or {}
+        parts = content.get("parts") or []
+        out: List[Tuple[bytes, int]] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            blob = part.get("inlineData") or part.get("inline_data")
+            if not isinstance(blob, dict):
+                continue
+            mime_type = blob.get("mimeType") or blob.get("mime_type") or ""
+            if not str(mime_type).startswith("audio/pcm"):
+                continue
+            data = blob.get("data")
+            if isinstance(data, str):
+                chunk = self._decode_base64url(data)
+            elif isinstance(data, (bytes, bytearray)):
+                chunk = bytes(data)
+            else:
+                continue
+            if not chunk:
+                continue
+            out.append((chunk, self._parse_pcm_rate_from_mime(str(mime_type))))
+        return out
+
+    async def stream_audio_events(
+        self,
+        *,
+        conversation_id: str,
+        input_pcm_bytes: bytes,
+        input_sr: int,
+    ):
+        self._ensure_runtime()
+        await self._ensure_session(conversation_id)
+        assert self._live_request_queue_cls is not None
+        assert self._types is not None
+        assert self._runner is not None
+        live_request_queue = self._live_request_queue_cls()
+        run_config = self._build_run_config()
+
+        async def _upstream() -> None:
+            chunk_bytes = max(320, int((input_sr * 0.02)) * 2)
+            for i in range(0, len(input_pcm_bytes), chunk_bytes):
+                if i >= len(input_pcm_bytes):
+                    break
+                chunk = input_pcm_bytes[i : i + chunk_bytes]
+                if not chunk:
+                    continue
+                audio_blob = self._types.Blob(
+                    mime_type=f"audio/pcm;rate={input_sr}",
+                    data=chunk,
+                )
+                live_request_queue.send_realtime(audio_blob)
+                await asyncio.sleep(0)
+            live_request_queue.close()
+
+        upstream_task = asyncio.create_task(_upstream())
+        try:
+            async for event in self._runner.run_live(
+                user_id=conversation_id,
+                session_id=conversation_id,
+                live_request_queue=live_request_queue,
+                run_config=run_config,
+            ):
+                for chunk_bytes, src_sr in self._extract_audio_chunks(event):
+                    yield chunk_bytes, src_sr
+        finally:
+            live_request_queue.close()
+            if not upstream_task.done():
+                upstream_task.cancel()
+            try:
+                await upstream_task
+            except Exception:
+                pass
+
+
+class ConversationRuntime:
+    def __init__(self, websocket: WebSocket, conversation_id: str) -> None:
+        self.websocket = websocket
+        self.conversation_id = conversation_id
+        self.adk = GoogleAdkLiveAudioEngine()
+        self._listening = False
+        self._user_audio_chunks: List[bytes] = []
+        self._user_audio_sr: int = CONVERSATION_AUDIO_SR
+        self._reply_task: Optional[asyncio.Task] = None
+        self.current_stream_session_id: Optional[str] = None
+        self.current_reply_id: Optional[str] = None
+        self.current_generation_epoch: int = 0
+
+    async def _send(self, payload: Dict[str, Any]) -> None:
+        payload.setdefault("conversation_id", self.conversation_id)
+        payload.setdefault("server_boot_id", SERVER_BOOT_ID)
+        payload.setdefault("server_clock_id", SERVER_CLOCK_ID)
+        payload.setdefault("server_time_ms", _server_time_ms())
+        await self.websocket.send_text(json.dumps(payload))
+
+    async def send_hello_ack(self) -> None:
+        await self._send(
+            {
+                "type": "hello_ack",
+                "conversation_id": self.conversation_id,
+                "protocol_version": CONVERSATION_PROTOCOL_VERSION,
+            }
+        )
+
+    async def handle_ptt_start(self) -> None:
+        self._listening = True
+        self._user_audio_chunks = []
+        self._user_audio_sr = CONVERSATION_AUDIO_SR
+        await self._send({"type": "listening"})
+
+    async def handle_user_audio(self, payload: Dict[str, Any]) -> None:
+        if not self._listening:
+            return
+        b64 = payload.get("pcm_b64") or payload.get("pcmb64") or payload.get("audio_b64")
+        if not b64:
+            return
+        raw = base64.b64decode(b64)
+        sr = int(payload.get("sr", CONVERSATION_AUDIO_SR))
+        if sr > 0:
+            self._user_audio_sr = sr
+        self._user_audio_chunks.append(raw)
+        max_bytes = int(CONVERSATION_PTT_MAX_SEC * self._user_audio_sr * 2)
+        current = sum(len(c) for c in self._user_audio_chunks)
+        if current > max_bytes:
+            # Keep the tail if client overruns configured max PTT duration.
+            joined = b"".join(self._user_audio_chunks)
+            self._user_audio_chunks = [joined[-max_bytes:]]
+
+    async def handle_ptt_end(self) -> None:
+        if not self._listening:
+            return
+        self._listening = False
+        if self._reply_task and not self._reply_task.done():
+            await self.interrupt(reason="new_turn")
+        pcm_bytes = b"".join(self._user_audio_chunks)
+        self._user_audio_chunks = []
+        self._reply_task = asyncio.create_task(self._run_turn(pcm_bytes, self._user_audio_sr))
+
+    async def interrupt(self, reason: str = "interrupt") -> None:
+        global epoch_drop_count
+        if self._reply_task and not self._reply_task.done():
+            self._reply_task.cancel()
+        if self.current_stream_session_id:
+            sid = self.current_stream_session_id
+            now_ms = _server_time_ms()
+            async with sessions_lock:
+                st = sessions.get(sid)
+                if st:
+                    st.generation_epoch += 1
+                    st.deprecated_at_ms = now_ms
+                    st.last_activity_ms = now_ms
+                    st.producer_connected = False
+                    self.current_generation_epoch = st.generation_epoch
+            epoch_drop_count += 1
+            await _broadcast_audio_control("stop", sid, reason)
+        await self._send(
+            {
+                "type": "interrupted",
+                "reply_id": self.current_reply_id,
+                "stream_session_id": self.current_stream_session_id,
+                "reason": reason,
+            }
+        )
+
+    async def _run_turn(self, pcm_bytes: bytes, input_sr: int) -> None:
+        if not pcm_bytes:
+            return
+        stream_session_id: Optional[str] = None
+        reply_id: Optional[str] = None
+        generation_epoch = 0
+        emitted_thinking_end = False
+        emitted_speaking_start = False
+        output_sample_accum = np.zeros((0,), dtype=np.int16)
+        out_chunk_samples = max(1, int((CONVERSATION_AUDIO_SR * CONVERSATION_PCM_CHUNK_MS) / 1000))
+        chunk_idx = 0
+        stale_stream = False
+        try:
+            await self._send({"type": "assistant_thinking_start"})
+            reply_id = str(uuid.uuid4())
+            async for raw_chunk, chunk_sr in self.adk.stream_audio_events(
+                conversation_id=self.conversation_id,
+                input_pcm_bytes=pcm_bytes,
+                input_sr=input_sr,
+            ):
+                audio_i16 = np.frombuffer(raw_chunk, dtype=np.int16)
+                if audio_i16.size == 0:
+                    continue
+                if chunk_sr != CONVERSATION_AUDIO_SR:
+                    audio_i16 = self.adk._resample_int16_linear(audio_i16, chunk_sr, CONVERSATION_AUDIO_SR)
+                if audio_i16.size == 0:
+                    continue
+                if output_sample_accum.size == 0:
+                    output_sample_accum = audio_i16
+                else:
+                    output_sample_accum = np.concatenate([output_sample_accum, audio_i16], axis=0)
+                while output_sample_accum.size >= out_chunk_samples:
+                    chunk_i16 = output_sample_accum[:out_chunk_samples]
+                    output_sample_accum = output_sample_accum[out_chunk_samples:]
+                    if stream_session_id is None:
+                        stream_session_id = await _create_audio_session(
+                            conversation_id=self.conversation_id,
+                            reply_id=reply_id,
+                        )
+                        async with sessions_lock:
+                            st = sessions.get(stream_session_id)
+                            generation_epoch = st.generation_epoch if st else 0
+                        self.current_reply_id = reply_id
+                        self.current_stream_session_id = stream_session_id
+                        self.current_generation_epoch = generation_epoch
+                    async with sessions_lock:
+                        st = sessions.get(stream_session_id)
+                        if st is None or st.generation_epoch != generation_epoch:
+                            stale_stream = True
+                            break
+                    await ingest_audio_chunk(
+                        audio_np=(chunk_i16.astype(np.float32) / 32768.0),
+                        sr=CONVERSATION_AUDIO_SR,
+                        chunk_id=str(chunk_idx),
+                        stream_session_id=stream_session_id,
+                        generation_epoch=generation_epoch,
+                        source="assistant_adk_live",
+                        conversation_id=self.conversation_id,
+                        reply_id=reply_id,
+                    )
+                    if not emitted_thinking_end:
+                        emitted_thinking_end = True
+                        await self._send({"type": "assistant_thinking_end"})
+                    if not emitted_speaking_start:
+                        emitted_speaking_start = True
+                        await self._send(
+                            {
+                                "type": "assistant_speaking_start",
+                                "reply_id": reply_id,
+                                "stream_session_id": stream_session_id,
+                            }
+                        )
+                    chunk_idx += 1
+                if stale_stream:
+                    break
+            if (
+                stream_session_id is not None
+                and output_sample_accum.size > 0
+                and not stale_stream
+            ):
+                await ingest_audio_chunk(
+                    audio_np=(output_sample_accum.astype(np.float32) / 32768.0),
+                    sr=CONVERSATION_AUDIO_SR,
+                    chunk_id=str(chunk_idx),
+                    stream_session_id=stream_session_id,
+                    generation_epoch=generation_epoch,
+                    source="assistant_adk_live",
+                    conversation_id=self.conversation_id,
+                    reply_id=reply_id,
+                )
+                if not emitted_thinking_end:
+                    emitted_thinking_end = True
+                    await self._send({"type": "assistant_thinking_end"})
+                if not emitted_speaking_start:
+                    emitted_speaking_start = True
+                    await self._send(
+                        {
+                            "type": "assistant_speaking_start",
+                            "reply_id": reply_id,
+                            "stream_session_id": stream_session_id,
+                        }
+                    )
+            if not emitted_thinking_end:
+                await self._send({"type": "assistant_thinking_end"})
+            if emitted_speaking_start and stream_session_id is not None:
+                await self._send(
+                    {
+                        "type": "assistant_speaking_end",
+                        "reply_id": reply_id,
+                        "stream_session_id": stream_session_id,
+                    }
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Conversation turn failed conversation=%s: %s", self.conversation_id, exc)
+            await self._send({"type": "error", "message": str(exc)})
+            try:
+                await self._send({"type": "assistant_thinking_end"})
+            except Exception:
+                pass
+        finally:
+            if stream_session_id:
+                async with sessions_lock:
+                    st = sessions.get(stream_session_id)
+                    if st:
+                        st.producer_connected = False
+                        st.last_activity_ms = _server_time_ms()
+
+    async def close(self) -> None:
+        if self._reply_task and not self._reply_task.done():
+            self._reply_task.cancel()
+
+
 @app.on_event("startup")
 async def _startup():
     logger.info(
@@ -539,6 +1202,7 @@ async def _startup():
         PROTOCOL_VERSION,
         STREAM_FPS,
     )
+    _log_conversation_dependency_health()
     app.state.broadcast_task = asyncio.create_task(broadcast_anim_loop())
     app.state.infer_task = asyncio.create_task(inference_worker())
     app.state.gc_task = asyncio.create_task(_session_gc_loop())
@@ -549,6 +1213,25 @@ def _process_chunk(audio_np: np.ndarray, sr: int, chunk_id: Optional[str]) -> Op
     if not coeffs:
         return None
     return coeffs
+
+
+def _log_conversation_dependency_health() -> None:
+    missing: List[str] = []
+    try:
+        from google.adk.agents import Agent  # type: ignore  # noqa: F401
+    except ModuleNotFoundError:
+        missing.append("google-adk")
+    try:
+        from google import genai  # type: ignore  # noqa: F401
+    except ModuleNotFoundError:
+        missing.append("google-genai")
+    if missing:
+        logger.warning(
+            "Conversation dependencies missing: %s. Install into active interpreter with: "
+            "python3 -m pip install %s",
+            missing,
+            " ".join(missing),
+        )
 
 
 @app.websocket("/ws/audio")
@@ -572,70 +1255,35 @@ async def ws_audio(websocket: WebSocket):
             if dtype == "float32":
                 audio_np = np.frombuffer(audio_bytes, dtype=np.float32)
             else:
-                audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            sample_count = int(audio_np.shape[0])
+                audio_np = _pcm16_bytes_to_float32(audio_bytes)
+            async with sessions_lock:
+                st = sessions.get(session_id)
+                generation_epoch = st.generation_epoch if st else 0
+            await ingest_audio_chunk(
+                audio_np=audio_np,
+                sr=sr,
+                chunk_id=chunk_id,
+                stream_session_id=session_id,
+                generation_epoch=generation_epoch,
+                source="simulator",
+                conversation_id=None,
+                reply_id=None,
+            )
             now_ms = _server_time_ms()
-            async with sessions_lock:
-                st = sessions.get(session_id)
-                if st:
-                    st.last_activity_ms = now_ms
-                    st.latest_audio_sr = sr
-                    st.latest_audio_cursor += sample_count
-                    st.latest_audio_server_time_ms = now_ms
-            audio_cursor = 0
-            async with sessions_lock:
-                st = sessions.get(session_id)
-                if st:
-                    audio_cursor = st.latest_audio_cursor
-            if audio_clients:
-                header = {
-                    "type": "audio",
-                    "session_id": session_id,
-                    "chunk_id": chunk_id,
-                    "sr": sr,
-                    "channels": 1,
-                    "dtype": "int16",
-                    "samples": sample_count,
-                    "audio_sample_cursor": audio_cursor,
-                    "server_time_ms": now_ms,
-                    "server_boot_id": SERVER_BOOT_ID,
-                }
-                dead_audio = []
-                for ws in list(audio_clients):
-                    try:
-                        await ws.send_text(json.dumps(header))
-                        await ws.send_bytes(audio_bytes)
-                    except Exception:
-                        dead_audio.append(ws)
-                for ws in dead_audio:
-                    audio_clients.discard(ws)
-                logger.info(
-                    "Audio broadcast session=%s chunk_id=%s samples=%d clients=%d",
-                    session_id,
-                    chunk_id,
-                    sample_count,
-                    len(audio_clients),
-                )
             await websocket.send_text(
                 json.dumps(
                     {
                         "type": "ack",
                         "chunk_id": chunk_id,
+                        "stream_session_id": session_id,
                         "session_id": session_id,
+                        "generation_epoch": generation_epoch,
                         "server_boot_id": SERVER_BOOT_ID,
+                        "server_clock_id": SERVER_CLOCK_ID,
                         "server_time_ms": now_ms,
                     }
                 )
             )
-            try:
-                audio_in_queue.put_nowait((audio_np, sr, chunk_id, session_id))
-            except asyncio.QueueFull:
-                try:
-                    old = audio_in_queue.get_nowait()
-                    audio_in_queue.put_nowait((audio_np, sr, chunk_id, session_id))
-                    logger.warning("Audio queue full; dropped oldest chunk %s", old[2] if len(old) > 2 else "?")
-                except Exception:
-                    logger.error("Audio queue overflow; dropping chunk %s", chunk_id)
     except WebSocketDisconnect:
         async with sessions_lock:
             st = sessions.get(session_id)
@@ -656,6 +1304,39 @@ async def ws_audio_out(websocket: WebSocket):
     except WebSocketDisconnect:
         audio_clients.discard(websocket)
         logger.info("Audio OUT WS disconnected: %s (clients=%d)", websocket.client, len(audio_clients))
+
+
+@app.websocket("/ws/conversation")
+async def ws_conversation(websocket: WebSocket):
+    await websocket.accept()
+    conversation_id = str(uuid.uuid4())
+    runtime = ConversationRuntime(websocket, conversation_id)
+    logger.info("Conversation WS connected: %s conversation=%s", websocket.client, conversation_id)
+    await runtime.send_hello_ack()
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            mtype = msg.get("type")
+            if mtype == "hello":
+                await runtime.send_hello_ack()
+            elif mtype == "ptt_start":
+                await runtime.handle_ptt_start()
+            elif mtype == "user_audio":
+                await runtime.handle_user_audio(msg)
+            elif mtype == "ptt_end":
+                await runtime.handle_ptt_end()
+            elif mtype == "interrupt":
+                await runtime.interrupt(reason="interrupt")
+            elif mtype == "ping":
+                await runtime._send({"type": "pong", "ts": msg.get("ts")})
+    except WebSocketDisconnect:
+        logger.info("Conversation WS disconnected: %s conversation=%s", websocket.client, conversation_id)
+    finally:
+        await runtime.close()
 
 
 @app.websocket("/ws/anim")
@@ -679,10 +1360,16 @@ async def ws_anim(websocket: WebSocket):
         if subscribe_msg.get("type") == "anim_subscribe" and int(subscribe_msg.get("protocol_version", 2)) >= 2:
             protocol = int(subscribe_msg.get("protocol_version", 2))
             known_boot_id = subscribe_msg.get("known_boot_id")
-            known_session_id = subscribe_msg.get("known_session_id")
+            known_clock_id = subscribe_msg.get("known_server_clock_id")
+            known_session_id = (
+                subscribe_msg.get("known_stream_session_id")
+                or subscribe_msg.get("known_session_id")
+            )
             async with sessions_lock:
                 active_sid = active_session_id
             if known_boot_id and known_boot_id != SERVER_BOOT_ID:
+                mode = "reset_required"
+            elif known_clock_id and known_clock_id != SERVER_CLOCK_ID:
                 mode = "reset_required"
             elif active_sid is None:
                 mode = "live_only"
@@ -699,6 +1386,7 @@ async def ws_anim(websocket: WebSocket):
                         "mode": mode,
                         "server_boot_id": SERVER_BOOT_ID,
                         "server_clock_id": SERVER_CLOCK_ID,
+                        "stream_session_id": active_sid,
                         "session_id": active_sid,
                         "stream_fps": STREAM_FPS,
                         "server_time_ms": _server_time_ms(),
@@ -715,6 +1403,7 @@ async def ws_anim(websocket: WebSocket):
                         "protocol_version": PROTOCOL_VERSION,
                         "server_boot_id": SERVER_BOOT_ID,
                         "server_clock_id": SERVER_CLOCK_ID,
+                        "stream_session_id": active_sid,
                         "session_id": active_sid,
                     }
                 )
@@ -742,7 +1431,7 @@ async def ws_anim(websocket: WebSocket):
             except Exception:
                 continue
             if msg.get("type") == "resync_request":
-                req_session = msg.get("session_id")
+                req_session = _resolve_stream_session_id(msg)
                 async with sessions_lock:
                     active_sid = active_session_id
                 if active_sid and req_session == active_sid:

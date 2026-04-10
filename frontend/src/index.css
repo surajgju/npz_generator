@@ -93,6 +93,12 @@ body,
   cursor: pointer;
 }
 
+#hud .btns button.active {
+  background: #e53935;
+  border-color: #e53935;
+  color: #fff;
+}
+
 #hud input[type="range"] {
   width: 90px;
   vertical-align: middle;

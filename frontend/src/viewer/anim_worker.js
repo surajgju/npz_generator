@@ -12,6 +12,7 @@ const PROTOCOL_VERSION = 2;
 let buildId = "dev";
 let knownBootId = null;
 let knownSessionId = null;
+let knownServerClockId = null;
 let knownLastAppliedFrame = -1;
 let currentSessionId = null;
 let serverBootId = null;
@@ -365,6 +366,7 @@ function sendResyncRequest(reason) {
   ws.send(
     JSON.stringify({
       type: "resync_request",
+      stream_session_id: currentSessionId,
       session_id: currentSessionId,
       reason,
     })
@@ -483,6 +485,8 @@ function connectAnim() {
         type: "anim_subscribe",
         protocol_version: PROTOCOL_VERSION,
         known_boot_id: knownBootId,
+        known_server_clock_id: knownServerClockId,
+        known_stream_session_id: knownSessionId,
         known_session_id: knownSessionId,
         last_applied_frame: Number.isFinite(knownLastAppliedFrame) ? knownLastAppliedFrame : -1,
       })
@@ -503,9 +507,23 @@ function connectAnim() {
       if (msg.type === "anim_subscribe_ack") {
         serverBootId = msg.server_boot_id || serverBootId;
         serverClockId = msg.server_clock_id || serverClockId;
+        if (knownServerClockId && serverClockId && knownServerClockId !== serverClockId) {
+          postMessage({
+            type: "status",
+            status: "reset_required",
+            reason: "server_clock_mismatch",
+            serverBootId,
+            serverClockId,
+            sessionId: currentSessionId,
+            protocolVersion: PROTOCOL_VERSION,
+          });
+          ws.close();
+          return;
+        }
+        const ackSessionId = msg.stream_session_id || msg.session_id || currentSessionId;
         const modeFromAck = msg.mode === "resume" ? "snapshot_loading" : "live_playing";
-        switchSession(msg.session_id || currentSessionId, modeFromAck, "subscribe_ack");
-        currentSessionId = msg.session_id || currentSessionId;
+        switchSession(ackSessionId, modeFromAck, "subscribe_ack");
+        currentSessionId = ackSessionId;
         streamFps = msg.stream_fps || streamFps;
         observeServerTime(msg.server_time_ms);
         if (msg.mode === "reset_required") {
@@ -533,15 +551,22 @@ function connectAnim() {
         return;
       }
       if (msg.type === "anim_snapshot_start") {
-        switchSession(msg.session_id || currentSessionId, "snapshot_loading", "snapshot_start");
+        const sid = msg.stream_session_id || msg.session_id || currentSessionId;
+        switchSession(sid, "snapshot_loading", "snapshot_start");
         playbackState = "snapshot_loading";
         targetLiveFrame = null;
         seenLiveAtOrBeyondTarget = false;
         return;
       }
       if (msg.type === "anim_snapshot_end") {
-        switchSession(msg.session_id || currentSessionId, "snapshot_loading", "snapshot_end");
-        currentSessionId = msg.session_id || currentSessionId;
+        const sid = msg.stream_session_id || msg.session_id || currentSessionId;
+        if (msg.server_clock_id && serverClockId && msg.server_clock_id !== serverClockId) {
+          playbackState = "resyncing";
+          sendResyncRequest("clock_mismatch");
+          return;
+        }
+        switchSession(sid, "snapshot_loading", "snapshot_end");
+        currentSessionId = sid;
         observeServerTime(msg.live_head_server_time_ms);
         const liveHeadFrame = Number.isFinite(msg.live_head_frame) ? msg.live_head_frame : -1;
         const liveHeadServerTimeMs = Number.isFinite(msg.live_head_server_time_ms)
@@ -611,12 +636,13 @@ function connectAnim() {
         return;
       }
       if (msg.type === "anim") {
-        if (msg.session_id && msg.session_id !== currentSessionId) {
+        const sid = msg.stream_session_id || msg.session_id || null;
+        if (sid && sid !== currentSessionId) {
           const nextMode = msg.phase === "snapshot" ? "snapshot_loading" : "live_playing";
-          switchSession(msg.session_id, nextMode, "anim_header");
+          switchSession(sid, nextMode, "anim_header");
         }
         if (Number.isFinite(msg.server_time_ms)) observeServerTime(msg.server_time_ms);
-        if (msg.session_id) currentSessionId = msg.session_id;
+        if (sid) currentSessionId = sid;
       }
       return;
     }
@@ -624,7 +650,7 @@ function connectAnim() {
     if (!header || header.type !== "anim") return;
     const frame = Number.isFinite(header.frame) ? header.frame : 0;
     const phaseName = header.phase || "live";
-    currentSessionId = header.session_id || currentSessionId;
+    currentSessionId = header.stream_session_id || header.session_id || currentSessionId;
     if (!Number.isFinite(nbones) || nbones <= 0) nbones = header.nbones || nbones;
     if (!Number.isFinite(nmorphs) || nmorphs <= 0) nmorphs = header.nmorphs || nmorphs;
     if (!frameMarks) ensureCapacity();
@@ -646,6 +672,7 @@ self.onmessage = (event) => {
     wsHost = msg.host || wsHost;
     knownBootId = msg.knownBootId || null;
     knownSessionId = msg.knownSessionId || null;
+    knownServerClockId = msg.knownServerClockId || null;
     knownLastAppliedFrame = Number.isFinite(msg.lastAppliedFrame) ? msg.lastAppliedFrame : -1;
     buildId = msg.buildId || buildId;
     connectAnim();

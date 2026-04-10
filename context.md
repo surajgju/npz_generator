@@ -39,6 +39,10 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
   - `animOffsetSec`: Initial animation offset from worker frame indexes.
   - `audioBuf`: Audio startup/holding threshold.
   - **Monotonic Time Alignment**: Worker smooths `server_time_ms - performance.now()` with EMA to estimate server now and target live frame.
+- **Voice Conversation Path**:
+  - Browser Push-to-Talk captures PCM16 audio and sends it to `/ws/conversation`.
+  - Server flow: Google ADK Live audio-in/audio-out -> resample/chunk -> `ingest_audio_chunk` -> existing `/ws/audio_out` + `/ws/anim`.
+  - Frontend flushes audio scheduler on `stream_session_id` change to prevent cross-reply drift.
 
 ## 4. SMPL-X Morph Target Strategy
 - **Base vs. Additive**: We use **Additive Blending**. Morph influences are applied on top of the "Base Face" (Neutral Mean).
@@ -52,10 +56,17 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
   - `server_clock_id`: monotonic clock identity.
   - `server_time_ms`: monotonic milliseconds since server boot.
 - **Sessionized Streams**:
-  - `session_id` created when `/ws/audio` producer connects.
+  - `stream_session_id` created per active audio/reply stream (`session_id` retained as compatibility alias).
   - `/ws/anim` subscriber sends `anim_subscribe` with known boot/session/frame.
   - Server responds with `anim_subscribe_ack` mode:
     - `resume`, `live_only`, `reset_required`.
+- **Conversation Channel** (`/ws/conversation`):
+  - `hello` / `hello_ack` with `protocol_version`.
+  - explicit lifecycle events:
+    - `listening`
+    - `assistant_thinking_start`, `assistant_thinking_end`
+    - `assistant_speaking_start`, `assistant_speaking_end` (both include `stream_session_id`)
+    - `interrupted`
 - **Snapshot Envelope**:
   - `anim_snapshot_start`
   - `anim` frames with `phase: "snapshot"`
@@ -70,7 +81,7 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
 - **Live Frames**:
   - `anim` frames with `phase: "live"`.
 - **Audio Metadata** (`/ws/audio_out`):
-  - `session_id`, `chunk_id`, `audio_sample_cursor`, `server_time_ms`, `server_boot_id`.
+  - `stream_session_id`, `chunk_id`, `audio_sample_cursor`, `server_time_ms`, `server_boot_id`, `server_clock_id`.
 - **Control Message**:
   - Client may send `resync_request` when tail lock or drift thresholds are exceeded.
 - **Reconnect Rule (Burst Prevention)**:
@@ -85,10 +96,11 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
 
 ## 6. Server Architecture, Session Lifecycle, and Security
 - **Asynchronous Pipeline**:
-  - `audio_in_queue`: decouples incoming audio from inference.
-  - `anim_queue`: decouples inference from broadcast cadence.
+  - `audio_in_queue`: decouples incoming audio from inference; tuple carries `(stream_session_id, generation_epoch, source, conversation/reply ids)`.
+  - `anim_queue`: decouples inference from broadcast cadence; tuple carries `(stream_session_id, generation_epoch, frame_index, payload)`.
 - **Session State (`SessionState`)**:
   - `session_id`, activity timestamps, deprecation timestamp.
+  - `generation_epoch` for interrupt-safe stale-drop filtering.
   - rolling `frame_ring` for reconnect snapshots.
   - latest audio cursor/rate/time for live-edge anchors.
   - producer/subscriber counters.

@@ -12,7 +12,7 @@ An end-to-end pipeline for generating expressive SMPL-X motion from audio. This 
 
 - **🎭 Expressive Motion Generation**: Uses the **EMAGE** (Expressive Motion Generation) architecture for synchronized body, face, hand, and global translation from raw audio.
 - **⚡ Real-Time Streaming Pipeline**: A low-latency system that processes audio chunks via WebSockets and streams SMPL‑X animation directly to a Three.js viewer.
-- **🎙️ Voice Conversation (Google ADK Live Audio)**: Browser Push-to-Talk (`/ws/conversation`) streams user PCM directly to ADK Live and routes assistant audio into the existing audio/anim streaming path.
+- **🎙️ Voice Conversation (Native Gemini 3.1 Live)**: Uses the `google-genai` native WebSocket stream for ultra-low latency. Browser Push-to-Talk (`/ws/conversation`) streams user PCM directly to Gemini and routes assistant response audio into the real-time animation pipeline.
 - **🧭 Sessionized Streaming (Protocol v2)**: Per-reply stream sessions with reconnect-aware handshake (`anim_subscribe`) using `stream_session_id`, `server_boot_id`, `server_clock_id`, and monotonic `server_time_ms`.
 - **🔁 Snapshot Recovery**: Reconnecting clients receive a short snapshot window (2-3s), then jump to live edge without replay burst.
 - **🛡️ Drift/Freeze Protection**: Worker tail-lock alignment with timeout and resync request; viewer has explicit stall states (`stalled_hold`, `stalled_ease`, `resyncing`).
@@ -22,7 +22,7 @@ An end-to-end pipeline for generating expressive SMPL-X motion from audio. This 
 - **🌐 Dual Visualization Suite**:
     - **Offline (Streamlit)**: High-performance local NPZ viewer.
     - **Live (Vite/React)**: Modern Three.js viewer for real-time streaming and interactive debugging.
-- **🔗 Gemini Live Integration**: Pre-wired adapters to bridge Gemini PCM audio streams with the motion synthesis pipeline.
+- **🔗 Gemini 3.1 Live Native Integration**: Optimized engine that bypasses legacy ADK overhead, supporting the latest multi-modal Live API for seamless speech-to-motion updates.
 
 ---
 
@@ -130,17 +130,16 @@ flowchart TD
         B[Simulated WAV Streamer]
     end
 
-    subgraph Backend ["Python Backend (FastAPI)"]
-        C["/ws/audio Receiver (Session Producer)"]
-        D["EMAGE Inference (GPU)"]
-        E["SmplxRetargeter (Signal Processing)"]
-        F["Session Ring Buffer + Broadcast /ws/anim"]
-        J["Session GC (TTL + LRU)"]
+    subgraph Backend ["Modular Backend (FastAPI)"]
+        C["/ws/audio Receiver"]
+        D["audio_pipeline.py (Inference)"]
+        E["session.py (State & GC)"]
+        F["conversation.py (PTT/Gemini)"]
         
         C --> D
         D --> E
-        E --> F
-        F --> J
+        F --> D
+        E -->|/ws/anim| G
     end
 
     subgraph Frontend ["WebGL Frontend (Three.js)"]
@@ -163,9 +162,9 @@ flowchart TD
 
 | Directory/File | Description |
 | :--- | :--- |
-| `frontend/` | React + Three.js application source code. Worker source is `frontend/src/viewer/anim_worker.js`. |
+| `frontend/` | React + Three.js application source code. |
 | `web/` | Target for frontend build. Served by FastAPI. |
-| `server/` | FastAPI server, sessionized WebSocket handlers, inference/broadcast loops, and Gemini adapters. |
+| `server/` | **Modularized Backend**: `app.py` (coordinator), `session.py` (state), `audio_pipeline.py` (ML/Audio), `conversation.py` (PTT). |
 | `emage_utils/` | Core EMAGE model implementation and VQ-VAE utils. |
 | `scripts/` | Export utilities and audio streaming simulators. |
 | `models/` | SMPL-X and EMAGE model weight storage path. |
@@ -206,27 +205,13 @@ Fine-tune your animation quality via CLI or config files:
 
 ---
 
-## 🌩️ Streaming Integration
-The simulator path remains unchanged and still feeds the same inference/broadcast pipeline:
-```python
-from server.gemini_adapter import GeminiAudioBridge
-
-bridge = GeminiAudioBridge(sample_rate=16000)
-payload = bridge.build_audio_payload(pcm_bytes, chunk_id="42")
-# Send the payload to the /ws/audio endpoint
-```
-
----
-
 ## 🧪 Testing Checklist
 1. [ ] Run `python3 generate_npz.py` and verify `output/intro_output.npz`.
 2. [ ] Run `python3 render.py` and check `output.mp4`.
-3. [ ] Run `npm run build` in the frontend directory.
-4. [ ] Start the uvicorn server and open the live viewer at `localhost:8000`.
-5. [ ] Run `stream_audio_to_ws.py` and observe smooth 3D motion in the browser.
-6. [ ] Reload browser mid-stream and verify reconnect does not burst/replay old frames.
-7. [ ] Simulate network stall (2-3s) and verify `stalled_hold -> stalled_ease -> smooth resume`.
-8. [ ] Verify session turnover (new `/ws/audio` producer) does not leak stale sessions.
+3. [ ] Run `npm build` (or similar) in the frontend directory.
+4. [ ] Start the uvicorn server: `python3 -m uvicorn server.app:app --reload`.
+5. [ ] Open the live viewer at `localhost:8000`.
+6. [ ] Connect Microphone and verify Gemini 3.1 Live PTT conversation starts high-fidelity motion.
 
 ---
 

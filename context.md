@@ -41,7 +41,8 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
   - **Monotonic Time Alignment**: Worker smooths `server_time_ms - performance.now()` with EMA to estimate server now and target live frame.
 - **Voice Conversation Path**:
   - Browser Push-to-Talk captures PCM16 audio and sends it to `/ws/conversation`.
-  - Server flow: Google ADK Live audio-in/audio-out -> resample/chunk -> `ingest_audio_chunk` -> existing `/ws/audio_out` + `/ws/anim`.
+  - Server flow: `conversation.py` (Runtime) -> `audio_pipeline.py` (`GeminiLiveAudioEngine`) -> `google-genai` Live API.
+  - Assistant response chunks are routed to `ingest_audio_chunk` in `audio_pipeline.py`, fanning out to `/ws/audio_out` and the ML inference queue.
   - Frontend flushes audio scheduler on `stream_session_id` change to prevent cross-reply drift.
 
 ## 4. SMPL-X Morph Target Strategy
@@ -94,27 +95,26 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
   - `[3:3 + nbones*4]`: Bone Quaternions (X, Y, Z, W).
   - `[3 + nbones*4:]`: Morph influences.
 
-## 6. Server Architecture, Session Lifecycle, and Security
+## 6. Modular Server Architecture & Session Lifecycle
+The backend is split into specialized modules for scalability and maintainability:
+- **`app.py`**: Thin coordinator. Owns FastAPI routes, startup lifecycle, and static mounting.
+- **`session.py`**: Owns `SessionState` dataclasses, the shared session registry, and the GC loop.
+- **`audio_pipeline.py`**: The "Core Engine". Owns `inference_worker`, `GeminiLiveAudioEngine`, and the animation broadcast loop.
+- **`conversation.py`**: Owns `ConversationRuntime`, managing the PTT state machine and assistant interaction logic.
+
 - **Asynchronous Pipeline**:
-  - `audio_in_queue`: decouples incoming audio from inference; tuple carries `(stream_session_id, generation_epoch, source, conversation/reply ids)`.
-  - `anim_queue`: decouples inference from broadcast cadence; tuple carries `(stream_session_id, generation_epoch, frame_index, payload)`.
+  - `audio_in_queue`: decouples incoming audio from inference.
+  - `anim_queue`: decouples inference from broadcast cadence.
 - **Session State (`SessionState`)**:
   - `session_id`, activity timestamps, deprecation timestamp.
   - `generation_epoch` for interrupt-safe stale-drop filtering.
   - rolling `frame_ring` for reconnect snapshots.
   - latest audio cursor/rate/time for live-edge anchors.
-  - producer/subscriber counters.
-- **Session Ownership**:
-  - New `/ws/audio` producer creates a new active session.
-  - Previous active session is deprecated but temporarily resumable.
 - **GC & Leak Prevention**:
-  - periodic cleanup removes idle/deprecated sessions by TTL.
-  - `MAX_SESSIONS` cap with LRU-style eviction for stale sessions.
-- **Cache Headers**:
-  - HTML: `Cache-Control: no-cache`.
-  - fingerprinted assets: `Cache-Control: public,max-age=31536000,immutable`.
+  - `session_gc_loop` in `session.py` removes idle/deprecated sessions by TTL.
+  - `MAX_SESSIONS` cap ensures memory stability.
 - **WASM Performance**:
-  - Middleware sets COOP/COEP/CORP for SharedArrayBuffer compatibility.
+  - Middleware in `app.py` sets COOP/COEP/CORP for SharedArrayBuffer compatibility.
 
 ## 7. Current Debug Configuration
 - **Debug Defaults**:

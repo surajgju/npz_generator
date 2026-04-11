@@ -54,6 +54,7 @@ const warn = (...args) => console.warn("[Viewer]", ...args);
 const error = (...args) => console.error("[Viewer]", ...args);
 const DEBUG = false;
 const BUILD_ID = import.meta.env.VITE_BUILD_ID || import.meta.env.MODE || "dev";
+const ENABLE_MORPH_DEBUGGER = import.meta.env.VITE_ENABLE_MORPH_DEBUGGER === "1";
 const IDLE_START_MS = 2000;
 let lastDebugSummary = 0;
 let lastHudLog = null;
@@ -1315,7 +1316,7 @@ async function loadAvatar() {
       morphTargetsMax: meshMorphTargets,
     });
     exposeViewerDebug();
-    initMorphDebugPanel();
+    if (ENABLE_MORPH_DEBUGGER) initMorphDebugPanel();
   } catch (err) {
     error("Failed to load head.glb", err);
   }
@@ -2194,37 +2195,18 @@ async function ensureMicCapture() {
   await micCaptureCtx.resume();
   micSampleRate = micCaptureCtx.sampleRate || CONVERSATION_AUDIO_SAMPLE_RATE;
   micSource = micCaptureCtx.createMediaStreamSource(micStream);
-  
+
   let useWorklet = !!(micCaptureCtx.audioWorklet);
   if (useWorklet) {
-    const workletCode = `
-      class MicProcessor extends AudioWorkletProcessor {
-        constructor() {
-          super();
-          this.buffer = new Float32Array(${CONVERSATION_PTT_BUFFER});
-          this.offset = 0;
-        }
-        process(inputs, outputs, parameters) {
-          if (!inputs[0] || !inputs[0][0]) return true;
-          const input = inputs[0][0];
-          for (let i = 0; i < input.length; i++) {
-            this.buffer[this.offset++] = input[i];
-            if (this.offset >= ${CONVERSATION_PTT_BUFFER}) {
-              this.port.postMessage(this.buffer);
-              this.offset = 0;
-              this.buffer = new Float32Array(${CONVERSATION_PTT_BUFFER});
-            }
-          }
-          return true;
-        }
-      }
-      registerProcessor('mic-processor', MicProcessor);
-    `;
-    const blob = new Blob([workletCode], { type: 'application/javascript' });
-    const workletUrl = URL.createObjectURL(blob);
+    const workletUrl = new URL("./mic-capture.worklet.js", import.meta.url);
     try {
       await micCaptureCtx.audioWorklet.addModule(workletUrl);
-      micProcessor = new AudioWorkletNode(micCaptureCtx, 'mic-processor');
+      micProcessor = new AudioWorkletNode(micCaptureCtx, "mic-capture-processor", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        processorOptions: { bufferSize: CONVERSATION_PTT_BUFFER },
+      });
       micProcessor.port.onmessage = (event) => {
         if (!pttActive || !conversationConnected) return;
         const samples = event.data;
@@ -2240,8 +2222,6 @@ async function ensureMicCapture() {
     } catch (e) {
       console.warn("AudioWorklet failed, falling back to ScriptProcessor", e);
       useWorklet = false;
-    } finally {
-      URL.revokeObjectURL(workletUrl);
     }
   }
 

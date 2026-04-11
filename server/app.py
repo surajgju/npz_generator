@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import importlib.util
 import json
 import logging
 import math
@@ -8,9 +9,37 @@ import re
 import sys
 import time
 import uuid
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+
+# Suppress known environment/runtime warnings that are not actionable inside app logic.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*urllib3 v2 only supports OpenSSL 1\.1\.1\+.*",
+    category=Warning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*enable_nested_tensor is True, but self\.use_nested_tensor is False.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Python version 3\.9 past its end of life.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*non-supported Python version.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Pydantic serializer warnings:.*response_modalities.*",
+    category=UserWarning,
+)
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -105,7 +134,7 @@ async def add_headers(request, call_next):
     path = request.url.path
     if path == "/" or path.endswith(".html"):
         response.headers["Cache-Control"] = "no-cache"
-    elif re.search(r"\.[0-9a-fA-F]{8,}\.", path):
+    elif re.search(r"[.-][A-Za-z0-9_-]{8,}\.", path):
         response.headers["Cache-Control"] = "public,max-age=31536000,immutable"
     return response
 
@@ -774,150 +803,123 @@ async def inference_worker():
         )
 
 
-class GoogleAdkLiveAudioEngine:
+class GeminiLiveAudioEngine:
+    """Streams PCM audio to Gemini Live API and yields PCM audio response chunks.
+
+    Uses the native google-genai AsyncSession (send_realtime_input + receive)
+    directly, bypassing the ADK runner which sends the deprecated media_chunks
+    format. Supports Gemini 2.5 and 3.1 Live models.
+    """
+
+    # Models tried in order when none is explicitly configured.
+    DEFAULT_MODEL_CANDIDATES: List[str] = [
+        "gemini-3.1-flash-live-preview",
+        "gemini-2.5-flash-native-audio-preview-12-2025",
+        "gemini-2.5-flash-native-audio-preview-09-2025",
+    ]
+
     def __init__(self) -> None:
-        self.model = os.environ.get(
-            "GOOGLE_ADK_MODEL",
-            "gemini-2.5-flash-native-audio-preview-12-2025",
-        )
-        self.system_instruction = os.environ.get(
+        self.system_instruction: str = os.environ.get(
             "GOOGLE_ADK_SYSTEM_PROMPT",
             "You are a concise helpful voice assistant.",
         )
-        self._runner = None
-        self._session_service = None
-        self._types = None
-        self._run_config_cls = None
-        self._streaming_mode = None
-        self._live_request_queue_cls = None
+        self.model_candidates: List[str] = self._build_model_candidates()
+        self.model: str = self.model_candidates[0]
+        logger.info(
+            "Gemini Live engine initialised model_candidates=%s",
+            self.model_candidates,
+        )
 
-    def _ensure_runtime(self) -> None:
-        if self._runner is not None:
-            return
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _normalize_model(name: str) -> str:
+        value = (name or "").strip()
+        return value[len("models/"):] if value.startswith("models/") else value
+
+    def _build_model_candidates(self) -> List[str]:
+        env_model = self._normalize_model(os.environ.get("GOOGLE_ADK_MODEL", ""))
+        env_extra = [
+            self._normalize_model(m)
+            for m in os.environ.get("GOOGLE_ADK_MODEL_CANDIDATES", "").split(",")
+            if m.strip()
+        ]
+        seen: List[str] = []
+        for m in [env_model, *env_extra, *self.DEFAULT_MODEL_CANDIDATES]:
+            if m and m not in seen:
+                seen.append(m)
+        return seen or list(self.DEFAULT_MODEL_CANDIDATES)
+
+    @staticmethod
+    def _make_genai_client():
         try:
-            from google.adk.agents import Agent  # type: ignore
-            from google.adk.agents.live_request_queue import LiveRequestQueue  # type: ignore
-            from google.adk.agents.run_config import RunConfig, StreamingMode  # type: ignore
-            from google.adk.runners import Runner  # type: ignore
-            from google.adk.sessions import InMemorySessionService  # type: ignore
-            from google.genai import types  # type: ignore
+            from google import genai  # type: ignore
         except ModuleNotFoundError as exc:
             raise RuntimeError(
-                "Missing ADK/Gemini dependencies. Install with: "
-                "python3 -m pip install google-adk google-genai"
+                "Missing google-genai. Install with: pip install google-genai"
             ) from exc
-        self._types = types
-        self._run_config_cls = RunConfig
-        self._streaming_mode = StreamingMode
-        self._live_request_queue_cls = LiveRequestQueue
-        self._session_service = InMemorySessionService()
-        agent = Agent(
-            name="voice_assistant",
-            model=self.model,
-            instruction=self.system_instruction,
+        api_key = (
+            os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+            or ""
         )
-        self._runner = Runner(
-            app_name="npz_generator",
-            agent=agent,
-            session_service=self._session_service,
-        )
-
-    async def _ensure_session(self, conversation_id: str) -> None:
-        assert self._session_service is not None
-        session = await self._session_service.get_session(
-            app_name="npz_generator",
-            user_id=conversation_id,
-            session_id=conversation_id,
-        )
-        if not session:
-            await self._session_service.create_session(
-                app_name="npz_generator",
-                user_id=conversation_id,
-                session_id=conversation_id,
+        if not api_key:
+            raise RuntimeError(
+                "No Gemini API key found. Set GEMINI_API_KEY or GOOGLE_API_KEY."
             )
+        return genai.Client(api_key=api_key)
 
     @staticmethod
-    def _parse_pcm_rate_from_mime(mime_type: str) -> int:
+    def _build_live_config(system_instruction: str):
+        from google.genai import types  # type: ignore
+
+        return types.LiveConnectConfig(
+            responseModalities=["AUDIO"],
+            systemInstruction=system_instruction,
+            sessionResumption=types.SessionResumptionConfig(),
+        )
+
+    @staticmethod
+    def _parse_pcm_rate(mime_type: str) -> int:
         m = re.search(r"rate=(\d+)", mime_type or "")
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                return 24000
-        return 24000
+        return int(m.group(1)) if m else 24000
 
     @staticmethod
-    def _decode_base64url(data: str) -> bytes:
-        raw = data.strip().replace("-", "+").replace("_", "/")
-        while len(raw) % 4:
-            raw += "="
-        return base64.b64decode(raw)
+    def _is_model_unsupported_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "not found" in msg
+            or "not supported for bidigeneratecontent" in msg
+            or ("policy violation" in msg and "model" in msg)
+        )
 
     @staticmethod
-    def _resample_int16_linear(audio_i16: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-        if audio_i16.size == 0 or src_sr <= 0 or dst_sr <= 0 or src_sr == dst_sr:
-            return audio_i16
-        src = audio_i16.astype(np.float32) / 32768.0
-        dst_count = max(1, int(round(src.shape[0] * (dst_sr / float(src_sr)))))
-        dst_index = np.linspace(0, src.shape[0] - 1, num=dst_count, dtype=np.float32)
-        src_index = np.arange(src.shape[0], dtype=np.float32)
-        resampled = np.interp(dst_index, src_index, src)
-        return np.clip(resampled * 32768.0, -32768, 32767).astype(np.int16)
+    def _is_api_key_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "api key" in msg or "unauthenticated" in msg or "permission_denied" in msg
 
-    def _build_run_config(self):
-        assert self._run_config_cls is not None
-        assert self._streaming_mode is not None
-        assert self._types is not None
-        kwargs = {
-            "streaming_mode": self._streaming_mode.BIDI,
-            "response_modalities": [self._types.Modality.AUDIO],
-            "input_audio_transcription": None,
-            "output_audio_transcription": None,
-        }
-        if hasattr(self._types, "SessionResumptionConfig"):
-            kwargs["session_resumption"] = self._types.SessionResumptionConfig()
-        try:
-            return self._run_config_cls(**kwargs)
-        except TypeError:
-            kwargs.pop("session_resumption", None)
-            return self._run_config_cls(**kwargs)
+    @classmethod
+    def user_message_for_exception(cls, exc: Exception) -> str:
+        msg = str(exc)
+        lower = msg.lower()
+        if "reported as leaked" in lower:
+            return (
+                "Gemini API key is disabled (reported as leaked). "
+                "Create a new key in Google AI Studio and set GEMINI_API_KEY."
+            )
+        if cls._is_api_key_error(exc):
+            return (
+                "Gemini authentication failed. Verify GEMINI_API_KEY "
+                "and ensure Live API access is enabled."
+            )
+        if cls._is_model_unsupported_error(exc):
+            return (
+                "Configured Gemini Live model is not available. "
+                "Set GOOGLE_ADK_MODEL to a supported live audio model."
+            )
+        return msg
 
-    @staticmethod
-    def _event_to_dict(event: Any) -> Dict[str, Any]:
-        if isinstance(event, dict):
-            return event
-        if hasattr(event, "model_dump"):
-            try:
-                return event.model_dump(exclude_none=True, by_alias=True)
-            except Exception:
-                return event.model_dump(exclude_none=True)
-        return {}
-
-    def _extract_audio_chunks(self, event: Any) -> List[Tuple[bytes, int]]:
-        payload = self._event_to_dict(event)
-        content = payload.get("content") or {}
-        parts = content.get("parts") or []
-        out: List[Tuple[bytes, int]] = []
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            blob = part.get("inlineData") or part.get("inline_data")
-            if not isinstance(blob, dict):
-                continue
-            mime_type = blob.get("mimeType") or blob.get("mime_type") or ""
-            if not str(mime_type).startswith("audio/pcm"):
-                continue
-            data = blob.get("data")
-            if isinstance(data, str):
-                chunk = self._decode_base64url(data)
-            elif isinstance(data, (bytes, bytearray)):
-                chunk = bytes(data)
-            else:
-                continue
-            if not chunk:
-                continue
-            out.append((chunk, self._parse_pcm_rate_from_mime(str(mime_type))))
-        return out
+    # ------------------------------------------------------------------ streaming
 
     async def stream_audio_events(
         self,
@@ -926,55 +928,84 @@ class GoogleAdkLiveAudioEngine:
         input_pcm_bytes: bytes,
         input_sr: int,
     ):
-        self._ensure_runtime()
-        await self._ensure_session(conversation_id)
-        assert self._live_request_queue_cls is not None
-        assert self._types is not None
-        assert self._runner is not None
-        live_request_queue = self._live_request_queue_cls()
-        run_config = self._build_run_config()
+        """Connect to Gemini Live, send audio, yield (pcm_bytes, sample_rate) tuples."""
+        client = self._make_genai_client()
+        live_config = self._build_live_config(self.system_instruction)
+        chunk_size = max(320, int(input_sr * 0.02) * 2)  # ~20 ms chunks
 
-        async def _upstream() -> None:
-            chunk_bytes = max(320, int((input_sr * 0.02)) * 2)
-            for i in range(0, len(input_pcm_bytes), chunk_bytes):
-                if i >= len(input_pcm_bytes):
-                    break
-                chunk = input_pcm_bytes[i : i + chunk_bytes]
-                if not chunk:
-                    continue
-                audio_blob = self._types.Blob(
-                    mime_type=f"audio/pcm;rate={input_sr}",
-                    data=chunk,
-                )
-                live_request_queue.send_realtime(audio_blob)
-                await asyncio.sleep(0)
-            live_request_queue.close()
+        last_exc: Optional[Exception] = None
 
-        upstream_task = asyncio.create_task(_upstream())
-        try:
-            async for event in self._runner.run_live(
-                user_id=conversation_id,
-                session_id=conversation_id,
-                live_request_queue=live_request_queue,
-                run_config=run_config,
-            ):
-                for chunk_bytes, src_sr in self._extract_audio_chunks(event):
-                    yield chunk_bytes, src_sr
-        finally:
-            live_request_queue.close()
-            if not upstream_task.done():
-                upstream_task.cancel()
+        for idx, model_name in enumerate(self.model_candidates):
+            self.model = model_name
             try:
-                await upstream_task
-            except Exception:
-                pass
+                async with client.aio.live.connect(
+                    model=model_name, config=live_config
+                ) as session:
+                    logger.info(
+                        "Gemini Live connected model=%s conversation=%s",
+                        model_name,
+                        conversation_id,
+                    )
+
+                    # Send audio chunks then signal end-of-turn.
+                    from google.genai import types  # type: ignore
+
+                    for offset in range(0, len(input_pcm_bytes), chunk_size):
+                        chunk = input_pcm_bytes[offset: offset + chunk_size]
+                        if not chunk:
+                            continue
+                        await session.send_realtime_input(
+                            audio=types.Blob(
+                                mime_type=f"audio/pcm;rate={input_sr}",
+                                data=chunk,
+                            )
+                        )
+                    # Signal end of user audio turn.
+                    await session.send_realtime_input(audio_stream_end=True)
+
+                    # Receive response chunks.
+                    async for response in session.receive():
+                        server_content = getattr(response, "server_content", None)
+                        if server_content is None:
+                            continue
+                        model_turn = getattr(server_content, "model_turn", None)
+                        if model_turn is None:
+                            continue
+                        parts = getattr(model_turn, "parts", None) or []
+                        for part in parts:
+                            inline_data = getattr(part, "inline_data", None)
+                            if inline_data is None:
+                                continue
+                            mime = getattr(inline_data, "mime_type", "") or ""
+                            if not mime.startswith("audio/pcm"):
+                                continue
+                            data = getattr(inline_data, "data", None)
+                            if isinstance(data, (bytes, bytearray)) and data:
+                                yield bytes(data), self._parse_pcm_rate(mime)
+                return  # success — no fallback needed
+
+            except Exception as exc:
+                last_exc = exc
+                has_next = idx + 1 < len(self.model_candidates)
+                if has_next and self._is_model_unsupported_error(exc):
+                    logger.warning(
+                        "Gemini Live model %s failed (%s); retrying with %s",
+                        model_name,
+                        str(exc).splitlines()[0],
+                        self.model_candidates[idx + 1],
+                    )
+                    continue
+                raise
+
+        if last_exc is not None:
+            raise last_exc
 
 
 class ConversationRuntime:
     def __init__(self, websocket: WebSocket, conversation_id: str) -> None:
         self.websocket = websocket
         self.conversation_id = conversation_id
-        self.adk = GoogleAdkLiveAudioEngine()
+        self.adk = GeminiLiveAudioEngine()
         self._listening = False
         self._user_audio_chunks: List[bytes] = []
         self._user_audio_sr: int = CONVERSATION_AUDIO_SR
@@ -1000,6 +1031,8 @@ class ConversationRuntime:
         )
 
     async def handle_ptt_start(self) -> None:
+        if self._reply_task and not self._reply_task.done():
+            await self.interrupt(reason="user_started_speaking")
         self._listening = True
         self._user_audio_chunks = []
         self._user_audio_sr = CONVERSATION_AUDIO_SR
@@ -1180,8 +1213,11 @@ class ConversationRuntime:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.exception("Conversation turn failed conversation=%s: %s", self.conversation_id, exc)
-            await self._send({"type": "error", "message": str(exc)})
+            if self.adk._is_invalid_api_key_error(exc) or self.adk._is_model_not_supported_error(exc):
+                logger.warning("Conversation turn failed conversation=%s: %s", self.conversation_id, exc)
+            else:
+                logger.exception("Conversation turn failed conversation=%s: %s", self.conversation_id, exc)
+            await self._send({"type": "error", "message": self.adk.user_message_for_exception(exc)})
             try:
                 await self._send({"type": "assistant_thinking_end"})
             except Exception:
@@ -1223,13 +1259,9 @@ def _process_chunk(audio_np: np.ndarray, sr: int, chunk_id: Optional[str]) -> Op
 
 def _log_conversation_dependency_health() -> None:
     missing: List[str] = []
-    try:
-        from google.adk.agents import Agent  # type: ignore  # noqa: F401
-    except ModuleNotFoundError:
+    if importlib.util.find_spec("google.adk") is None:
         missing.append("google-adk")
-    try:
-        from google import genai  # type: ignore  # noqa: F401
-    except ModuleNotFoundError:
+    if importlib.util.find_spec("google.genai") is None:
         missing.append("google-genai")
     if missing:
         logger.warning(

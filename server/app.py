@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore", message=r".*Pydantic serializer warnings:.*res
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # Ensure repo root and server dir are on sys.path for local imports.
@@ -89,6 +90,14 @@ CONVERSATION_PROTOCOL_VERSION: int = 1
 SERVER_BOOT_ID: str = str(uuid.uuid4())
 SERVER_CLOCK_ID: str = "monotonic-ms-v1"
 _BOOT_MONO_NS: int = time.monotonic_ns()
+ 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _server_time_ms() -> int:
@@ -322,7 +331,7 @@ async def ws_conversation(websocket: WebSocket):
         create_audio_session_fn=_create_audio_session,
     )
     logger.info("Conversation WS connected: %s conversation=%s", websocket.client, conversation_id)
-    await runtime.send_hello_ack()
+    # await runtime.send_hello_ack() # Removed redundant call: loop handles "hello" message.
     try:
         while True:
             raw = await websocket.receive_text()

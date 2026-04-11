@@ -130,21 +130,24 @@ export function teardownMicCapture() {
 
 // ── Private helpers ────────────────────────────────────────────────────────
 
+// Matches the reference `float32ToPcm16` from useLiveAPI audio-utils:
+// clamp to [-1, 1] then scale with separate negative/positive ranges.
 function _float32ToInt16(input) {
   const out = new Int16Array(input.length);
   for (let i = 0; i < input.length; i++) {
     const s = Math.max(-1, Math.min(1, input[i]));
-    out[i] = s < 0 ? s * 32768 : s * 32767;
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
   return out;
 }
 
+// Matches the reference `arrayBufferToBase64` from useLiveAPI audio-utils:
+// iterate byte-by-byte to avoid call-stack limits on large typed arrays.
 function _int16ToBase64(int16Array) {
   const bytes = new Uint8Array(int16Array.buffer);
   let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
 }

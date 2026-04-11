@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { destroyViewer, initViewer } from "./viewer/ViewerController.js";
+import { ConversationPanel } from "./ConversationPanel.jsx";
 
 function App() {
   const [view, setView] = useState("viewer");
@@ -74,6 +75,7 @@ function App() {
         </div>
       </div>
 
+      {/* ── Existing HUD (stats, view controls) ── */}
       <div id="hud" className={view === "viewer" ? "" : "hidden"}>
         <div className="row">
           <span>Status</span>
@@ -118,18 +120,16 @@ function App() {
           <span>Audio Buf</span>
           <span id="audioBuffer">0.0s</span>
         </div>
-        <div className="row">
-          <span>Conversation</span>
-          <span id="conversationStatus">disconnected</span>
-        </div>
-        <div className="row">
-          <span>Assistant</span>
-          <span id="conversationState">idle</span>
-        </div>
-        <div className="row">
-          <span>Reply Stream</span>
-          <span id="conversationSession">-</span>
-        </div>
+
+        {/*
+          ── Ghost conversation status elements ──
+          ViewerController reads these by ID. We keep them in the DOM but
+          invisible — the ConversationPanel reads them via MutationObserver.
+        */}
+        <span id="conversationStatus" style={{ display: "none" }}>disconnected</span>
+        <span id="conversationState"  style={{ display: "none" }}>idle</span>
+        <span id="conversationSession" style={{ display: "none" }}>-</span>
+
         <div className="row">
           <span>Playback</span>
           <span id="playState">buffering</span>
@@ -214,16 +214,26 @@ function App() {
         </div>
         <div className="btns">
           <button id="enableAudio">Enable Audio</button>
-          <button id="connectConversation">Connect Voice</button>
-          <button id="pttButton">Push To Talk</button>
-          <button id="disconnectMic">Disconnect Mic</button>
-          <button id="interruptReply">Interrupt</button>
+          {/*
+            ── Ghost conversation control buttons ──
+            These are visually hidden but remain in the DOM so ViewerController
+            can attach its click handlers. ConversationPanel.jsx calls .click()
+            on them programmatically.
+          */}
+          <button id="connectConversation" style={{ display: "none" }}>Connect Voice</button>
+          <button id="pttButton"           style={{ display: "none" }}>Push To Talk</button>
+          <button id="disconnectMic"       style={{ display: "none" }}>Disconnect Mic</button>
+          <button id="interruptReply"      style={{ display: "none" }}>Interrupt</button>
           <button id="togglePlay">Pause</button>
           <button id="clearBuffer">Clear Buffer</button>
           <button id="resetCam">Reset Cam</button>
         </div>
       </div>
+
       <canvas id="canvas" className={view === "viewer" ? "" : "hidden"}></canvas>
+
+      {/* ── Premium conversation panel overlay ── */}
+      {view === "viewer" && <ConversationPanel />}
 
       <div id="utilities" className={view === "utilities" ? "" : "hidden"}>
         <h2>Command Runner (Copy to Terminal)</h2>

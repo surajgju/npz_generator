@@ -65,8 +65,9 @@ class GeminiLiveAudioEngine:
 
     DEFAULT_MODEL_CANDIDATES: List[str] = [
         "gemini-3.1-flash-live-preview",
-        "gemini-2.5-flash-native-audio-preview-12-2025",
-        "gemini-2.5-flash-native-audio-preview-09-2025",
+        "gemini-2.0-flash-live-001",
+        "gemini-2.0-flash-exp",
+        "gemini-2.0-flash",
     ]
 
     def __init__(self) -> None:
@@ -125,11 +126,25 @@ class GeminiLiveAudioEngine:
         types = _genai_types
         if types is None:
             raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
-        return types.LiveConnectConfig(
-            responseModalities=["AUDIO"],
-            systemInstruction=system_instruction,
-            sessionResumption=types.SessionResumptionConfig(),
-        )
+
+        # Build speech / voice config only when the types are available.
+        voice_name = os.environ.get("GEMINI_LIVE_VOICE", "Zephyr")
+        try:
+            speech_cfg = types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+                )
+            )
+        except Exception:
+            speech_cfg = None
+
+        kwargs = dict(response_modalities=["AUDIO"])
+        if system_instruction:
+            kwargs["system_instruction"] = system_instruction
+        if speech_cfg is not None:
+            kwargs["speech_config"] = speech_cfg
+
+        return types.LiveConnectConfig(**kwargs)
 
     @staticmethod
     def _parse_pcm_rate(mime_type: str) -> int:
@@ -226,10 +241,18 @@ class GeminiLiveAudioEngine:
         input_pcm_bytes: bytes,
         input_sr: int,
     ):
-        """Connect to Gemini Live, send audio, yield (pcm_bytes, sample_rate) tuples."""
+        """Connect to Gemini Live, stream audio via send_realtime_input, yield (pcm_bytes, sample_rate) tuples.
+
+        Uses send_realtime_input (matches the useLiveAPI reference pattern) which is
+        the correct API for real-time audio streaming as of google-genai >=0.8.
+        Falls back to the legacy session.send() path when send_realtime_input is
+        unavailable on the session object.
+        """
         client = self._make_genai_client()
         live_config = self._build_live_config(self.system_instruction)
-        chunk_size = max(320, int(input_sr * 0.02) * 2)  # ~20 ms chunks
+        # ~20 ms chunks at the input sample rate (2 bytes per int16 sample)
+        chunk_size = max(320, int(input_sr * 0.02) * 2)
+        mime_type = f"audio/pcm;rate={input_sr}"
         idle_timeout_sec = float(os.environ.get("GEMINI_LIVE_RECEIVE_IDLE_TIMEOUT_SEC", "8"))
         max_turn_sec = float(os.environ.get("GEMINI_LIVE_MAX_TURN_SEC", "45"))
         last_exc: Optional[Exception] = None
@@ -245,21 +268,49 @@ class GeminiLiveAudioEngine:
                         model_name,
                         conversation_id,
                     )
-                    types = _genai_types
-                    for offset in range(0, len(input_pcm_bytes), chunk_size):
-                        chunk = input_pcm_bytes[offset: offset + chunk_size]
-                        if not chunk:
-                            continue
-                        await session.send_realtime_input(
-                            audio=types.Blob(
-                                mime_type=f"audio/pcm;rate={input_sr}",
-                                data=chunk,
-                            )
-                        )
-                    await session.send(end_of_turn=True)
 
+                    # ── Send audio ───────────────────────────────────────────
+                    # Prefer send_realtime_input (matches useLiveAPI reference):
+                    #   session.send_realtime_input(audio={"data": b64, "mime_type": mime})
+                    # Fall back to session.send() for older SDK versions.
+                    use_realtime_input = callable(getattr(session, "send_realtime_input", None))
+
+                    if use_realtime_input:
+                        import base64 as _base64
+                        for offset in range(0, len(input_pcm_bytes), chunk_size):
+                            chunk = input_pcm_bytes[offset: offset + chunk_size]
+                            if not chunk:
+                                continue
+                            b64_chunk = _base64.b64encode(chunk).decode("ascii")
+                            await session.send_realtime_input(
+                                audio={"data": b64_chunk, "mime_type": mime_type}
+                            )
+                        # Signal end-of-turn with empty bytes + end_of_turn=True.
+                        # Passing a dict to session.send() raises ValueError in
+                        # all current google-genai SDK versions.
+                        await session.send(input=b"", end_of_turn=True)
+                        logger.debug(
+                            "Gemini Live audio sent via send_realtime_input model=%s bytes=%d",
+                            model_name, len(input_pcm_bytes),
+                        )
+                    else:
+                        # Legacy path: send raw PCM bytes
+                        for offset in range(0, len(input_pcm_bytes), chunk_size):
+                            chunk = input_pcm_bytes[offset: offset + chunk_size]
+                            if not chunk:
+                                continue
+                            await session.send(input=chunk, end_of_turn=False)
+                        await session.send(input=b"", end_of_turn=True)
+                        logger.debug(
+                            "Gemini Live audio sent via legacy session.send model=%s bytes=%d",
+                            model_name, len(input_pcm_bytes),
+                        )
+
+                    # ── Receive loop ─────────────────────────────────────────
                     recv_iter = session.receive().__aiter__()
                     turn_start = asyncio.get_running_loop().time()
+                    interrupted = False
+
                     while True:
                         elapsed = asyncio.get_running_loop().time() - turn_start
                         if elapsed >= max_turn_sec:
@@ -284,8 +335,17 @@ class GeminiLiveAudioEngine:
                             )
                             break
 
+                        # ── Handle interrupted flag (mirrors useLiveAPI reference) ──
                         server_content = getattr(response, "server_content", None)
                         if server_content is not None:
+                            if getattr(server_content, "interrupted", False):
+                                logger.info(
+                                    "Gemini Live interrupted model=%s conversation=%s",
+                                    model_name, conversation_id,
+                                )
+                                interrupted = True
+                                break
+
                             model_turn = getattr(server_content, "model_turn", None)
                             if model_turn is not None:
                                 for part in getattr(model_turn, "parts", None) or []:
@@ -306,6 +366,9 @@ class GeminiLiveAudioEngine:
                                 conversation_id,
                             )
                             break
+
+                    if interrupted:
+                        break
                 return  # success
 
             except Exception as exc:

@@ -1879,13 +1879,18 @@ function initWorker() {
           workerFallbackTimer = null;
         }
       } else if (msg.status === "reset_required") {
-        warn("Worker requested reset", msg);
+        warn("Worker requested reset - clearing stale session state", msg);
+        sessionStorage.removeItem("viewer_known_boot_id");
+        sessionStorage.removeItem("viewer_known_server_clock_id");
+        sessionStorage.removeItem("viewer_known_session_id");
+        sessionStorage.removeItem("viewer_last_applied_frame");
         pipelineModeEl.textContent = "Resync";
         statusEl.textContent = "Resyncing";
         workerAlive = false;
         workerReady = false;
         resyncing = true;
         startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+        // Optionally reload or re-init here if needed, but the next connect should be clean.
       } else if (msg.status === "error" || msg.status === "closed") {
         warn("Worker status:", msg);
         pipelineModeEl.textContent = "Error";

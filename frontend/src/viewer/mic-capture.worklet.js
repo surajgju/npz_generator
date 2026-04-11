@@ -13,7 +13,8 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     for (let i = 0; i < input.length; i++) {
       this.buffer[this.offset++] = input[i];
       if (this.offset >= this.bufferSize) {
-        this.port.postMessage(this.buffer);
+        // Post a copy so the main thread owns its own buffer slice.
+        this.port.postMessage(this.buffer.slice());
         this.offset = 0;
         this.buffer = new Float32Array(this.bufferSize);
       }

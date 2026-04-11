@@ -1793,12 +1793,12 @@ function startManualOverride(type, durationSec, payload) {
 window.testMorph = function (name, value) {
   const targets = morphTargetMap.get(name);
   if (!targets) {
-    console.error(`Morph target ${name} not found in map.`);
+    error(`Morph target ${name} not found in map.`);
     return;
   }
   targets.forEach(t => {
     t.mesh.morphTargetInfluences[t.index] = value;
-    console.log(`Applied manual morph: ${name} = ${value} on ${t.mesh.name}`);
+    log(`Applied manual morph: ${name} = ${value} on ${t.mesh.name}`);
   });
 };
 
@@ -2220,25 +2220,8 @@ async function ensureMicCapture() {
         });
       };
     } catch (e) {
-      console.warn("AudioWorklet failed, falling back to ScriptProcessor", e);
-      useWorklet = false;
+      throw new Error(`AudioWorklet failed to load mic-capture processor: ${e.message}. Ensure the server sets the required COOP/COEP headers.`);
     }
-  }
-
-  if (!useWorklet) {
-    micProcessor = micCaptureCtx.createScriptProcessor(CONVERSATION_PTT_BUFFER, 1, 1);
-    micProcessor.onaudioprocess = (event) => {
-      if (!pttActive || !conversationConnected) return;
-      const samples = event.inputBuffer.getChannelData(0);
-      const int16 = float32ToInt16(samples);
-      sendConversationMessage({
-        type: "user_audio",
-        seq: pttSeq++,
-        sr: micSampleRate,
-        dtype: "int16",
-        pcm_b64: int16ToBase64(int16),
-      });
-    };
   }
 
   micMuteGain = micCaptureCtx.createGain();

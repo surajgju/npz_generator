@@ -2,6 +2,8 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { ConversationClient } from "./ConversationClient.js";
+import { ensureMicCapture, teardownMicCapture } from "./AudioCapture.js";
 
 let statusEl = null;
 let bufferSecEl = null;
@@ -1098,35 +1100,29 @@ let lastRateTime = performance.now();
 let currentPlayFps = streamFps;
 
 let audioCtx = null;
-let audioWs = null;
 let audioEnabled = false;
 let audioStarted = false;
 let audioStartTime = null;
 let audioScheduledTime = 0;
 let audioQueue = [];
 let audioQueuedSec = 0;
-let conversationWs = null;
+let conversationClient = null;
 let conversationConnected = false;
 let conversationId = null;
-let conversationReplyId = null;
 let conversationStreamSessionId = null;
 let assistantLifecycleState = "idle";
-let micStream = null;
-let micCaptureCtx = null;
-let micSource = null;
-let micProcessor = null;
-let micMuteGain = null;
 let pttActive = false;
+let pttPressed = false;
+let pttStarting = false;
 let pttSeq = 0;
-let micSampleRate = 16000;
 let silentStartTime = null;
 let animOffsetSec = 0;
 let animOffsetSet = false;
 const AUDIO_JITTER_SEC = 0.08;
-const AUDIO_START_BUFFER_SEC = 0.6;
-const AUDIO_LOW_BUFFER_SEC = 0.3;
-const CONVERSATION_AUDIO_SAMPLE_RATE = 16000;
-const CONVERSATION_PTT_BUFFER = 2048;
+const AUDIO_START_LEAD_SEC = Number(import.meta.env.VITE_AUDIO_START_LEAD_SEC || 0.03);
+const AUDIO_START_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_START_BUFFER_SEC || 0.18);
+const MESH_START_BUFFER_SEC = Number(import.meta.env.VITE_MESH_START_BUFFER_SEC || 0.18);
+const AUDIO_LOW_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_LOW_BUFFER_SEC || 0.12);
 const STARTUP_SUPPRESS_MS = 4000;
 const STALL_HOLD_MS = 300;
 const STALL_EASE_MS = 700;
@@ -1959,85 +1955,6 @@ function initWorker() {
   }, 5000);
 }
 
-function connectAudioSocket() {
-  if (audioWs) return;
-  audioWs = new WebSocket(`ws://${WS_HOST}/ws/audio_out`);
-  audioWs.binaryType = "arraybuffer";
-  let audioHeader = null;
-
-  audioWs.onopen = () => {
-    audioStatusEl.textContent = "connected";
-    log("Connected to /ws/audio_out");
-  };
-  audioWs.onclose = () => {
-    audioStatusEl.textContent = "disconnected";
-    warn("Audio WS disconnected");
-    audioWs = null;
-  };
-  audioWs.onerror = () => {
-    audioStatusEl.textContent = "error";
-    error("Audio WS error");
-  };
-  audioWs.onmessage = (event) => {
-    if (typeof event.data === "string") {
-      try {
-        audioHeader = JSON.parse(event.data);
-      } catch {
-        audioHeader = null;
-      }
-      if (audioHeader && audioHeader.type === "audio") {
-        const nextAudioSessionId =
-          audioHeader.stream_session_id || audioHeader.session_id || null;
-        if (nextAudioSessionId && conversationSessionEl) {
-          conversationSessionEl.textContent = nextAudioSessionId;
-        }
-        if (audioSessionId && nextAudioSessionId !== audioSessionId) {
-          beginSessionRecovery("audio_session_switch");
-        }
-        if (nextAudioSessionId) audioSessionId = nextAudioSessionId;
-      } else if (audioHeader && audioHeader.type === "audio_control" && audioHeader.action === "stop") {
-        beginSessionRecovery("audio_control_stop");
-      }
-      return;
-    }
-    if (!audioHeader || !audioCtx) return;
-    if (audioHeader.type !== "audio") {
-      audioHeader = null;
-      return;
-    }
-    const sr = audioHeader.sr || 16000;
-    const pcm = new Int16Array(event.data);
-    const floats = new Float32Array(pcm.length);
-    for (let i = 0; i < pcm.length; i++) {
-      floats[i] = pcm[i] / 32768;
-    }
-    const buffer = audioCtx.createBuffer(1, floats.length, sr);
-    buffer.copyToChannel(floats, 0);
-    const duration = buffer.duration;
-    if (hasSessionMismatch()) {
-      if (!sessionMismatchWarned) {
-        sessionMismatchWarned = true;
-        warn("Session mismatch between anim/audio", { workerSessionId, audioSessionId });
-        beginSessionRecovery("anim_audio_mismatch");
-      }
-      queueAudioChunk(buffer, duration);
-      audioHeader = null;
-      return;
-    }
-    if (resyncing) {
-      queueAudioChunk(buffer, duration);
-      audioHeader = null;
-      return;
-    }
-    if (!audioStarted) {
-      queueAudioChunk(buffer, duration);
-    } else {
-      scheduleAudioBuffer(buffer, duration);
-    }
-    audioHeader = null;
-  };
-}
-
 function updateConversationHud() {
   if (conversationStatusEl) {
     conversationStatusEl.textContent = conversationConnected ? "connected" : "disconnected";
@@ -2051,201 +1968,154 @@ function updateConversationHud() {
 }
 
 function sendConversationMessage(payload) {
-  if (!conversationWs || conversationWs.readyState !== WebSocket.OPEN) return;
-  conversationWs.send(JSON.stringify(payload));
+  if (conversationClient) conversationClient.send(payload);
+}
+
+function handleAssistantAudioChunk(chunkData, audioHeader) {
+  if (!audioCtx || !audioHeader) return;
+  const sr = audioHeader.sr || 16000;
+  const pcm = new Int16Array(chunkData);
+  const floats = new Float32Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) {
+    floats[i] = pcm[i] / 32768;
+  }
+  const buffer = audioCtx.createBuffer(1, floats.length, sr);
+  buffer.copyToChannel(floats, 0);
+  const duration = buffer.duration;
+  if (hasSessionMismatch()) {
+    if (!sessionMismatchWarned) {
+      sessionMismatchWarned = true;
+      warn("Session mismatch between anim/audio", { workerSessionId, audioSessionId });
+      beginSessionRecovery("anim_audio_mismatch");
+    }
+    queueAudioChunk(buffer, duration);
+    return;
+  }
+  if (resyncing) {
+    queueAudioChunk(buffer, duration);
+    return;
+  }
+  if (!audioStarted) {
+    queueAudioChunk(buffer, duration);
+  } else {
+    scheduleAudioBuffer(buffer, duration);
+  }
 }
 
 function connectConversationSocket() {
-  if (conversationWs) return;
-  conversationWs = new WebSocket(`ws://${WS_HOST}/ws/conversation`);
-  conversationWs.onopen = () => {
-    conversationConnected = true;
-    assistantLifecycleState = "idle";
-    updateConversationHud();
-    sendConversationMessage({ type: "hello", protocol_version: 1, build_id: BUILD_ID });
-  };
-  conversationWs.onclose = () => {
-    conversationConnected = false;
-    assistantLifecycleState = "idle";
-    updateConversationHud();
-    conversationWs = null;
-  };
-  conversationWs.onerror = () => {
-    conversationConnected = false;
-    assistantLifecycleState = "idle";
-    updateConversationHud();
-  };
-  conversationWs.onmessage = (event) => {
-    let msg = null;
-    try {
-      msg = JSON.parse(event.data);
-    } catch {
-      return;
+  if (conversationClient) return;
+  conversationClient = new ConversationClient({
+    wsHost: WS_HOST,
+    buildId: BUILD_ID,
+    callbacks: {
+      onConnectionChange: (connected) => {
+        conversationConnected = connected;
+        updateConversationHud();
+      },
+      onLifecycleChange: (state) => {
+        if (state === "idle_from_thinking") {
+          assistantLifecycleState = "idle";
+        } else {
+          assistantLifecycleState = state;
+        }
+        updateConversationHud();
+      },
+      onStreamSessionChange: (sessionId) => {
+        if (sessionId && conversationStreamSessionId && sessionId !== conversationStreamSessionId) {
+          beginSessionRecovery("conversation_stream_switch");
+        }
+        conversationStreamSessionId = sessionId || conversationStreamSessionId;
+        updateConversationHud();
+      },
+      onError: (msg) => {
+        warn("Conversation error", msg);
+      },
+      onHelloAck: (meta) => {
+        conversationId = meta.conversationId || conversationId;
+        serverBootId = meta.serverBootId || serverBootId;
+        serverClockId = meta.serverClockId || serverClockId;
+        protocolVersion = meta.protocolVersion || protocolVersion;
+        updateConversationHud();
+        if (DEBUG) {
+          log("Conversation hello_ack", meta);
+        }
+      },
+      onAudioConnectionChange: (connected) => {
+        if (!audioStatusEl) return;
+        audioStatusEl.textContent = connected ? "connected" : "disconnected";
+      },
+      onAudioHeader: (audioHeader) => {
+        const nextAudioSessionId = audioHeader.stream_session_id || audioHeader.session_id || null;
+        if (nextAudioSessionId && conversationSessionEl) {
+          conversationSessionEl.textContent = nextAudioSessionId;
+        }
+        if (audioSessionId && nextAudioSessionId !== audioSessionId) {
+          beginSessionRecovery("audio_session_switch");
+        }
+        if (nextAudioSessionId) audioSessionId = nextAudioSessionId;
+      },
+      onAudioControl: (msg) => {
+        if (msg.action === "stop") {
+          beginSessionRecovery("audio_control_stop");
+        }
+      },
+      onAudioChunk: (chunkData, audioHeader) => {
+        handleAssistantAudioChunk(chunkData, audioHeader);
+      },
     }
-    if (!msg || typeof msg !== "object") return;
-    if (msg.type === "hello_ack") {
-      conversationId = msg.conversation_id || conversationId;
-      serverBootId = msg.server_boot_id || serverBootId;
-      serverClockId = msg.server_clock_id || serverClockId;
-      if (Number.isFinite(msg.protocol_version)) protocolVersion = msg.protocol_version;
-      updateConversationHud();
-      if (DEBUG) {
-        log("Conversation hello_ack", {
-          conversationId,
-          protocolVersion,
-          serverBootId,
-          serverClockId,
-        });
-      }
-      return;
-    }
-    if (msg.type === "listening") {
-      assistantLifecycleState = "listening";
-      updateConversationHud();
-      return;
-    }
-    if (msg.type === "assistant_thinking_start") {
-      assistantLifecycleState = "thinking";
-      updateConversationHud();
-      return;
-    }
-    if (msg.type === "assistant_thinking_end") {
-      if (assistantLifecycleState === "thinking") assistantLifecycleState = "idle";
-      updateConversationHud();
-      return;
-    }
-    if (msg.type === "assistant_speaking_start") {
-      assistantLifecycleState = "speaking";
-      conversationReplyId = msg.reply_id || conversationReplyId;
-      const nextSessionId = msg.stream_session_id || msg.session_id || null;
-      if (nextSessionId && conversationStreamSessionId && nextSessionId !== conversationStreamSessionId) {
-        beginSessionRecovery("conversation_stream_switch");
-      }
-      conversationStreamSessionId = nextSessionId || conversationStreamSessionId;
-      updateConversationHud();
-      return;
-    }
-    if (msg.type === "assistant_speaking_end") {
-      assistantLifecycleState = "idle";
-      updateConversationHud();
-      return;
-    }
-    if (msg.type === "interrupted") {
-      assistantLifecycleState = "idle";
-      updateConversationHud();
-      return;
-    }
-    if (msg.type === "error") {
-      warn("Conversation error", msg);
-      assistantLifecycleState = "idle";
-      updateConversationHud();
-    }
-  };
+  });
+  conversationClient.connectConversation();
 }
 
 async function ensureConversationConnected(timeoutMs = 4000) {
-  if (conversationConnected && conversationWs && conversationWs.readyState === WebSocket.OPEN) return;
-  connectConversationSocket();
-  const start = performance.now();
-  while (!(conversationConnected && conversationWs && conversationWs.readyState === WebSocket.OPEN)) {
-    if (performance.now() - start > timeoutMs) {
-      throw new Error("Conversation socket timeout");
-    }
-    // eslint-disable-next-line no-await-in-loop
-    await new Promise((resolve) => setTimeout(resolve, 40));
-  }
-}
-
-function float32ToInt16(input) {
-  const out = new Int16Array(input.length);
-  for (let i = 0; i < input.length; i++) {
-    const s = Math.max(-1, Math.min(1, input[i]));
-    out[i] = s < 0 ? s * 32768 : s * 32767;
-  }
-  return out;
-}
-
-function int16ToBase64(int16Array) {
-  const bytes = new Uint8Array(int16Array.buffer);
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
-async function ensureMicCapture() {
-  if (micCaptureCtx && micProcessor && micSource) return;
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    throw new Error("getUserMedia is not supported in this browser");
-  }
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      sampleRate: CONVERSATION_AUDIO_SAMPLE_RATE,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
-  });
-  micCaptureCtx = new (window.AudioContext || window.webkitAudioContext)({
-    sampleRate: CONVERSATION_AUDIO_SAMPLE_RATE,
-  });
-  await micCaptureCtx.resume();
-  micSampleRate = micCaptureCtx.sampleRate || CONVERSATION_AUDIO_SAMPLE_RATE;
-  micSource = micCaptureCtx.createMediaStreamSource(micStream);
-
-  let useWorklet = !!(micCaptureCtx.audioWorklet);
-  if (useWorklet) {
-    const workletUrl = new URL("./mic-capture.worklet.js", import.meta.url);
-    try {
-      await micCaptureCtx.audioWorklet.addModule(workletUrl);
-      micProcessor = new AudioWorkletNode(micCaptureCtx, "mic-capture-processor", {
-        numberOfInputs: 1,
-        numberOfOutputs: 1,
-        outputChannelCount: [1],
-        processorOptions: { bufferSize: CONVERSATION_PTT_BUFFER },
-      });
-      micProcessor.port.onmessage = (event) => {
-        if (!pttActive || !conversationConnected) return;
-        const samples = event.data;
-        const int16 = float32ToInt16(samples);
-        sendConversationMessage({
-          type: "user_audio",
-          seq: pttSeq++,
-          sr: micSampleRate,
-          dtype: "int16",
-          pcm_b64: int16ToBase64(int16),
-        });
-      };
-    } catch (e) {
-      throw new Error(`AudioWorklet failed to load mic-capture processor: ${e.message}. Ensure the server sets the required COOP/COEP headers.`);
-    }
-  }
-
-  micMuteGain = micCaptureCtx.createGain();
-  micMuteGain.gain.value = 0;
-  micSource.connect(micProcessor);
-  micProcessor.connect(micMuteGain);
-  micMuteGain.connect(micCaptureCtx.destination);
+  if (!conversationClient) connectConversationSocket();
+  await conversationClient.ensureConnected(timeoutMs);
 }
 
 async function startPushToTalk() {
-  if (pttActive) return;
-  if (!audioEnabled) await onEnableAudio();
-  await ensureConversationConnected();
-  await ensureMicCapture();
-  pttActive = true;
-  pttSeq = 0;
-  assistantLifecycleState = "listening";
-  updateConversationHud();
-  sendConversationMessage({ type: "ptt_start" });
-  if (pttButton) pttButton.classList.add("active");
+  if (pttActive || pttStarting) return;
+  pttStarting = true;
+  try {
+    if (!audioEnabled) await onEnableAudio();
+    await ensureConversationConnected();
+    await ensureMicCapture({
+      isPttActive: () => pttActive,
+      isConvConnected: () => conversationConnected,
+      sendMsg: sendConversationMessage,
+      getPttSeq: () => pttSeq++
+    });
+    if (!pttPressed) {
+      // Pointer was released while async setup was in-flight.
+      sendConversationMessage({ type: "ptt_end" });
+      return;
+    }
+    pttActive = true;
+    pttSeq = 0;
+    assistantLifecycleState = "listening";
+    updateConversationHud();
+    sendConversationMessage({ type: "ptt_start" });
+    if (!pttPressed) {
+      stopPushToTalk({ forceSend: true });
+      return;
+    }
+    if (pttButton) pttButton.classList.add("active");
+  } finally {
+    pttStarting = false;
+  }
 }
 
-function stopPushToTalk() {
-  if (!pttActive) return;
+function stopPushToTalk({ forceSend = false } = {}) {
+  if (!pttActive) {
+    if (forceSend && conversationConnected) {
+      sendConversationMessage({ type: "ptt_end" });
+      if (assistantLifecycleState === "listening") {
+        assistantLifecycleState = "thinking";
+        updateConversationHud();
+      }
+    }
+    if (pttButton) pttButton.classList.remove("active");
+    return;
+  }
   pttActive = false;
   sendConversationMessage({ type: "ptt_end" });
   if (assistantLifecycleState === "listening") {
@@ -2261,33 +2131,12 @@ function onInterruptReply() {
 }
 
 function onDisconnectMic() {
+  pttPressed = false;
+  stopPushToTalk({ forceSend: true });
+  sendConversationMessage({ type: "interrupt" });
   teardownMicCapture();
-}
-
-function teardownMicCapture() {
-  pttActive = false;
-  if (micProcessor) {
-    micProcessor.disconnect();
-    if (micProcessor.port) micProcessor.port.onmessage = null;
-    micProcessor.onaudioprocess = null;
-    micProcessor = null;
-  }
-  if (micSource) {
-    micSource.disconnect();
-    micSource = null;
-  }
-  if (micMuteGain) {
-    micMuteGain.disconnect();
-    micMuteGain = null;
-  }
-  if (micStream) {
-    for (const track of micStream.getTracks()) track.stop();
-    micStream = null;
-  }
-  if (micCaptureCtx) {
-    micCaptureCtx.close();
-    micCaptureCtx = null;
-  }
+  assistantLifecycleState = "idle";
+  updateConversationHud();
 }
 
 function scheduleAudioBuffer(buffer, duration) {
@@ -2430,8 +2279,8 @@ function tryStartPlayback() {
   if (resyncing || hasSessionMismatch()) return;
   const meshBuf = Math.max(workerQueueLen / streamFps, (workerMaxIndex + 1) / streamFps);
   const audioBuf = audioQueuedSec;
-  if (meshBuf >= 0.6 && audioBuf >= AUDIO_START_BUFFER_SEC) {
-    audioStartTime = audioCtx.currentTime + 0.1;
+  if (meshBuf >= MESH_START_BUFFER_SEC && audioBuf >= AUDIO_START_BUFFER_SEC) {
+    audioStartTime = audioCtx.currentTime + AUDIO_START_LEAD_SEC;
     audioScheduledTime = audioStartTime;
     for (const item of audioQueue) {
       scheduleAudioBuffer(item.buffer, item.duration);
@@ -2854,7 +2703,8 @@ async function onEnableAudio() {
   startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   await audioCtx.resume();
-  connectAudioSocket();
+  connectConversationSocket();
+  conversationClient.connectAudioOut();
 }
 
 function onConnectConversation() {
@@ -2864,8 +2714,10 @@ function onConnectConversation() {
 
 function onPttPointerDown(event) {
   event.preventDefault();
+  pttPressed = true;
   startPushToTalk().catch((err) => {
     warn("PTT start failed", err);
+    pttPressed = false;
     pttActive = false;
     if (pttButton) pttButton.classList.remove("active");
   });
@@ -2873,7 +2725,8 @@ function onPttPointerDown(event) {
 
 function onPttPointerUp(event) {
   event.preventDefault();
-  stopPushToTalk();
+  pttPressed = false;
+  stopPushToTalk({ forceSend: true });
 }
 
 function onResize() {
@@ -3039,13 +2892,9 @@ export function destroyViewer() {
     worker.terminate();
     worker = null;
   }
-  if (audioWs) {
-    audioWs.close();
-    audioWs = null;
-  }
-  if (conversationWs) {
-    conversationWs.close();
-    conversationWs = null;
+  if (conversationClient) {
+    conversationClient.disconnect();
+    conversationClient = null;
   }
   teardownMicCapture();
   if (audioCtx) {

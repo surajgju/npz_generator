@@ -48,13 +48,13 @@ if SERVER_DIR not in sys.path:
 from live_streaming_pipeline import LiveMotionGenerator
 from npz_logging import setup_logging
 from retargeter import SmplxRetargeter
+from . import session as session_state
 from .session import (
     STREAM_FPS,
     SNAPSHOT_FRAMES,
     SessionFrame,
     sessions,
     sessions_lock,
-    active_session_id,
     anim_clients,
     anim_client_protocol,
     anim_client_session,
@@ -384,7 +384,7 @@ async def ws_anim(websocket: WebSocket):
                 or subscribe_msg.get("known_session_id")
             )
             async with sessions_lock:
-                active_sid = active_session_id
+                active_sid = session_state.active_session_id
 
             if known_boot_id and known_boot_id != SERVER_BOOT_ID:
                 mode = "reset_required"
@@ -447,7 +447,7 @@ async def ws_anim(websocket: WebSocket):
             if msg.get("type") == "resync_request":
                 req_session = _resolve_stream_session_id(msg)
                 async with sessions_lock:
-                    active_sid = active_session_id
+                    active_sid = session_state.active_session_id
                 if active_sid and req_session == active_sid:
                     logger.info(
                         "Resync request accepted session=%s reason=%s",

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from fastapi import WebSocket
 
+from . import session as session_state
 from .session import (
     STREAM_FPS,
     SLOW_MOTION_FACTOR,
@@ -31,7 +32,6 @@ from .session import (
     audio_clients,
     sessions,
     sessions_lock,
-    active_session_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -163,6 +163,35 @@ class GeminiLiveAudioEngine:
         msg = str(exc).lower()
         return "api key" in msg or "unauthenticated" in msg or "permission_denied" in msg
 
+    @staticmethod
+    def _truthy_attr(obj: Any, names: List[str]) -> bool:
+        for name in names:
+            value = getattr(obj, name, None)
+            if isinstance(value, bool):
+                if value:
+                    return True
+                continue
+            if value in (1, "1", "true", "True", "TRUE"):
+                return True
+        return False
+
+    @classmethod
+    def _is_turn_complete_response(cls, response: Any) -> bool:
+        """Detect end-of-turn markers across SDK field naming variants."""
+        names = [
+            "turn_complete",
+            "turnComplete",
+            "generation_complete",
+            "generationComplete",
+            "interrupted",
+        ]
+        if cls._truthy_attr(response, names):
+            return True
+        server_content = getattr(response, "server_content", None)
+        if server_content is not None and cls._truthy_attr(server_content, names):
+            return True
+        return False
+
     # Keep the old name as an alias so ConversationRuntime._run_turn still works
     _is_invalid_api_key_error = _is_api_key_error
     _is_model_not_supported_error = _is_model_unsupported_error
@@ -201,6 +230,8 @@ class GeminiLiveAudioEngine:
         client = self._make_genai_client()
         live_config = self._build_live_config(self.system_instruction)
         chunk_size = max(320, int(input_sr * 0.02) * 2)  # ~20 ms chunks
+        idle_timeout_sec = float(os.environ.get("GEMINI_LIVE_RECEIVE_IDLE_TIMEOUT_SEC", "8"))
+        max_turn_sec = float(os.environ.get("GEMINI_LIVE_MAX_TURN_SEC", "45"))
         last_exc: Optional[Exception] = None
 
         for idx, model_name in enumerate(self.model_candidates):
@@ -225,25 +256,56 @@ class GeminiLiveAudioEngine:
                                 data=chunk,
                             )
                         )
-                    await session.send_realtime_input(audio_stream_end=True)
+                    await session.send(end_of_turn=True)
 
-                    async for response in session.receive():
+                    recv_iter = session.receive().__aiter__()
+                    turn_start = asyncio.get_running_loop().time()
+                    while True:
+                        elapsed = asyncio.get_running_loop().time() - turn_start
+                        if elapsed >= max_turn_sec:
+                            logger.warning(
+                                "Gemini Live turn timeout model=%s conversation=%s elapsed=%.2fs",
+                                model_name,
+                                conversation_id,
+                                elapsed,
+                            )
+                            break
+                        timeout = max(0.1, min(idle_timeout_sec, max_turn_sec - elapsed))
+                        try:
+                            response = await asyncio.wait_for(recv_iter.__anext__(), timeout=timeout)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Gemini Live receive idle timeout model=%s conversation=%s timeout=%.2fs",
+                                model_name,
+                                conversation_id,
+                                timeout,
+                            )
+                            break
+
                         server_content = getattr(response, "server_content", None)
-                        if server_content is None:
-                            continue
-                        model_turn = getattr(server_content, "model_turn", None)
-                        if model_turn is None:
-                            continue
-                        for part in getattr(model_turn, "parts", None) or []:
-                            inline_data = getattr(part, "inline_data", None)
-                            if inline_data is None:
-                                continue
-                            mime = getattr(inline_data, "mime_type", "") or ""
-                            if not mime.startswith("audio/pcm"):
-                                continue
-                            data = getattr(inline_data, "data", None)
-                            if isinstance(data, (bytes, bytearray)) and data:
-                                yield bytes(data), self._parse_pcm_rate(mime)
+                        if server_content is not None:
+                            model_turn = getattr(server_content, "model_turn", None)
+                            if model_turn is not None:
+                                for part in getattr(model_turn, "parts", None) or []:
+                                    inline_data = getattr(part, "inline_data", None)
+                                    if inline_data is None:
+                                        continue
+                                    mime = getattr(inline_data, "mime_type", "") or ""
+                                    if not mime.startswith("audio/pcm"):
+                                        continue
+                                    data = getattr(inline_data, "data", None)
+                                    if isinstance(data, (bytes, bytearray)) and data:
+                                        yield bytes(data), self._parse_pcm_rate(mime)
+
+                        if self._is_turn_complete_response(response):
+                            logger.debug(
+                                "Gemini Live turn complete model=%s conversation=%s",
+                                model_name,
+                                conversation_id,
+                            )
+                            break
                 return  # success
 
             except Exception as exc:
@@ -455,7 +517,7 @@ async def broadcast_anim_loop(server_clock_id: str, server_time_fn) -> None:
                     morphs=morphs,
                 )
             )
-            active_sid = active_session_id
+            active_sid = session_state.active_session_id
 
         if session_id != active_sid:
             await asyncio.sleep(1 / STREAM_FPS)

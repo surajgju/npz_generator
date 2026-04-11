@@ -1,8 +1,9 @@
 /**
- * ConversationClient.js — /ws/conversation WebSocket protocol client.
+ * ConversationClient.js — unified conversation + audio_out WebSocket client.
  *
  * Exports a single `ConversationClient` class that manages the lifecycle of
- * the conversation WebSocket: connect, disconnect, send, and message dispatch.
+ * `/ws/conversation` and `/ws/audio_out`: connect, disconnect, send, and
+ * message dispatch.
  *
  * All assistant lifecycle state changes are communicated via callbacks so that
  * ViewerController.js can update its own rendering state without circular deps.
@@ -15,10 +16,14 @@ export class ConversationClient {
    * @param {string} options.buildId — build identifier sent in the hello message
    * @param {object} options.callbacks — event callbacks
    * @param {(connected: boolean) => void} options.callbacks.onConnectionChange
-   * @param {(state: string) => void}      options.callbacks.onLifecycleChange
-   * @param {(sessionId: string) => void}  options.callbacks.onStreamSessionChange
-   * @param {(msg: object) => void}        options.callbacks.onError
-   * @param {(meta: object) => void}       options.callbacks.onHelloAck
+   * @param {(state: string) => void} options.callbacks.onLifecycleChange
+   * @param {(sessionId: string|null) => void} options.callbacks.onStreamSessionChange
+   * @param {(msg: object) => void} options.callbacks.onError
+   * @param {(meta: object) => void} options.callbacks.onHelloAck
+   * @param {(connected: boolean) => void} options.callbacks.onAudioConnectionChange
+   * @param {(header: object) => void} options.callbacks.onAudioHeader
+   * @param {(msg: object) => void} options.callbacks.onAudioControl
+   * @param {(chunk: ArrayBuffer, header: object) => void} options.callbacks.onAudioChunk
    */
   constructor({ wsHost, buildId, callbacks = {} }) {
     this._wsHost = wsHost;
@@ -26,12 +31,22 @@ export class ConversationClient {
     this._cb = callbacks;
 
     this._ws = null;
+    this._audioWs = null;
+    this._pendingAudioHeader = null;
     this.connected = false;
+    this.audioConnected = false;
     this.conversationId = null;
+    this.lifecycleState = "idle";
   }
 
-  /** Open the WebSocket if not already open. No-ops if already connected. */
+  /** Open both sockets if not already open. */
   connect() {
+    this.connectConversation();
+    this.connectAudioOut();
+  }
+
+  /** Open /ws/conversation if not already open. */
+  connectConversation() {
     if (this._ws) return;
     this._ws = new WebSocket(`ws://${this._wsHost}/ws/conversation`);
 
@@ -45,13 +60,13 @@ export class ConversationClient {
       this.connected = false;
       this._ws = null;
       this._cb.onConnectionChange?.(false);
-      this._cb.onLifecycleChange?.("idle");
+      this._setLifecycle("idle");
     };
 
     this._ws.onerror = () => {
       this.connected = false;
       this._cb.onConnectionChange?.(false);
-      this._cb.onLifecycleChange?.("idle");
+      this._setLifecycle("idle");
     };
 
     this._ws.onmessage = (event) => {
@@ -66,16 +81,70 @@ export class ConversationClient {
     };
   }
 
+  /** Open /ws/audio_out if not already open. */
+  connectAudioOut() {
+    if (this._audioWs) return;
+    this._audioWs = new WebSocket(`ws://${this._wsHost}/ws/audio_out`);
+    this._audioWs.binaryType = "arraybuffer";
+
+    this._audioWs.onopen = () => {
+      this.audioConnected = true;
+      this._cb.onAudioConnectionChange?.(true);
+    };
+
+    this._audioWs.onclose = () => {
+      this.audioConnected = false;
+      this._pendingAudioHeader = null;
+      this._audioWs = null;
+      this._cb.onAudioConnectionChange?.(false);
+    };
+
+    this._audioWs.onerror = () => {
+      this.audioConnected = false;
+      this._cb.onAudioConnectionChange?.(false);
+    };
+
+    this._audioWs.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        let msg;
+        try {
+          msg = JSON.parse(event.data);
+        } catch {
+          this._pendingAudioHeader = null;
+          return;
+        }
+        if (!msg || typeof msg !== "object") {
+          this._pendingAudioHeader = null;
+          return;
+        }
+        if (msg.type === "audio") {
+          this._pendingAudioHeader = msg;
+          this._cb.onAudioHeader?.(msg);
+          this._cb.onStreamSessionChange?.(msg.stream_session_id || msg.session_id || null);
+        } else if (msg.type === "audio_control") {
+          this._pendingAudioHeader = null;
+          this._cb.onAudioControl?.(msg);
+        }
+        return;
+      }
+
+      if (!(event.data instanceof ArrayBuffer)) return;
+      const header = this._pendingAudioHeader;
+      this._pendingAudioHeader = null;
+      if (!header || header.type !== "audio") return;
+      this._cb.onAudioChunk?.(event.data, header);
+    };
+  }
+
   /** Wait until the WebSocket is open (polls with 40 ms intervals). */
   async ensureConnected(timeoutMs = 4000) {
     if (this.connected && this._ws && this._ws.readyState === WebSocket.OPEN) return;
-    this.connect();
+    this.connectConversation();
     const start = performance.now();
     while (!(this.connected && this._ws && this._ws.readyState === WebSocket.OPEN)) {
       if (performance.now() - start > timeoutMs) {
         throw new Error("Conversation socket connection timeout");
       }
-      // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => setTimeout(resolve, 40));
     }
   }
@@ -92,10 +161,22 @@ export class ConversationClient {
       this._ws.close();
       this._ws = null;
     }
+    if (this._audioWs) {
+      this._audioWs.close();
+      this._audioWs = null;
+    }
     this.connected = false;
+    this.audioConnected = false;
+    this._pendingAudioHeader = null;
+    this._setLifecycle("idle");
   }
 
   // ── Private message dispatch ─────────────────────────────────────────────
+
+  _setLifecycle(state) {
+    this.lifecycleState = state;
+    this._cb.onLifecycleChange?.(state);
+  }
 
   _dispatch(msg) {
     switch (msg.type) {
@@ -110,34 +191,37 @@ export class ConversationClient {
         break;
 
       case "listening":
-        this._cb.onLifecycleChange?.("listening");
+        this._setLifecycle("listening");
         break;
 
       case "assistant_thinking_start":
-        this._cb.onLifecycleChange?.("thinking");
+        this._setLifecycle("thinking");
         break;
 
       case "assistant_thinking_end":
-        // Only transition back to idle if we haven't moved to speaking yet.
-        this._cb.onLifecycleChange?.("idle_from_thinking");
+        if (this.lifecycleState !== "speaking") {
+          this._setLifecycle("idle");
+        }
         break;
 
       case "assistant_speaking_start":
-        this._cb.onLifecycleChange?.("speaking");
+        this._setLifecycle("speaking");
         this._cb.onStreamSessionChange?.(msg.stream_session_id || msg.session_id || null);
         break;
 
       case "assistant_speaking_end":
-        this._cb.onLifecycleChange?.("idle");
+        this._setLifecycle("idle");
         break;
 
       case "interrupted":
-        this._cb.onLifecycleChange?.("idle");
+      case "interrupt_ack":
+        this._setLifecycle("idle");
+        this._cb.onStreamSessionChange?.(msg.stream_session_id || msg.session_id || null);
         break;
 
       case "error":
         this._cb.onError?.(msg);
-        this._cb.onLifecycleChange?.("idle");
+        this._setLifecycle("idle");
         break;
 
       default:

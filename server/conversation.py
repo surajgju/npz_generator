@@ -32,6 +32,9 @@ CONVERSATION_AUDIO_SR: int = int(
 )
 CONVERSATION_PCM_CHUNK_MS: int = int(os.environ.get("CONVERSATION_PCM_CHUNK_MS", "20"))
 CONVERSATION_PTT_MAX_SEC: float = float(os.environ.get("CONVERSATION_PTT_MAX_SEC", "20"))
+CONVERSATION_PTT_GUARD_SEC: float = float(
+    os.environ.get("CONVERSATION_PTT_GUARD_SEC", str(CONVERSATION_PTT_MAX_SEC + 1.0))
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +67,7 @@ class ConversationRuntime:
         self._user_audio_chunks: List[bytes] = []
         self._user_audio_sr: int = CONVERSATION_AUDIO_SR
         self._reply_task: Optional[asyncio.Task] = None
+        self._ptt_guard_task: Optional[asyncio.Task] = None
         self.current_stream_session_id: Optional[str] = None
         self.current_reply_id: Optional[str] = None
         self.current_generation_epoch: int = 0
@@ -84,12 +88,33 @@ class ConversationRuntime:
             }
         )
 
+    def _cancel_ptt_guard(self) -> None:
+        if self._ptt_guard_task and not self._ptt_guard_task.done():
+            self._ptt_guard_task.cancel()
+        self._ptt_guard_task = None
+
+    async def _ptt_guard(self) -> None:
+        try:
+            await asyncio.sleep(max(0.25, CONVERSATION_PTT_GUARD_SEC))
+            if not self._listening:
+                return
+            logger.warning(
+                "PTT guard timeout conversation=%s after %.2fs; forcing ptt_end",
+                self.conversation_id,
+                CONVERSATION_PTT_GUARD_SEC,
+            )
+            await self.handle_ptt_end()
+        except asyncio.CancelledError:
+            return
+
     async def handle_ptt_start(self) -> None:
         if self._reply_task and not self._reply_task.done():
             await self.interrupt(reason="user_started_speaking")
+        self._cancel_ptt_guard()
         self._listening = True
         self._user_audio_chunks = []
         self._user_audio_sr = CONVERSATION_AUDIO_SR
+        self._ptt_guard_task = asyncio.create_task(self._ptt_guard())
         await self._send({"type": "listening"})
 
     async def handle_user_audio(self, payload: Dict[str, Any]) -> None:
@@ -110,6 +135,7 @@ class ConversationRuntime:
             self._user_audio_chunks = [joined[-max_bytes:]]
 
     async def handle_ptt_end(self) -> None:
+        self._cancel_ptt_guard()
         if not self._listening:
             return
         self._listening = False
@@ -132,6 +158,9 @@ class ConversationRuntime:
         )
 
     async def interrupt(self, reason: str = "interrupt") -> None:
+        self._cancel_ptt_guard()
+        self._listening = False
+        self._user_audio_chunks = []
         if self._reply_task and not self._reply_task.done():
             self._reply_task.cancel()
             try:
@@ -147,8 +176,10 @@ class ConversationRuntime:
                     st.producer_connected = False
         await self._send(
             {
-                "type": "interrupt_ack",
+                "type": "interrupted",
                 "stream_session_id": self.current_stream_session_id,
+                "session_id": self.current_stream_session_id,
+                "reply_id": self.current_reply_id,
                 "reason": reason,
             }
         )
@@ -161,6 +192,7 @@ class ConversationRuntime:
         generation_epoch = 0
         emitted_thinking_end = False
         emitted_speaking_start = False
+        emitted_speaking_end = False
         output_sample_accum = np.zeros((0,), dtype=np.int16)
         out_chunk_samples = max(
             1, int((CONVERSATION_AUDIO_SR * CONVERSATION_PCM_CHUNK_MS) / 1000)
@@ -276,14 +308,17 @@ class ConversationRuntime:
 
             if not emitted_thinking_end:
                 await self._send({"type": "assistant_thinking_end"})
+                emitted_thinking_end = True
             if emitted_speaking_start and stream_session_id is not None:
                 await self._send(
                     {
                         "type": "assistant_speaking_end",
                         "reply_id": reply_id,
                         "stream_session_id": stream_session_id,
+                        "session_id": stream_session_id,
                     }
                 )
+                emitted_speaking_end = True
 
         except asyncio.CancelledError:
             raise
@@ -305,17 +340,47 @@ class ConversationRuntime:
                 {"type": "error", "message": self.adk.user_message_for_exception(exc)}
             )
             try:
-                await self._send({"type": "assistant_thinking_end"})
+                if not emitted_thinking_end:
+                    await self._send({"type": "assistant_thinking_end"})
+                    emitted_thinking_end = True
             except Exception:
                 pass
         finally:
+            try:
+                if not emitted_thinking_end:
+                    await self._send({"type": "assistant_thinking_end"})
+                    emitted_thinking_end = True
+                if (
+                    emitted_speaking_start
+                    and not emitted_speaking_end
+                    and stream_session_id is not None
+                ):
+                    await self._send(
+                        {
+                            "type": "assistant_speaking_end",
+                            "reply_id": reply_id,
+                            "stream_session_id": stream_session_id,
+                            "session_id": stream_session_id,
+                        }
+                    )
+                    emitted_speaking_end = True
+            except Exception:
+                pass
             if stream_session_id:
                 async with sessions_lock:
                     st = sessions.get(stream_session_id)
                     if st:
                         st.producer_connected = False
                         st.last_activity_ms = self._server_time_fn()
+            if self.current_reply_id == reply_id:
+                self.current_reply_id = None
 
     async def close(self) -> None:
+        self._cancel_ptt_guard()
         if self._reply_task and not self._reply_task.done():
             self._reply_task.cancel()
+            try:
+                await self._reply_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._reply_task = None

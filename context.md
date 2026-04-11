@@ -25,8 +25,10 @@ Raw model outputs are normalized and mapped in `server/retargeter.py` using para
 
 ## 3. Frontend Architecture & Synchronization
 The WebGL frontend (Three.js) is designed for low-latency visual stability and reconnect recovery.
-- **Multi-Threaded Pipeline**:
-  - **Main Thread (`ViewerController.js`)**: Handles rendering, audio scheduling, HUD metrics, stall states, and session checks.
+- **Modular Multi-Threaded Pipeline**:
+  - **Main Thread UI (`ViewerController.js`)**: Orchestrates rendering, audio playback, HUD metrics, and DOM interactions.
+  - **WebSocket / Protocol (`ConversationClient.js`)**: Encapsulates all backend communication for `/ws/conversation` over a unified socket.
+  - **Audio Capturing (`AudioCapture.js`)**: Manages microphone `AudioWorkletNode` isolation and Push-to-Talk payloads asynchronously.
   - **Animation Worker (`frontend/src/viewer/anim_worker.js`)**: Handles protocol v2 handshake, frame buffering, interpolation, snapshot ingest, and resync signaling.
 - **Worker Playback States**:
   - `snapshot_loading`: Ingest snapshot frames only.
@@ -40,8 +42,9 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
   - `audioBuf`: Audio startup/holding threshold.
   - **Monotonic Time Alignment**: Worker smooths `server_time_ms - performance.now()` with EMA to estimate server now and target live frame.
 - **Voice Conversation Path**:
-  - Browser Push-to-Talk captures PCM16 audio and sends it to `/ws/conversation`.
+  - Browser Push-to-Talk captures PCM16 audio via `AudioCapture.js` and sends it to `/ws/conversation` via `ConversationClient.js`.
   - Server flow: `conversation.py` (Runtime) -> `audio_pipeline.py` (`GeminiLiveAudioEngine`) -> `google-genai` Live API.
+  - **Explicit Handover**: To prevent the Gemini VAD (Voice Activity Detection) from stalling the pipeline on quiet/short inputs, the backend explicitly sends an `end_of_turn=True` flag when the user releases Push-to-Talk.
   - Assistant response chunks are routed to `ingest_audio_chunk` in `audio_pipeline.py`, fanning out to `/ws/audio_out` and the ML inference queue.
   - Frontend flushes audio scheduler on `stream_session_id` change to prevent cross-reply drift.
 
@@ -97,7 +100,7 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
 
 ## 6. Modular Server Architecture & Session Lifecycle
 The backend is split into specialized modules for scalability and maintainability:
-- **`app.py`**: Thin coordinator. Owns FastAPI routes, startup lifecycle, and static mounting.
+- **`app.py`**: Thin coordinator. Owns FastAPI WebSockets and API routing (Static asset mounting has been removed in favor of React/Vite development server on port 5173).
 - **`session.py`**: Owns `SessionState` dataclasses, the shared session registry, and the GC loop.
 - **`audio_pipeline.py`**: The "Core Engine". Owns `inference_worker`, `GeminiLiveAudioEngine`, and the animation broadcast loop.
 - **`conversation.py`**: Owns `ConversationRuntime`, managing the PTT state machine and assistant interaction logic.

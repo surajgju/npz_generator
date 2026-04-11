@@ -474,4 +474,4 @@ async def ws_anim(websocket: WebSocket):
 
 
 # Mount static site last so WebSocket routes take precedence.
-app.mount("/", StaticFiles(directory="web", html=True), name="web")
+# app.mount("/", StaticFiles(directory="web", html=True), name="web")

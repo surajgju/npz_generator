@@ -34,16 +34,16 @@ Install the core Python dependencies (requires PyTorch and SMPL-X):
 python3 -m pip install -r requirements.txt
 ```
 
-### 2. Frontend Build (Optional for Live Streaming)
-The live viewer resides in the `/frontend` directory and needs a production build:
+### 2. Frontend Setup
+The live viewer resides in the `/frontend` directory. We recommend running it using the Vite development server:
 ```bash
 # Export SMPL-X faces (requires smplx weights in 'models/')
 python3 scripts/export_faces.py
 
-# Build frontend
-cd frontend && npm install && npm run build && cd ..
+# Start frontend
+cd frontend && npm install && npm run dev
 ```
-*Note: Exporting faces ensures that the Three.js viewer can render the avatar mesh correctly. The build command creates the `web/` directory that the FastAPI server uses for static hosting.*
+*Note: Exporting faces ensures that the Three.js viewer can render the avatar mesh correctly. The React frontend will run on port 5173 while communicating with the FastAPI backend on port 8000.*
 
 ### 3. Generate Motion (Offline)
 Generate high-fidelity motion from your audio files in the `./input` folder:
@@ -73,7 +73,7 @@ For browser Push-to-Talk conversation, set:
 export GEMINI_API_KEY=""
 
 ### 2. Open the Live Viewer
-The Three.js viewer will be live at: `http://localhost:8000/`.
+The Three.js viewer will be live at: `http://localhost:5173/`. Ensure the FastAPI server is running concurrently.
 
 ### 3. Stream Audio (Example Simulator)
 Use our utility script to simulate a live audio stream from a file:
@@ -208,10 +208,11 @@ Fine-tune your animation quality via CLI or config files:
 ## 🧪 Testing Checklist
 1. [ ] Run `python3 generate_npz.py` and verify `output/intro_output.npz`.
 2. [ ] Run `python3 render.py` and check `output.mp4`.
-3. [ ] Run `npm build` (or similar) in the frontend directory.
-4. [ ] Start the uvicorn server: `python3 -m uvicorn server.app:app --reload`.
-5. [ ] Open the live viewer at `localhost:8000`.
-6. [ ] Connect Microphone and verify Gemini 3.1 Live PTT conversation starts high-fidelity motion.
+3. [ ] Export faces: `python3 scripts/export_faces.py`.
+4. [ ] Start the backend server: `STREAM_FPS=20 python3 -m uvicorn server.app:app --reload --port 8000`.
+5. [ ] Start the frontend: `cd frontend && npm run dev`.
+6. [ ] Open the live viewer at `http://localhost:5173`.
+7. [ ] Connect Microphone and verify Gemini 3.1 Live PTT conversation starts high-fidelity motion.
 
 ---
 

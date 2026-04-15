@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -709,9 +710,66 @@ def _resample_frames_linear(data: np.ndarray, target_count: int) -> np.ndarray:
     return out.reshape((target_count,) + arr.shape[1:])
 
 
+def _reset_generator_stream_state(generator) -> None:
+    """Reset rolling state carried across chunks in LiveMotionGenerator."""
+    for attr in (
+        "_prev_overlap",
+        "_prev_last_pose",
+        "_prev_last_expr",
+        "_prev_last_trans",
+    ):
+        if hasattr(generator, attr):
+            setattr(generator, attr, None)
+
+
+def _min_samples_for_generator_call(generator) -> int:
+    """Compute a safe minimum audio sample count for one model inference call."""
+    try:
+        sr = int(getattr(generator, "sr", 16000)) or 16000
+        pose_fps = int(getattr(generator, "pose_fps", 30)) or 30
+        cfg = getattr(getattr(generator, "model", None), "cfg", None)
+        pre_frames = int(getattr(cfg, "seed_frames", 4)) if cfg is not None else 4
+        # modeling_emage_audio.inference needs total_len > 2*seed_frames to avoid empty cats.
+        min_frames = max(1, (2 * pre_frames) + 1)
+        min_samples = int(np.ceil((min_frames * sr) / float(pose_fps)))
+        return max(1, min_samples)
+    except Exception:
+        return 4800
+
+
+def _coalesce_chunk_ids(chunk_ids: List[Optional[str]]) -> Optional[str]:
+    values = [str(cid) for cid in chunk_ids if cid is not None]
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return f"{values[0]}-{values[-1]}"
+
+
 async def inference_worker(generator, retargeter) -> None:
     """Dequeue audio chunks, run inference, push retargeted frames to anim_queue."""
     global epoch_drop_count
+
+    min_required_samples = _min_samples_for_generator_call(generator)
+    try:
+        configured_batch_samples = int(
+            os.environ.get("INFERENCE_BATCH_SAMPLES", str(min_required_samples))
+        )
+    except ValueError:
+        configured_batch_samples = min_required_samples
+    batch_samples = max(min_required_samples, configured_batch_samples)
+    logger.info(
+        "Inference batching enabled min_required_samples=%d batch_samples=%d",
+        min_required_samples,
+        batch_samples,
+    )
+
+    # Per-session micro-batch buffers so tiny realtime chunks do not crash the model.
+    pending_chunks: Dict[str, deque] = defaultdict(deque)
+    pending_samples: Dict[str, int] = defaultdict(int)
+    pending_epoch: Dict[str, int] = {}
+    seen_first_batch: Dict[str, bool] = defaultdict(lambda: False)
+
     while True:
         item = await audio_in_queue.get()
         audio_np, sr, chunk_id, session_id, generation_epoch, source, conversation_id, reply_id = item
@@ -728,85 +786,141 @@ async def inference_worker(generator, retargeter) -> None:
                 )
                 continue
 
-        try:
-            async with inference_lock:
-                coeffs = await asyncio.to_thread(
-                    lambda: generator.process_audio_chunk(audio_np, sr, chunk_id)
+        # Reset per-session buffers when generation changes (interrupt/new reply).
+        prev_epoch = pending_epoch.get(session_id)
+        if prev_epoch is not None and prev_epoch != generation_epoch:
+            pending_chunks.pop(session_id, None)
+            pending_samples.pop(session_id, None)
+            seen_first_batch[session_id] = False
+        pending_epoch[session_id] = generation_epoch
+
+        audio_arr = np.asarray(audio_np, dtype=np.float32)
+        if audio_arr.size == 0:
+            continue
+        pending_chunks[session_id].append((chunk_id, audio_arr))
+        pending_samples[session_id] += int(audio_arr.shape[0])
+
+        # Consume buffered audio in fixed-size batches.
+        while pending_samples[session_id] >= batch_samples:
+            remaining = batch_samples
+            consumed_ids: List[Optional[str]] = []
+            parts: List[np.ndarray] = []
+
+            while remaining > 0 and pending_chunks[session_id]:
+                cid, arr = pending_chunks[session_id][0]
+                take = min(remaining, int(arr.shape[0]))
+                if take <= 0:
+                    pending_chunks[session_id].popleft()
+                    continue
+                parts.append(arr[:take])
+                consumed_ids.append(cid)
+                pending_samples[session_id] -= take
+                remaining -= take
+                if take == int(arr.shape[0]):
+                    pending_chunks[session_id].popleft()
+                else:
+                    pending_chunks[session_id][0] = (cid, arr[take:])
+
+            if not parts:
+                break
+
+            batch_audio = (
+                parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+            )
+            batch_chunk_id = _coalesce_chunk_ids(consumed_ids)
+
+            try:
+                async with inference_lock:
+                    if not seen_first_batch[session_id]:
+                        _reset_generator_stream_state(generator)
+                        seen_first_batch[session_id] = True
+                    coeffs = await asyncio.to_thread(
+                        lambda: generator.process_audio_chunk(batch_audio, sr, batch_chunk_id)
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "Inference failed for chunk %s (batched_samples=%d): %s",
+                    batch_chunk_id,
+                    int(batch_audio.shape[0]),
+                    exc,
                 )
-        except Exception as exc:
-            logger.exception("Inference failed for chunk %s: %s", chunk_id, exc)
-            continue
+                continue
 
-        if not coeffs:
-            logger.warning(
-                "No coeffs generated for chunk %s (audio_len=%d)",
-                chunk_id, audio_np.shape[0],
-            )
-            continue
+            if not coeffs:
+                logger.warning(
+                    "No coeffs generated for chunk %s (audio_len=%d)",
+                    batch_chunk_id, batch_audio.shape[0],
+                )
+                continue
 
-        if chunk_id is not None and str(chunk_id) == "0":
-            retargeter.reset_root_offset()
+            if not seen_first_batch[session_id]:
+                # Defensive: first batch marker should already be true.
+                seen_first_batch[session_id] = True
 
-        poses = coeffs["poses"]
-        expressions = coeffs["expressions"]
-        trans = coeffs["trans"]
-        frames_count = int(poses.shape[0])
+            # First emitted chunk for a stream: reset root offset.
+            if batch_chunk_id is not None and str(batch_chunk_id).startswith("0"):
+                retargeter.reset_root_offset()
 
-        if (STREAM_FPS != BASE_FPS or SLOW_MOTION_FACTOR != 1.0) and frames_count > 1:
-            target_count = max(
-                1,
-                int(round(frames_count * (STREAM_FPS / BASE_FPS) * SLOW_MOTION_FACTOR)),
-            )
-            poses = _resample_frames_linear(poses, target_count)
-            expressions = _resample_frames_linear(expressions, target_count)
-            trans = _resample_frames_linear(trans, target_count)
+            poses = coeffs["poses"]
+            expressions = coeffs["expressions"]
+            trans = coeffs["trans"]
             frames_count = int(poses.shape[0])
 
-        root_pos, bone_quats, morphs = retargeter.retarget(poses, expressions, trans)
+            if (STREAM_FPS != BASE_FPS or SLOW_MOTION_FACTOR != 1.0) and frames_count > 1:
+                target_count = max(
+                    1,
+                    int(round(frames_count * (STREAM_FPS / BASE_FPS) * SLOW_MOTION_FACTOR)),
+                )
+                poses = _resample_frames_linear(poses, target_count)
+                expressions = _resample_frames_linear(expressions, target_count)
+                trans = _resample_frames_linear(trans, target_count)
+                frames_count = int(poses.shape[0])
 
-        if frames_count > 0:
-            _log_inference_stats(
-                retargeter, chunk_id, session_id, frames_count,
-                poses, expressions, morphs, root_pos,
-            )
+            root_pos, bone_quats, morphs = retargeter.retarget(poses, expressions, trans)
 
-        dropped = 0
-        async with sessions_lock:
-            st = sessions.get(session_id)
-            if st is None:
-                continue
-            if generation_epoch != st.generation_epoch:
-                epoch_drop_count += 1
-                continue
-            start_frame_idx = st.next_frame_index
-            st.next_frame_index += frames_count
+            if frames_count > 0:
+                _log_inference_stats(
+                    retargeter, batch_chunk_id, session_id, frames_count,
+                    poses, expressions, morphs, root_pos,
+                )
 
-        for i in range(frames_count):
-            frame_index = start_frame_idx + i
-            try:
-                anim_queue.put_nowait((
-                    session_id, generation_epoch, frame_index,
-                    root_pos[i], bone_quats[i], morphs[i],
-                ))
-            except asyncio.QueueFull:
+            dropped = 0
+            async with sessions_lock:
+                st = sessions.get(session_id)
+                if st is None:
+                    continue
+                if generation_epoch != st.generation_epoch:
+                    epoch_drop_count += 1
+                    continue
+                start_frame_idx = st.next_frame_index
+                st.next_frame_index += frames_count
+
+            for i in range(frames_count):
+                frame_index = start_frame_idx + i
                 try:
-                    anim_queue.get_nowait()
-                    dropped += 1
                     anim_queue.put_nowait((
                         session_id, generation_epoch, frame_index,
                         root_pos[i], bone_quats[i], morphs[i],
                     ))
-                except Exception:
-                    break
+                except asyncio.QueueFull:
+                    try:
+                        anim_queue.get_nowait()
+                        dropped += 1
+                        anim_queue.put_nowait((
+                            session_id, generation_epoch, frame_index,
+                            root_pos[i], bone_quats[i], morphs[i],
+                        ))
+                    except Exception:
+                        break
 
-        if dropped > 0:
-            logger.warning(
-                "Dropped %d anim frames due to full queue (session=%s)", dropped, session_id
+            if dropped > 0:
+                logger.warning(
+                    "Dropped %d anim frames due to full queue (session=%s)", dropped, session_id
+                )
+            logger.info(
+                "Enqueued %d anim frames (session=%s queue=%d fps=%d chunk=%s)",
+                frames_count, session_id, anim_queue.qsize(), STREAM_FPS, batch_chunk_id,
             )
-        logger.info(
-            "Enqueued %d anim frames (session=%s queue=%d fps=%d)",
-            frames_count, session_id, anim_queue.qsize(), STREAM_FPS,
-        )
 
 
 def _log_inference_stats(

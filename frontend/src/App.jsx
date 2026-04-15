@@ -8,31 +8,31 @@ function App() {
     () => [
       {
         label: "Install Dependencies",
-        cmd: "python3 -m pip install -r requirements.txt",
+        cmd: "./venv/bin/python -m pip install -r requirements.txt",
       },
       {
         label: "Generate Motion (Offline)",
-        cmd: "python3 generate_npz.py",
+        cmd: "./venv/bin/python generate_npz.py",
       },
       {
         label: "Streamlit Viewer",
-        cmd: "python3 -m streamlit run visualize_web.py",
+        cmd: "./venv/bin/python -m streamlit run visualize_web.py",
       },
       {
         label: "Render MP4",
-        cmd: "python3 render.py",
+        cmd: "./venv/bin/python render.py",
       },
       {
         label: "Start WebSocket Server",
-        cmd: "STREAM_FPS=15 python3 -m uvicorn server.app:app --reload --port 8000",
+        cmd: "STREAM_FPS=15 ./venv/bin/python -m uvicorn server.app:app --reload --port 8000",
       },
       {
         label: "Stream Audio (Simulator)",
-        cmd: "python3 scripts/stream_audio_to_ws.py --audio input/viseme.mp3 --chunk 0.5",
+        cmd: "./venv/bin/python scripts/stream_audio_to_ws.py --audio input/viseme.mp3 --chunk 0.5",
       },
       {
         label: "Export Faces (One-Time)",
-        cmd: "python3 scripts/export_faces.py",
+        cmd: "./venv/bin/python scripts/export_faces.py",
       },
     ],
     []

@@ -10,6 +10,7 @@ Owns:
 Shared state queues live here and are imported by app.py for startup.
 """
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -105,10 +106,11 @@ class GeminiLiveAudioEngine:
     @staticmethod
     def _make_genai_client():
         try:
-            from google import genai  # type: ignore
-        except ModuleNotFoundError as exc:
+            genai = importlib.import_module("google.genai")  # type: ignore
+        except (ModuleNotFoundError, ImportError) as exc:
             raise RuntimeError(
-                "Missing google-genai. Install with: pip install google-genai"
+                "Missing google-genai in the active Python environment. "
+                "Install with: pip install google-genai"
             ) from exc
         api_key = (
             os.environ.get("GEMINI_API_KEY")
@@ -122,18 +124,22 @@ class GeminiLiveAudioEngine:
         return genai.Client(api_key=api_key)
 
     @staticmethod
-    def _build_live_config(system_instruction: str):
+    def _build_live_config(system_instruction: str, *, enable_speech: bool = True):
         types = _genai_types
         if types is None:
             raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
 
         # Build speech / voice config only when the types are available.
-        voice_name = os.environ.get("GEMINI_LIVE_VOICE", "Zephyr")
+        voice_name = os.environ.get("GEMINI_LIVE_VOICE", "Aoede")
         try:
-            speech_cfg = types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+            speech_cfg = (
+                types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+                    )
                 )
+                if enable_speech
+                else None
             )
         except Exception:
             speech_cfg = None
@@ -177,6 +183,15 @@ class GeminiLiveAudioEngine:
     def _is_api_key_error(exc: Exception) -> bool:
         msg = str(exc).lower()
         return "api key" in msg or "unauthenticated" in msg or "permission_denied" in msg
+
+    @staticmethod
+    def _is_invalid_request_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "invalid argument" in msg
+            or "invalid frame payload data" in msg
+            or "1007" in msg
+        )
 
     @staticmethod
     def _truthy_attr(obj: Any, names: List[str]) -> bool:
@@ -230,6 +245,16 @@ class GeminiLiveAudioEngine:
                 "Configured Gemini Live model is not available. "
                 "Set GOOGLE_ADK_MODEL to a supported live audio model."
             )
+        if "cannot import name 'genai' from 'google'" in lower or "no module named 'google.genai'" in lower:
+            return (
+                "google-genai is not installed in the Python interpreter running the server. "
+                "Activate your project venv and start uvicorn with that interpreter."
+            )
+        if "missing google-genai in the active python environment" in lower:
+            return (
+                "google-genai is not installed in the Python interpreter running the server. "
+                "Activate your project venv and start uvicorn with that interpreter."
+            )
         return msg
 
     # ------------------------------------------------------------------ streaming
@@ -245,11 +270,21 @@ class GeminiLiveAudioEngine:
 
         Uses send_realtime_input (matches the useLiveAPI reference pattern) which is
         the correct API for real-time audio streaming as of google-genai >=0.8.
-        Falls back to the legacy session.send() path when send_realtime_input is
-        unavailable on the session object.
+        Falls back to send_client_content for older/limited session objects.
         """
         client = self._make_genai_client()
-        live_config = self._build_live_config(self.system_instruction)
+        live_config_with_speech = self._build_live_config(
+            self.system_instruction, enable_speech=True
+        )
+        live_config_without_speech = self._build_live_config(
+            self.system_instruction, enable_speech=False
+        )
+        live_config_variants = [("speech:on", live_config_with_speech)]
+        if (
+            live_config_with_speech.model_dump(mode="json", exclude_none=True)
+            != live_config_without_speech.model_dump(mode="json", exclude_none=True)
+        ):
+            live_config_variants.append(("speech:off", live_config_without_speech))
         # ~20 ms chunks at the input sample rate (2 bytes per int16 sample)
         chunk_size = max(320, int(input_sr * 0.02) * 2)
         mime_type = f"audio/pcm;rate={input_sr}"
@@ -259,130 +294,160 @@ class GeminiLiveAudioEngine:
 
         for idx, model_name in enumerate(self.model_candidates):
             self.model = model_name
-            try:
-                async with client.aio.live.connect(
-                    model=model_name, config=live_config
-                ) as session:
-                    logger.info(
-                        "Gemini Live connected model=%s conversation=%s",
-                        model_name,
-                        conversation_id,
-                    )
+            has_next_model = idx + 1 < len(self.model_candidates)
 
-                    # ── Send audio ───────────────────────────────────────────
-                    # Prefer send_realtime_input (matches useLiveAPI reference):
-                    #   session.send_realtime_input(audio={"data": b64, "mime_type": mime})
-                    # Fall back to session.send() for older SDK versions.
-                    use_realtime_input = callable(getattr(session, "send_realtime_input", None))
-
-                    if use_realtime_input:
-                        import base64 as _base64
-                        for offset in range(0, len(input_pcm_bytes), chunk_size):
-                            chunk = input_pcm_bytes[offset: offset + chunk_size]
-                            if not chunk:
-                                continue
-                            b64_chunk = _base64.b64encode(chunk).decode("ascii")
-                            await session.send_realtime_input(
-                                audio={"data": b64_chunk, "mime_type": mime_type}
-                            )
-                        # Signal end-of-turn with empty bytes + end_of_turn=True.
-                        # Passing a dict to session.send() raises ValueError in
-                        # all current google-genai SDK versions.
-                        await session.send(input=b"", end_of_turn=True)
-                        logger.debug(
-                            "Gemini Live audio sent via send_realtime_input model=%s bytes=%d",
-                            model_name, len(input_pcm_bytes),
-                        )
-                    else:
-                        # Legacy path: send raw PCM bytes
-                        for offset in range(0, len(input_pcm_bytes), chunk_size):
-                            chunk = input_pcm_bytes[offset: offset + chunk_size]
-                            if not chunk:
-                                continue
-                            await session.send(input=chunk, end_of_turn=False)
-                        await session.send(input=b"", end_of_turn=True)
-                        logger.debug(
-                            "Gemini Live audio sent via legacy session.send model=%s bytes=%d",
-                            model_name, len(input_pcm_bytes),
+            for cfg_idx, (cfg_name, live_config) in enumerate(live_config_variants):
+                has_next_cfg = cfg_idx + 1 < len(live_config_variants)
+                try:
+                    async with client.aio.live.connect(
+                        model=model_name, config=live_config
+                    ) as session:
+                        logger.info(
+                            "Gemini Live connected model=%s config=%s conversation=%s",
+                            model_name,
+                            cfg_name,
+                            conversation_id,
                         )
 
-                    # ── Receive loop ─────────────────────────────────────────
-                    recv_iter = session.receive().__aiter__()
-                    turn_start = asyncio.get_running_loop().time()
-                    interrupted = False
-
-                    while True:
-                        elapsed = asyncio.get_running_loop().time() - turn_start
-                        if elapsed >= max_turn_sec:
-                            logger.warning(
-                                "Gemini Live turn timeout model=%s conversation=%s elapsed=%.2fs",
-                                model_name,
-                                conversation_id,
-                                elapsed,
-                            )
-                            break
-                        timeout = max(0.1, min(idle_timeout_sec, max_turn_sec - elapsed))
-                        try:
-                            response = await asyncio.wait_for(recv_iter.__anext__(), timeout=timeout)
-                        except StopAsyncIteration:
-                            break
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "Gemini Live receive idle timeout model=%s conversation=%s timeout=%.2fs",
-                                model_name,
-                                conversation_id,
-                                timeout,
-                            )
-                            break
-
-                        # ── Handle interrupted flag (mirrors useLiveAPI reference) ──
-                        server_content = getattr(response, "server_content", None)
-                        if server_content is not None:
-                            if getattr(server_content, "interrupted", False):
-                                logger.info(
-                                    "Gemini Live interrupted model=%s conversation=%s",
-                                    model_name, conversation_id,
+                        # Realtime input is the supported path for streamed microphone PCM.
+                        # Send buffered user audio in ~20 ms chunks and explicitly close the
+                        # audio stream to trigger deterministic generation after PTT ends.
+                        sent_chunks = 0
+                        if callable(getattr(session, "send_realtime_input", None)):
+                            for start in range(0, len(input_pcm_bytes), chunk_size):
+                                chunk = input_pcm_bytes[start : start + chunk_size]
+                                if not chunk:
+                                    continue
+                                await session.send_realtime_input(
+                                    audio=_genai_types.Blob(data=chunk, mime_type=mime_type)
                                 )
-                                interrupted = True
+                                sent_chunks += 1
+                            await session.send_realtime_input(audio_stream_end=True)
+                        else:
+                            # Backward-compat fallback for older SDK sessions.
+                            await session.send_client_content(
+                                turns=[
+                                    _genai_types.Content(
+                                        role="user",
+                                        parts=[
+                                            _genai_types.Part.from_bytes(
+                                                data=input_pcm_bytes,
+                                                mime_type=mime_type,
+                                            )
+                                        ],
+                                    )
+                                ],
+                                turn_complete=True,
+                            )
+                            sent_chunks = max(
+                                1, (len(input_pcm_bytes) + chunk_size - 1) // max(1, chunk_size)
+                            )
+
+                        logger.debug(
+                            "Gemini Live audio sent model=%s config=%s bytes=%d sr=%d chunks=%d",
+                            model_name,
+                            cfg_name,
+                            len(input_pcm_bytes),
+                            input_sr,
+                            sent_chunks,
+                        )
+
+                        # ── Receive loop ─────────────────────────────────────────
+                        recv_iter = session.receive().__aiter__()
+                        turn_start = asyncio.get_running_loop().time()
+                        interrupted = False
+
+                        while True:
+                            elapsed = asyncio.get_running_loop().time() - turn_start
+                            if elapsed >= max_turn_sec:
+                                logger.warning(
+                                    "Gemini Live turn timeout model=%s conversation=%s elapsed=%.2fs",
+                                    model_name,
+                                    conversation_id,
+                                    elapsed,
+                                )
+                                break
+                            timeout = max(0.1, min(idle_timeout_sec, max_turn_sec - elapsed))
+                            try:
+                                response = await asyncio.wait_for(recv_iter.__anext__(), timeout=timeout)
+                            except StopAsyncIteration:
+                                break
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "Gemini Live receive idle timeout model=%s conversation=%s timeout=%.2fs",
+                                    model_name,
+                                    conversation_id,
+                                    timeout,
+                                )
                                 break
 
-                            model_turn = getattr(server_content, "model_turn", None)
-                            if model_turn is not None:
-                                for part in getattr(model_turn, "parts", None) or []:
-                                    inline_data = getattr(part, "inline_data", None)
-                                    if inline_data is None:
-                                        continue
-                                    mime = getattr(inline_data, "mime_type", "") or ""
-                                    if not mime.startswith("audio/pcm"):
-                                        continue
-                                    data = getattr(inline_data, "data", None)
-                                    if isinstance(data, (bytes, bytearray)) and data:
-                                        yield bytes(data), self._parse_pcm_rate(mime)
+                            # ── Handle interrupted flag (mirrors useLiveAPI reference) ──
+                            server_content = getattr(response, "server_content", None)
+                            if server_content is not None:
+                                if getattr(server_content, "interrupted", False):
+                                    logger.info(
+                                        "Gemini Live interrupted model=%s conversation=%s",
+                                        model_name, conversation_id,
+                                    )
+                                    interrupted = True
+                                    break
 
-                        if self._is_turn_complete_response(response):
-                            logger.debug(
-                                "Gemini Live turn complete model=%s conversation=%s",
-                                model_name,
-                                conversation_id,
-                            )
+                                model_turn = getattr(server_content, "model_turn", None)
+                                if model_turn is not None:
+                                    for part in getattr(model_turn, "parts", None) or []:
+                                        inline_data = getattr(part, "inline_data", None)
+                                        if inline_data is None:
+                                            continue
+                                        mime = getattr(inline_data, "mime_type", "") or ""
+                                        if not mime.startswith("audio/pcm"):
+                                            continue
+                                        data = getattr(inline_data, "data", None)
+                                        if isinstance(data, (bytes, bytearray)) and data:
+                                            yield bytes(data), self._parse_pcm_rate(mime)
+
+                            if self._is_turn_complete_response(response):
+                                logger.debug(
+                                    "Gemini Live turn complete model=%s conversation=%s",
+                                    model_name,
+                                    conversation_id,
+                                )
+                                break
+
+                        if interrupted:
                             break
+                    return  # success
 
-                    if interrupted:
+                except Exception as exc:
+                    last_exc = exc
+
+                    if has_next_cfg and self._is_invalid_request_error(exc):
+                        logger.warning(
+                            "Gemini Live invalid request model=%s config=%s (%s); retrying with %s",
+                            model_name,
+                            cfg_name,
+                            str(exc).splitlines()[0],
+                            live_config_variants[cfg_idx + 1][0],
+                        )
+                        continue
+
+                    if has_next_model and self._is_model_unsupported_error(exc):
+                        logger.warning(
+                            "Gemini Live model %s failed (%s); retrying with %s",
+                            model_name,
+                            str(exc).splitlines()[0],
+                            self.model_candidates[idx + 1],
+                        )
                         break
-                return  # success
 
-            except Exception as exc:
-                last_exc = exc
-                has_next = idx + 1 < len(self.model_candidates)
-                if has_next and self._is_model_unsupported_error(exc):
-                    logger.warning(
-                        "Gemini Live model %s failed (%s); retrying with %s",
-                        model_name,
-                        str(exc).splitlines()[0],
-                        self.model_candidates[idx + 1],
-                    )
-                    continue
-                raise
+                    if has_next_model and self._is_invalid_request_error(exc):
+                        logger.warning(
+                            "Gemini Live model %s invalid request (%s); retrying with %s",
+                            model_name,
+                            str(exc).splitlines()[0],
+                            self.model_candidates[idx + 1],
+                        )
+                        break
+                    raise
 
         if last_exc is not None:
             raise last_exc

@@ -54,14 +54,17 @@ let neutralFrame = null;
 
 let serverOffsetMs = 0;
 let hasServerOffset = false;
+let lastDriftWarnMs = 0;
 
 let playbackState = "live_playing"; // snapshot_loading | tail_lock_align | live_playing | resyncing
 let targetLiveFrame = null;
 let tailLockStartMs = 0;
 let seenLiveAtOrBeyondTarget = false;
 let lastResyncRequestMs = 0;
-const MAX_TAIL_LOCK_MS = 1200;
-const MAX_DRIFT_MS = 100;
+const MAX_TAIL_LOCK_MS = 3000;
+const FAST_TRACK_DRIFT_MS = 250;
+const SNAP_DRIFT_MS = 2000;
+const DRIFT_WARN_COOLDOWN_MS = 1000;
 function resetTimelineState() {
   targetLiveFrame = null;
   tailLockStartMs = 0;
@@ -127,18 +130,29 @@ function buildNeutralFrame() {
 
 function observeServerTime(serverTimeMs) {
   if (!Number.isFinite(serverTimeMs)) return;
-  const raw = serverTimeMs - performance.now();
+  const now = performance.now();
+  const raw = serverTimeMs - now;
   if (!hasServerOffset) {
     serverOffsetMs = raw;
     hasServerOffset = true;
   } else {
-    // EMA smoothing
-    serverOffsetMs = serverOffsetMs * 0.9 + raw * 0.1;
-    // If drift exceeds threshold, snap immediately
-    if (Math.abs(serverOffsetMs - raw) > MAX_DRIFT_MS) {
-      console.warn(`[Worker] Large drift detected: ${Math.abs(serverOffsetMs - raw).toFixed(2)}ms, snapping.`);
+    // Compare against previous offset first; post-EMA comparisons create false positives.
+    const delta = raw - serverOffsetMs;
+    const absDelta = Math.abs(delta);
+
+    // True discontinuity (clock jump / long stall): hard snap.
+    if (absDelta > SNAP_DRIFT_MS) {
+      if (now - lastDriftWarnMs > DRIFT_WARN_COOLDOWN_MS) {
+        console.warn(`[Worker] Large drift detected: ${absDelta.toFixed(2)}ms, snapping.`);
+        lastDriftWarnMs = now;
+      }
       serverOffsetMs = raw;
+      return;
     }
+
+    // Normal case: EMA smooth. For moderate drift, converge faster without snapping.
+    const alpha = absDelta > FAST_TRACK_DRIFT_MS ? 0.35 : 0.1;
+    serverOffsetMs += delta * alpha;
   }
 }
 

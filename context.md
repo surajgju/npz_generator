@@ -20,8 +20,11 @@ Raw model outputs are normalized and mapped in `server/retargeter.py` using para
   - `expression_norm_target`: Target standard deviation for PCA coefficients.
   - `jaw_scale`: Independent multiplier for the physical jaw bone rotation to ensure clear mouth articulation.
 - **Smoothing (EMA)**: `expression_smooth_alpha` applies an Exponential Moving Average (1.0 = no smoothing, 0.1 = heavy smoothing) to eliminate high-frequency artifacting from the AI inference.
-- **Linear Temporal Resampling**: `_resample_frames_linear` handles the transition between `BASE_FPS` (30) and `STREAM_FPS` (variable) using linear interpolation for all pose and expression channels. This ensures fluid motion regardless of the target broadcast rate.
+- **Temporal Resampling**:
+  - Pose channels use quaternion **SLERP** interpolation in `audio_pipeline.py` (axis-angle -> quaternion -> SLERP -> axis-angle) to avoid rotation ghosting artifacts.
+  - Expressions and root translation still use `_resample_frames_linear`.
 - **Slow-Motion Debugging**: A `SLOW_MOTION_FACTOR` can be applied to stretch the animation in time (e.g., 5.0 for 5x slower) while maintaining a steady broadcast rate, allowing for frame-by-frame irregularity analysis.
+- **Inference Ingress Buffering**: `audio_in_queue` is sized by `AUDIO_IN_QUEUE_MAX_CHUNKS` (default `512`) to absorb bursty Gemini Live chunk delivery and reduce dropped pre-inference chunks.
 
 ## 3. Frontend Architecture & Synchronization
 The WebGL frontend (Three.js) is designed for low-latency visual stability and reconnect recovery.
@@ -36,11 +39,15 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
   - `live_playing`: Normal audio-synced interpolation.
   - `resyncing`: Stop applying frames and request snapshot refresh.
 - **Viewer Playback States**:
-  - `buffering`, `playing`, `stalled_hold`, `stalled_ease`, `resyncing`.
+  - `buffering`, `playing`, `stalled_hold`, `stalled_ease`, `stalled_idle`, `resyncing`.
 - **Sync Logic**:
   - `animOffsetSec`: Initial animation offset from worker frame indexes.
   - `audioBuf`: Audio startup/holding threshold.
-  - **Monotonic Time Alignment**: Worker smooths `server_time_ms - performance.now()` with EMA to estimate server now and target live frame.
+  - **Decoupled Tick Clock**: Viewer always sends worker `tick` messages even when `audioStarted=false` using a monotonic fallback elapsed clock; this prevents worker freeze during audio/session recovery windows.
+  - **Monotonic Time Alignment**: Worker estimates `server_time_ms - performance.now()` with robust smoothing:
+    - EMA for normal jitter,
+    - fast convergence for moderate drift,
+    - hard snap only for large discontinuities.
 - **Voice Conversation Path**:
   - Browser Push-to-Talk captures PCM16 audio via `AudioCapture.js` and sends it to `/ws/conversation` via `ConversationClient.js`.
   - Server flow: `conversation.py` (Runtime) -> `audio_pipeline.py` (`GeminiLiveAudioEngine`) -> `google-genai` Live API.
@@ -88,6 +95,7 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
   - `stream_session_id`, `chunk_id`, `audio_sample_cursor`, `server_time_ms`, `server_boot_id`, `server_clock_id`.
 - **Control Message**:
   - Client may send `resync_request` when tail lock or drift thresholds are exceeded.
+  - Server may send `anim_session_switch` to proactively move anim clients to a new `stream_session_id` before the next live frame burst.
 - **Reconnect Rule (Burst Prevention)**:
   - Snapshot frames are never replayed as backlog.
   - On `anim_snapshot_end`, worker targets live edge:
@@ -127,20 +135,27 @@ The backend is split into specialized modules for scalability and maintainabilit
   - `snapshotDropCount`, `liveDropCount`, `resyncSkipped`.
   - queue length, in/out FPS, play state, audio buffer.
 - **Stall/Recovery Behavior**:
-  - hold first (`stalled_hold`), then ease (`stalled_ease`) until live frames resume.
+  - Viewer re-applies the held last frame during lag to avoid blank/frozen output.
+  - hold first (`stalled_hold`), then additive idle overlay (`stalled_idle`) after `IDLE_START_MS`.
+  - Worker emits fallback frames on every tick path (latest cached frame or neutral pose) when interpolation targets are missing.
   - startup watchdog is suppressed briefly during reconnect/bootstrap.
+  - Worker auto-restarts on `reset_required` after clearing stale session cache.
 
 ## 8. Operational Defaults and Edge Cases
 - **Defaults**:
   - `STREAM_FPS=20`
   - `SNAPSHOT_SECONDS=3.0` (`SNAPSHOT_FRAMES=ceil(3.0*STREAM_FPS)`)
-  - `MAX_TAIL_LOCK_MS=350`
+  - `MAX_TAIL_LOCK_MS=3000`
   - `STARTUP_SUPPRESS_MS=4000`
   - `STALL_HOLD_MS=300`, `STALL_EASE_MS=700`
+  - `STALL_IDLE_BLEND_MS=1200`
+  - `SESSION_MISMATCH_GRACE_MS=1200`
+  - `AUDIO_IN_QUEUE_MAX_CHUNKS=512`
 - **Handled Edge Cases**:
   - Snapshot end behind live audio: worker seeds playhead to audio/live edge immediately.
   - No live frame after snapshot: tail lock timeout -> `resync_request`.
-  - Anim/audio session mismatch: viewer enters `resyncing` until channels agree.
+  - Anim/audio session mismatch: viewer enters `resyncing` until channels agree; mismatch detection is grace-windowed to avoid transient false positives.
+  - Soft session recovery keeps audio pipeline alive; hard resets are reserved for clock/reset-required paths.
   - Server restart (`server_boot_id` change): reset path, local state cleared.
   - Partial/expired historical state: server falls back to `live_only` or `reset_required`.
   - Deprecated session buffers: evicted by TTL/LRU GC to avoid memory growth.

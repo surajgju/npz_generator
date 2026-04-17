@@ -1238,6 +1238,8 @@ let workerReady = false;
 let workerFallbackTimer = null;
 let workerRestartTimer = null;
 let workerRestartPending = false;
+let fallbackTickElapsedSec = 0;
+let fallbackTickLastMs = 0;
 let lastFrameUpdate = 0;
 let workerMaxIndex = -1;
 let workerMinIndex = -1;
@@ -2382,17 +2384,25 @@ function beginSessionRecovery(reason) {
   const now = performance.now();
   if (now - lastSessionResetAt < 250) return;
   lastSessionResetAt = now;
+  const hardReset =
+    reason === "clock_mismatch" ||
+    reason === "server_clock_mismatch" ||
+    reason === "reset_required";
   mismatchStartMs = now;
   resyncing = true;
   startupSuppressUntilMs = now + STARTUP_SUPPRESS_MS;
   sessionMismatchWarned = false;
   animOffsetSec = 0;
   animOffsetSet = false;
-  audioStarted = false;
-  audioStartTime = null;
-  audioScheduledTime = audioCtx ? audioCtx.currentTime + AUDIO_JITTER_SEC : 0;
-  audioQueue = [];
-  audioQueuedSec = 0;
+  if (hardReset) {
+    audioStarted = false;
+    audioStartTime = null;
+    audioScheduledTime = audioCtx ? audioCtx.currentTime + AUDIO_JITTER_SEC : 0;
+    audioQueue = [];
+    audioQueuedSec = 0;
+    fallbackTickElapsedSec = 0;
+    fallbackTickLastMs = now;
+  }
   workerFrame = null;
   heldFrameData = null;
   workerFrameIndex = -1;
@@ -2405,7 +2415,12 @@ function beginSessionRecovery(reason) {
   lastWorkerFrameIndexSeen = -1;
   if (worker) worker.postMessage({ type: "reset" });
   if (DEBUG) {
-    warn("Session recovery started", { reason, workerSessionId, audioSessionId });
+    warn("Session recovery started", {
+      reason,
+      hardReset,
+      workerSessionId,
+      audioSessionId,
+    });
   }
 }
 
@@ -2440,6 +2455,23 @@ function computePlaybackFps(bufferSec) {
   const minFps = Math.max(8, streamFps * 0.85);
   const t = Math.min(1, Math.max(0, (bufferSec - 0.5) / 3.5));
   return minFps + t * (maxFps - minFps);
+}
+
+function computeWorkerTickElapsed(nowMs) {
+  if (audioStarted && audioCtx && audioStartTime !== null) {
+    maybeSetAnimOffset();
+    const synced = Math.max(0, audioCtx.currentTime - audioStartTime + animOffsetSec);
+    fallbackTickElapsedSec = Math.max(fallbackTickElapsedSec, synced);
+    fallbackTickLastMs = nowMs;
+    return synced;
+  }
+  if (!fallbackTickLastMs) {
+    fallbackTickLastMs = nowMs;
+  }
+  const dt = Math.max(0, Math.min(0.25, (nowMs - fallbackTickLastMs) / 1000));
+  fallbackTickElapsedSec += dt;
+  fallbackTickLastMs = nowMs;
+  return fallbackTickElapsedSec;
 }
 
 function tryStartPlayback() {
@@ -2492,6 +2524,10 @@ function updatePlaybackFrameWorker() {
     // return;
   }
   tryStartPlayback();
+  const elapsed = computeWorkerTickElapsed(nowMs);
+  if (worker) {
+    worker.postMessage({ type: "tick", elapsed });
+  }
   if (!audioStarted || !audioCtx || audioStartTime === null) {
     playStateEl.textContent = "buffering";
     return;
@@ -2500,14 +2536,9 @@ function updatePlaybackFrameWorker() {
     playStateEl.textContent = "holding";
     return;
   }
-  maybeSetAnimOffset();
-  const elapsed = audioCtx.currentTime - audioStartTime + animOffsetSec;
   if (elapsed < 0) {
     playStateEl.textContent = "buffering";
     return;
-  }
-  if (worker) {
-    worker.postMessage({ type: "tick", elapsed });
   }
 
   // Keep rendering alive during lag by replaying last frame and blending idle additively.
@@ -2790,6 +2821,8 @@ function onClearBuffer() {
   frameDirty = false;
   lagIdleBlend = 0;
   lagIdleStarted = false;
+  fallbackTickElapsedSec = 0;
+  fallbackTickLastMs = performance.now();
   stallSinceMs = null;
   resyncing = false;
   sessionMismatchWarned = false;

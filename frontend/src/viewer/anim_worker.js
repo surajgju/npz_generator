@@ -302,7 +302,9 @@ function applyMorphSmoothing(buffer) {
 }
 
 function emitFrame(frameIndex, data) {
-  if (frameIndex < lastAppliedFrame) return;
+  if (frameIndex < lastAppliedFrame && DEBUG) {
+    debugLog("emitFrame backward index", { frameIndex, lastAppliedFrame, sessionId: currentSessionId });
+  }
   const out = new Float32Array(data.length);
   out.set(data);
   postMessage(
@@ -324,7 +326,7 @@ function emitFrame(frameIndex, data) {
     },
     [out.buffer]
   );
-  lastAppliedFrame = frameIndex;
+  lastAppliedFrame = Math.max(lastAppliedFrame, frameIndex);
 }
 
 function updateEffectiveFps() {
@@ -393,8 +395,8 @@ function onTick(elapsed) {
       out.set(best.data);
       applyExtras(out, elapsed);
       applyMorphSmoothing(out);
-      // Bypass the lastAppliedFrame guard — during tail lock we always want to
-      // emit the hold frame so the viewer's frameDirty flag stays true.
+      // During tail lock we always emit the hold frame so viewer frameDirty
+      // stays true even when frame index does not advance.
       const holdOut = new Float32Array(out.length);
       holdOut.set(out);
       postMessage(

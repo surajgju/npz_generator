@@ -59,8 +59,8 @@ let targetLiveFrame = null;
 let tailLockStartMs = 0;
 let seenLiveAtOrBeyondTarget = false;
 let lastResyncRequestMs = 0;
-const MAX_TAIL_LOCK_MS = 350;
-
+const MAX_TAIL_LOCK_MS = 1200;
+const MAX_DRIFT_MS = 100;
 function resetTimelineState() {
   targetLiveFrame = null;
   tailLockStartMs = 0;
@@ -117,7 +117,13 @@ function observeServerTime(serverTimeMs) {
     serverOffsetMs = raw;
     hasServerOffset = true;
   } else {
+    // EMA smoothing
     serverOffsetMs = serverOffsetMs * 0.9 + raw * 0.1;
+    // If drift exceeds threshold, snap immediately
+    if (Math.abs(serverOffsetMs - raw) > MAX_DRIFT_MS) {
+      console.warn(`[Worker] Large drift detected: ${Math.abs(serverOffsetMs - raw).toFixed(2)}ms, snapping.`);
+      serverOffsetMs = raw;
+    }
   }
 }
 
@@ -387,7 +393,29 @@ function onTick(elapsed) {
       out.set(best.data);
       applyExtras(out, elapsed);
       applyMorphSmoothing(out);
-      emitFrame(best.frame, out);
+      // Bypass the lastAppliedFrame guard — during tail lock we always want to
+      // emit the hold frame so the viewer's frameDirty flag stays true.
+      const holdOut = new Float32Array(out.length);
+      holdOut.set(out);
+      postMessage(
+        {
+          type: "frame",
+          buffer: holdOut.buffer,
+          frameIndex: best.frame,
+          streamFps,
+          queueLen: storedCount,
+          snapshotDropCount,
+          liveDropCount,
+          resyncSkipped,
+          nbones,
+          nmorphs,
+          sessionId: currentSessionId,
+          serverBootId,
+          serverClockId,
+          protocolVersion: PROTOCOL_VERSION,
+        },
+        [holdOut.buffer]
+      );
     }
     if (seenLiveAtOrBeyondTarget) {
       playbackState = "live_playing";

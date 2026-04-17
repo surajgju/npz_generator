@@ -1,3 +1,4 @@
+
 """Session state management for the NPZ Generator streaming server.
 
 Owns SessionState, SessionFrame, the sessions dict, and all CRUD helpers.
@@ -10,7 +11,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
-
+import sys
 import numpy as np
 from fastapi import WebSocket
 
@@ -228,3 +229,30 @@ async def session_gc_loop(server_time_fn) -> None:
                 logger.info(
                     "Session GC evicted=%s active=%s", removable, active_session_id
                 )
+
+            total_mem = 0
+            for st in sessions.values():
+                total_mem += estimate_session_memory(st)
+            # Warn if > 200 MB (adjust threshold)
+            if total_mem > 200 * 1024 * 1024:
+                logger.warning(
+                    "High snapshot memory: %.2f MB across %d sessions",
+                    total_mem / (1024*1024), len(sessions)
+                )   
+
+
+def estimate_frame_memory(frame: SessionFrame) -> int:
+    """Approximate memory usage of a single SessionFrame in bytes."""
+    total = sys.getsizeof(frame)  # dataclass overhead
+    total += frame.root_pos.nbytes
+    total += frame.bone_quats.nbytes
+    total += frame.morphs.nbytes
+    return total
+
+def estimate_session_memory(st: SessionState) -> int:
+    total = sys.getsizeof(st)
+    total += sys.getsizeof(st.frame_ring)
+    for frame in st.frame_ring:
+        total += estimate_frame_memory(frame)
+    # Add other numpy arrays if any
+    return total

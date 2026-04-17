@@ -745,6 +745,52 @@ def _coalesce_chunk_ids(chunk_ids: List[Optional[str]]) -> Optional[str]:
         return values[0]
     return f"{values[0]}-{values[-1]}"
 
+def axis_angle_to_quat(axis_angle: np.ndarray) -> np.ndarray:
+    """Convert (..., 3) axis-angle to (..., 4) quaternion [x,y,z,w]."""
+    angles = np.linalg.norm(axis_angle, axis=-1, keepdims=True)
+    half = 0.5 * angles
+    small = angles < 1e-8
+    axis = np.zeros_like(axis_angle)
+    axis[~small[..., 0]] = axis_angle[~small[..., 0]] / angles[~small[..., 0]]
+    sin_half = np.sin(half)
+    quat = np.concatenate([axis * sin_half, np.cos(half)], axis=-1)
+    quat[small[..., 0]] = np.array([0, 0, 0, 1], dtype=quat.dtype)
+    return quat
+
+def quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
+    """Convert (..., 4) quaternion [x,y,z,w] to (..., 3) axis-angle."""
+    angle = 2 * np.arccos(np.clip(quat[..., 3], -1, 1))
+    sin_half = np.sin(angle * 0.5)
+    axis = np.zeros_like(quat[..., :3])
+    mask = sin_half > 1e-8
+    axis[mask] = quat[mask][..., :3] / sin_half[mask][..., np.newaxis]
+    return axis * angle[..., np.newaxis]
+
+def slerp_quat(q1: np.ndarray, q2: np.ndarray, t: float) -> np.ndarray:
+    """Spherical linear interpolation between two quaternions (...,4)."""
+    dot = np.sum(q1 * q2, axis=-1, keepdims=True)
+    neg_mask = dot < 0.0
+    q2 = np.where(neg_mask, -q2, q2)
+    dot = np.where(neg_mask, -dot, dot)
+    dot = np.clip(dot, -1.0, 1.0)
+
+    theta = np.arccos(dot)
+    sin_theta = np.sin(theta)
+    near_linear = sin_theta < 1e-6
+    safe_sin_theta = np.where(near_linear, 1.0, sin_theta)
+
+    w1 = np.sin((1.0 - t) * theta) / safe_sin_theta
+    w2 = np.sin(t * theta) / safe_sin_theta
+
+    slerp = (w1 * q1) + (w2 * q2)
+    linear = ((1.0 - t) * q1) + (t * q2)
+    out = np.where(near_linear, linear, slerp)
+
+    # Keep unit quaternions to avoid numerical drift.
+    norm = np.linalg.norm(out, axis=-1, keepdims=True)
+    return out / np.where(norm > 1e-8, norm, 1.0)
+
+
 
 async def inference_worker(generator, retargeter) -> None:
     """Dequeue audio chunks, run inference, push retargeted frames to anim_queue."""
@@ -866,15 +912,39 @@ async def inference_worker(generator, retargeter) -> None:
             trans = coeffs["trans"]
             frames_count = int(poses.shape[0])
 
+            # ------------------ RESAMPLING BLOCK (UPDATED) ------------------
             if (STREAM_FPS != BASE_FPS or SLOW_MOTION_FACTOR != 1.0) and frames_count > 1:
                 target_count = max(
                     1,
                     int(round(frames_count * (STREAM_FPS / BASE_FPS) * SLOW_MOTION_FACTOR)),
                 )
-                poses = _resample_frames_linear(poses, target_count)
+                # Resample expressions and translation linearly (they are scalar/vector)
                 expressions = _resample_frames_linear(expressions, target_count)
                 trans = _resample_frames_linear(trans, target_count)
-                frames_count = int(poses.shape[0])
+
+                # Resample poses using SLERP on quaternions
+                # poses shape: (frames_count, joint_count*3) axis-angle
+                joint_count = poses.shape[1] // 3
+                poses_aa = poses.reshape(frames_count, joint_count, 3)
+                poses_quat = axis_angle_to_quat(poses_aa)          # (frames, joints, 4)
+
+                # Build index mapping for SLERP
+                src_idx = np.linspace(0, frames_count - 1, target_count)
+                new_quats = []
+                for i in range(target_count):
+                    low = int(np.floor(src_idx[i]))
+                    high = min(low + 1, frames_count - 1)
+                    t = src_idx[i] - low
+                    q_low = poses_quat[low]
+                    q_high = poses_quat[high]
+                    q_interp = slerp_quat(q_low, q_high, t)
+                    new_quats.append(q_interp)
+                new_poses_quat = np.stack(new_quats, axis=0)       # (target, joints, 4)
+                # Convert back to axis-angle
+                new_poses_aa = quat_to_axis_angle(new_poses_quat)  # (target, joints, 3)
+                poses = new_poses_aa.reshape(target_count, -1)
+                frames_count = target_count
+            # --------------------------------------------------------------
 
             root_pos, bone_quats, morphs = retargeter.retarget(poses, expressions, trans)
 
@@ -921,8 +991,7 @@ async def inference_worker(generator, retargeter) -> None:
                 "Enqueued %d anim frames (session=%s queue=%d fps=%d chunk=%s)",
                 frames_count, session_id, anim_queue.qsize(), STREAM_FPS, batch_chunk_id,
             )
-
-
+            
 def _log_inference_stats(
     retargeter, chunk_id, session_id, frames_count,
     poses, expressions, morphs, root_pos,

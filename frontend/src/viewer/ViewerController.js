@@ -149,6 +149,7 @@ let idleRestQuats = {
   spine2: null,
   spine3: null,
 };
+let mismatchStartMs = null;
 
 function logDelta(label, curr, prev) {
   const changes = [];
@@ -829,7 +830,7 @@ function applyIdlePose(nowSec) {
     for (const t of idleBlinkTargets) {
       const base = t.base ?? 0;
       const v = Math.max(-1, Math.min(1, base + blinkVal));
-      t.mesh.morphTargetInfluences[t.index] += blinkVal;
+      t.mesh.morphTargetInfluences[t.index] = Math.max(-1, Math.min(1, (t.base ?? 0) + blinkVal));
     }
   }
 }
@@ -1700,7 +1701,7 @@ function applyAnimFrame(frame) {
     if (targets) {
       for (const t of targets) {
         const base = t.base ?? 0;
-        t.mesh.morphTargetInfluences[t.index] += smoothed;
+        t.mesh.morphTargetInfluences[t.index] = base + smoothed;
       }
     }
     const av = Math.abs(v);
@@ -1835,8 +1836,13 @@ function initWorker() {
       if (msg.serverClockId) serverClockId = msg.serverClockId;
       if (Number.isFinite(msg.protocolVersion)) protocolVersion = msg.protocolVersion;
       persistKnownSessionState();
+      const wasResyncing = resyncing;
       resyncing = false;
       sessionMismatchWarned = false;
+      // If we just cleared resyncing, attempt to flush any audio queued during the resync window.
+      if (wasResyncing && audioEnabled && audioCtx && !audioStarted) {
+        tryStartPlayback();
+      }
     } else if (msg.type === "handshake") {
       if (msg.sessionId) workerSessionId = msg.sessionId;
       if (msg.serverBootId) serverBootId = msg.serverBootId;
@@ -2210,8 +2216,17 @@ function applyStallEase(progress) {
   }
 }
 
+
 function hasSessionMismatch() {
-  return !!(workerSessionId && audioSessionId && workerSessionId !== audioSessionId);
+  if (!workerSessionId || !audioSessionId) return false;
+  if (workerSessionId === audioSessionId) {
+    mismatchStartMs = null;
+    return false;
+  }
+  const now = performance.now();
+  if (mismatchStartMs === null) mismatchStartMs = now;
+  // Only treat as mismatch if it persists > 500ms
+  return (now - mismatchStartMs) > 500;
 }
 
 function queueAudioChunk(buffer, duration) {
@@ -2326,7 +2341,7 @@ function updatePlaybackFrameWorker() {
   }
   if (resyncing || hasSessionMismatch()) {
     playStateEl.textContent = "resyncing";
-    return;
+    // return;
   }
   tryStartPlayback();
   if (!audioStarted || !audioCtx || audioStartTime === null) {

@@ -50,6 +50,7 @@ let effectiveFps = 0;
 let interpBuffer = null;
 let tickCount = 0;
 let lastAppliedFrame = -1;
+let neutralFrame = null;
 
 let serverOffsetMs = 0;
 let hasServerOffset = false;
@@ -108,6 +109,20 @@ function resetBuffer() {
 function ensureCapacity() {
   capacity = Math.max(1, Math.ceil(streamFps * bufferSeconds));
   resetBuffer();
+}
+
+function buildNeutralFrame() {
+  const len = 3 + nbones * 4 + nmorphs;
+  if (!Number.isFinite(len) || len <= 0) return null;
+  if (!neutralFrame || neutralFrame.length !== len) {
+    neutralFrame = new Float32Array(len);
+    neutralFrame.fill(0);
+    // Identity rotation for each bone quaternion.
+    for (let i = 0; i < nbones; i++) {
+      neutralFrame[3 + i * 4 + 3] = 1;
+    }
+  }
+  return neutralFrame;
 }
 
 function observeServerTime(serverTimeMs) {
@@ -433,6 +448,10 @@ function onTick(elapsed) {
     return;
   }
   if (maxIndex < 0) {
+    const neutral = buildNeutralFrame();
+    if (neutral) {
+      emitFrame(Math.max(lastAppliedFrame, 0), neutral);
+    }
     maybeSendStats();
     return;
   }
@@ -499,6 +518,21 @@ function onTick(elapsed) {
     applyExtras(out, elapsed);
     applyMorphSmoothing(out);
     emitFrame(i0, out);
+  } else {
+    // No exact interpolation frames available; keep stream alive with fallback pose.
+    const fallback = getLatestFrame();
+    if (fallback) {
+      const out = new Float32Array(fallback.data.length);
+      out.set(fallback.data);
+      applyExtras(out, elapsed);
+      applyMorphSmoothing(out);
+      emitFrame(fallback.frame, out);
+    } else {
+      const neutral = buildNeutralFrame();
+      if (neutral) {
+        emitFrame(Math.max(lastAppliedFrame, 0), neutral);
+      }
+    }
   }
   maybeSendStats();
 }
@@ -651,6 +685,7 @@ function connectAnim() {
         if (msg.saccade) saccadeConfig = msg.saccade;
         nbones = bones.length;
         nmorphs = morphs.length;
+        neutralFrame = null;
         eyeBoneIndices = [];
         for (let i = 0; i < bones.length; i++) {
           const name = (bones[i] || "").toLowerCase();

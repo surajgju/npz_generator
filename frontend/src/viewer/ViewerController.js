@@ -835,6 +835,90 @@ function applyIdlePose(nowSec) {
   }
 }
 
+function beginLagIdleOverlay(nowSec) {
+  idleStartSec = nowSec;
+  idleBlinkNextAt = null;
+  idleBlinkStartAt = null;
+  idleSaccadeNextAt = null;
+  idleSaccadeYaw = 0;
+  idleSaccadePitch = 0;
+  idleSaccadeTargetYaw = 0;
+  idleSaccadeTargetPitch = 0;
+  idleHeadPeriodSec = randRange(idleConfig.headSway.periodSec[0], idleConfig.headSway.periodSec[1]);
+  idleHeadPhase = randRange(0, Math.PI * 2);
+  cacheIdleBones();
+  autoDetectFaceRegions();
+  autoDetectBlinkMorphs();
+  refreshIdleBlinkTargets();
+}
+
+function slerpBoneTowardIdle(bone, restQuat, pitch, yaw, roll, blend) {
+  if (!bone || !restQuat) return;
+  tempEuler.set(pitch, yaw, roll, "YXZ");
+  tempQuat2.setFromEuler(tempEuler);
+  tempQuat.copy(restQuat).multiply(tempQuat2);
+  bone.quaternion.slerp(tempQuat, blend);
+}
+
+function applyIdlePoseAdditive(nowSec, blend) {
+  if (!avatarLoaded || blend <= 0) return;
+  if (!idleRestQuats.head && idleBones.head) {
+    cacheIdleBones();
+  }
+  const elapsed = nowSec - idleStartSec;
+  const headCfg = idleConfig.headSway;
+  const basePeriod = idleHeadPeriodSec || 6.0;
+  const yawAmp = (headCfg.yawDeg || 2.0) * (Math.PI / 180);
+  const pitchAmp = (headCfg.pitchDeg || 1.0) * (Math.PI / 180);
+  const rollAmp = (headCfg.rollDeg || 0.5) * (Math.PI / 180);
+  const yaw = Math.sin((elapsed / basePeriod) * Math.PI * 2 + idleHeadPhase) * yawAmp;
+  const pitch =
+    Math.sin((elapsed / (basePeriod * 1.3)) * Math.PI * 2 + idleHeadPhase * 0.7) * pitchAmp;
+  const roll =
+    Math.sin((elapsed / (basePeriod * 1.7)) * Math.PI * 2 + idleHeadPhase * 1.3) * rollAmp;
+
+  slerpBoneTowardIdle(idleBones.head, idleRestQuats.head, pitch, yaw, roll, blend);
+
+  const neckScale = idleConfig.neckScale ?? 0.5;
+  slerpBoneTowardIdle(
+    idleBones.neck,
+    idleRestQuats.neck,
+    pitch * neckScale,
+    yaw * neckScale,
+    roll * neckScale,
+    blend
+  );
+
+  const spineYaw = yaw * 0.5;
+  const spinePitch = pitch * 0.4;
+  slerpBoneTowardIdle(idleBones.spine1, idleRestQuats.spine1, spinePitch * 0.4, spineYaw * 0.4, 0, blend);
+  slerpBoneTowardIdle(idleBones.spine2, idleRestQuats.spine2, spinePitch * 0.35, spineYaw * 0.35, 0, blend);
+  slerpBoneTowardIdle(idleBones.spine3, idleRestQuats.spine3, spinePitch * 0.25, spineYaw * 0.25, 0, blend);
+
+  const shoulderPitch = (-8 * Math.PI) / 180;
+  const elbowBend = (-5 * Math.PI) / 180;
+  slerpBoneTowardIdle(idleBones.leftShoulder, idleRestQuats.leftShoulder, shoulderPitch, 0, 0, blend);
+  slerpBoneTowardIdle(idleBones.rightShoulder, idleRestQuats.rightShoulder, shoulderPitch, 0, 0, blend);
+  slerpBoneTowardIdle(idleBones.leftElbow, idleRestQuats.leftElbow, elbowBend, 0, 0, blend);
+  slerpBoneTowardIdle(idleBones.rightElbow, idleRestQuats.rightElbow, elbowBend, 0, 0, blend);
+
+  if (idleBones.leftEye && idleBones.rightEye && idleRestQuats.leftEye && idleRestQuats.rightEye) {
+    const { yaw: eyeYaw, pitch: eyePitch } = updateIdleSaccade(elapsed);
+    slerpBoneTowardIdle(idleBones.leftEye, idleRestQuats.leftEye, eyePitch, eyeYaw, 0, blend);
+    slerpBoneTowardIdle(idleBones.rightEye, idleRestQuats.rightEye, eyePitch, eyeYaw, 0, blend);
+  }
+
+  if (idleBlinkTargets.length) {
+    const blinkVal = updateIdleBlink(elapsed) * (idleConfig.blink.strength || 0.6) * idleBlinkStrengthScale;
+    for (const t of idleBlinkTargets) {
+      const base = t.base ?? 0;
+      const current = t.mesh.morphTargetInfluences[t.index] ?? base;
+      const target = Math.max(-1, Math.min(1, base + blinkVal));
+      t.mesh.morphTargetInfluences[t.index] = current + (target - current) * blend;
+    }
+  }
+}
+
 function updateIdleState() {
   const now = performance.now();
   if (manualOverride.active) {
@@ -1128,6 +1212,7 @@ const SESSION_MISMATCH_GRACE_MS = Number(import.meta.env.VITE_SESSION_MISMATCH_G
 const STARTUP_SUPPRESS_MS = 4000;
 const STALL_HOLD_MS = 300;
 const STALL_EASE_MS = 700;
+const STALL_IDLE_BLEND_MS = Number(import.meta.env.VITE_STALL_IDLE_BLEND_MS || 1200);
 const workerEnabled = typeof Worker !== "undefined";
 const WS_HOST =
   (import.meta && import.meta.env && import.meta.env.VITE_WS_HOST) ||
@@ -1146,8 +1231,13 @@ let workerResyncSkipped = 0;
 let workerInFps = 0;
 let workerPlaybackFps = 0;
 let frameDirty = false;
+let heldFrameData = null;
+let lagIdleBlend = 0;
+let lagIdleStarted = false;
 let workerReady = false;
 let workerFallbackTimer = null;
+let workerRestartTimer = null;
+let workerRestartPending = false;
 let lastFrameUpdate = 0;
 let workerMaxIndex = -1;
 let workerMinIndex = -1;
@@ -1802,6 +1892,14 @@ window.testMorph = function (name, value) {
 
 function initWorker() {
   if (!workerEnabled) return;
+  if (worker) {
+    try {
+      worker.terminate();
+    } catch {
+      // Ignore terminate errors.
+    }
+    worker = null;
+  }
   pipelineModeEl.textContent = "Worker";
   worker = new Worker(new URL("./anim_worker.js", import.meta.url), { type: "module" });
   startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
@@ -1828,7 +1926,10 @@ function initWorker() {
       workerResyncSkipped = msg.resyncSkipped ?? workerResyncSkipped;
       workerFrameIndex = msg.frameIndex ?? workerFrameIndex;
       workerFrame = new Float32Array(msg.buffer);
+      heldFrameData = workerFrame;
       frameDirty = true;
+      lagIdleBlend = 0;
+      lagIdleStarted = false;
       lastWorkerFrameIndexSeen = workerFrameIndex;
       lastWorkerFrameAt = performance.now();
       lastWorkerFrameBytes = msg.buffer ? msg.buffer.byteLength : null;
@@ -1872,6 +1973,9 @@ function initWorker() {
       if (DEBUG) warn("Worker requested resync", msg);
     } else if (msg.type === "session_switch") {
       if (msg.sessionId) workerSessionId = msg.sessionId;
+      heldFrameData = null;
+      lagIdleBlend = 0;
+      lagIdleStarted = false;
       clearMismatchIfAligned();
       resyncing = false;
       sessionMismatchWarned = false;
@@ -1894,14 +1998,22 @@ function initWorker() {
         sessionStorage.removeItem("viewer_known_server_clock_id");
         sessionStorage.removeItem("viewer_known_session_id");
         sessionStorage.removeItem("viewer_last_applied_frame");
+        workerSessionId = null;
         pipelineModeEl.textContent = "Resync";
         statusEl.textContent = "Resyncing";
         workerAlive = false;
         workerReady = false;
         resyncing = true;
         startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
-        // Optionally reload or re-init here if needed, but the next connect should be clean.
+        scheduleWorkerRestart("reset_required");
       } else if (msg.status === "error" || msg.status === "closed") {
+        if (workerRestartPending) {
+          pipelineModeEl.textContent = "Resync";
+          statusEl.textContent = "Reconnecting";
+          workerAlive = false;
+          workerReady = false;
+          return;
+        }
         warn("Worker status:", msg);
         pipelineModeEl.textContent = "Error";
         statusEl.textContent = "Disconnected";
@@ -1968,6 +2080,25 @@ function initWorker() {
       statusEl.textContent = "Connecting...";
     }
   }, 5000);
+}
+
+function scheduleWorkerRestart(reason, delayMs = 120) {
+  if (!workerEnabled || !initialized) return;
+  if (workerRestartPending) return;
+  workerRestartPending = true;
+  if (workerRestartTimer) {
+    clearTimeout(workerRestartTimer);
+    workerRestartTimer = null;
+  }
+  workerRestartTimer = setTimeout(() => {
+    workerRestartTimer = null;
+    workerRestartPending = false;
+    if (!initialized) return;
+    if (DEBUG) {
+      warn("Restarting worker", { reason });
+    }
+    initWorker();
+  }, delayMs);
 }
 
 function updateConversationHud() {
@@ -2263,11 +2394,14 @@ function beginSessionRecovery(reason) {
   audioQueue = [];
   audioQueuedSec = 0;
   workerFrame = null;
+  heldFrameData = null;
   workerFrameIndex = -1;
   workerMaxIndex = -1;
   workerMinIndex = -1;
   workerQueueLen = 0;
   frameDirty = false;
+  lagIdleBlend = 0;
+  lagIdleStarted = false;
   lastWorkerFrameIndexSeen = -1;
   if (worker) worker.postMessage({ type: "reset" });
   if (DEBUG) {
@@ -2376,18 +2510,49 @@ function updatePlaybackFrameWorker() {
     worker.postMessage({ type: "tick", elapsed });
   }
 
-  // Apply streamed frame only when new data arrives.
+  // Keep rendering alive during lag by replaying last frame and blending idle additively.
   if (workerFrame && frameDirty) {
     resetAllMorphsToBase();
     applyAnimFrame(workerFrame);
+    heldFrameData = workerFrame;
+    lagIdleBlend = 0;
+    lagIdleStarted = false;
     if (DEBUG && playCount % 30 === 0) {
       log("Applying audio-synced frame", { playCount, elapsed: elapsed.toFixed(3) });
     }
     frameDirty = false;
     playCount += 1;
     playStateEl.textContent = "playing";
-    lastFrameUpdate = performance.now();
+    lastFrameUpdate = nowMs;
     stallSinceMs = null;
+  } else if (heldFrameData) {
+    resetAllMorphsToBase();
+    applyAnimFrame(heldFrameData);
+    const stalledForMs = Math.max(0, nowMs - lastFrameUpdate);
+    if (stalledForMs <= STALL_HOLD_MS) {
+      playStateEl.textContent = "stalled_hold";
+      lagIdleBlend = 0;
+      lagIdleStarted = false;
+    } else if (stalledForMs <= IDLE_START_MS) {
+      playStateEl.textContent = "stalled_hold";
+      lagIdleBlend = 0;
+      lagIdleStarted = false;
+    } else {
+      if (!lagIdleStarted) {
+        beginLagIdleOverlay(nowSec);
+        lagIdleStarted = true;
+      }
+      lagIdleBlend = Math.min(1, (stalledForMs - IDLE_START_MS) / STALL_IDLE_BLEND_MS);
+      applyIdlePoseAdditive(nowSec, lagIdleBlend);
+      playStateEl.textContent = "stalled_idle";
+    }
+    if (DEBUG && !frameDirty && playCount % 30 === 0) {
+      log("Audio holding - replaying last frame", {
+        elapsed: elapsed.toFixed(3),
+        stalledForMs: Math.round(stalledForMs),
+        lagIdleBlend: lagIdleBlend.toFixed(2),
+      });
+    }
   } else {
     if (stallSinceMs === null) stallSinceMs = nowMs;
     const stalledForMs = nowMs - stallSinceMs;
@@ -2397,12 +2562,6 @@ function updatePlaybackFrameWorker() {
       const easeT = Math.min(1, (stalledForMs - STALL_HOLD_MS) / STALL_EASE_MS);
       applyStallEase(easeT);
       playStateEl.textContent = "stalled_ease";
-    }
-    if (DEBUG && !frameDirty && playCount % 30 === 0) {
-      log("Audio holding - no new worker frame", {
-        elapsed: elapsed.toFixed(3),
-        stalledForMs: Math.round(stalledForMs),
-      });
     }
   }
 
@@ -2627,7 +2786,10 @@ function onClearBuffer() {
   workerMinIndex = -1;
   workerFrameIndex = -1;
   workerFrame = null;
+  heldFrameData = null;
   frameDirty = false;
+  lagIdleBlend = 0;
+  lagIdleStarted = false;
   stallSinceMs = null;
   resyncing = false;
   sessionMismatchWarned = false;
@@ -2926,6 +3088,11 @@ export function destroyViewer() {
     worker.terminate();
     worker = null;
   }
+  if (workerRestartTimer) {
+    clearTimeout(workerRestartTimer);
+    workerRestartTimer = null;
+  }
+  workerRestartPending = false;
   if (conversationClient) {
     conversationClient.disconnect();
     conversationClient = null;

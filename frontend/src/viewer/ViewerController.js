@@ -1124,6 +1124,7 @@ const AUDIO_START_LEAD_SEC = Number(import.meta.env.VITE_AUDIO_START_LEAD_SEC ||
 const AUDIO_START_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_START_BUFFER_SEC || 0.18);
 const MESH_START_BUFFER_SEC = Number(import.meta.env.VITE_MESH_START_BUFFER_SEC || 0.18);
 const AUDIO_LOW_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_LOW_BUFFER_SEC || 0.12);
+const SESSION_MISMATCH_GRACE_MS = Number(import.meta.env.VITE_SESSION_MISMATCH_GRACE_MS || 1200);
 const STARTUP_SUPPRESS_MS = 4000;
 const STALL_HOLD_MS = 300;
 const STALL_EASE_MS = 700;
@@ -1832,6 +1833,7 @@ function initWorker() {
       lastWorkerFrameAt = performance.now();
       lastWorkerFrameBytes = msg.buffer ? msg.buffer.byteLength : null;
       if (msg.sessionId) workerSessionId = msg.sessionId;
+      clearMismatchIfAligned();
       if (msg.serverBootId) serverBootId = msg.serverBootId;
       if (msg.serverClockId) serverClockId = msg.serverClockId;
       if (Number.isFinite(msg.protocolVersion)) protocolVersion = msg.protocolVersion;
@@ -1845,6 +1847,7 @@ function initWorker() {
       }
     } else if (msg.type === "handshake") {
       if (msg.sessionId) workerSessionId = msg.sessionId;
+      clearMismatchIfAligned();
       if (msg.serverBootId) serverBootId = msg.serverBootId;
       if (msg.serverClockId) serverClockId = msg.serverClockId;
       if (Number.isFinite(msg.protocolVersion)) protocolVersion = msg.protocolVersion;
@@ -1869,6 +1872,7 @@ function initWorker() {
       if (DEBUG) warn("Worker requested resync", msg);
     } else if (msg.type === "session_switch") {
       if (msg.sessionId) workerSessionId = msg.sessionId;
+      clearMismatchIfAligned();
       resyncing = false;
       sessionMismatchWarned = false;
       startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
@@ -2064,6 +2068,7 @@ function connectConversationSocket() {
           beginSessionRecovery("audio_session_switch");
         }
         if (nextAudioSessionId) audioSessionId = nextAudioSessionId;
+        clearMismatchIfAligned();
       },
       onAudioControl: (msg) => {
         if (msg.action === "stop") {
@@ -2225,8 +2230,16 @@ function hasSessionMismatch() {
   }
   const now = performance.now();
   if (mismatchStartMs === null) mismatchStartMs = now;
-  // Only treat as mismatch if it persists > 500ms
-  return (now - mismatchStartMs) > 500;
+  // Only treat as mismatch if it persists beyond grace.
+  return (now - mismatchStartMs) > SESSION_MISMATCH_GRACE_MS;
+}
+
+function clearMismatchIfAligned() {
+  if (!workerSessionId || !audioSessionId) return false;
+  if (workerSessionId !== audioSessionId) return false;
+  mismatchStartMs = null;
+  sessionMismatchWarned = false;
+  return true;
 }
 
 function queueAudioChunk(buffer, duration) {
@@ -2238,6 +2251,7 @@ function beginSessionRecovery(reason) {
   const now = performance.now();
   if (now - lastSessionResetAt < 250) return;
   lastSessionResetAt = now;
+  mismatchStartMs = now;
   resyncing = true;
   startupSuppressUntilMs = now + STARTUP_SUPPRESS_MS;
   sessionMismatchWarned = false;

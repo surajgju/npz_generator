@@ -5,6 +5,8 @@ Owns SessionState, SessionFrame, the sessions dict, and all CRUD helpers.
 Imported by audio_pipeline.py, conversation.py, and app.py.
 """
 import asyncio
+import json
+import logging
 import math
 import os
 import uuid
@@ -76,6 +78,7 @@ anim_clients: "set[WebSocket]" = set()
 anim_client_protocol: Dict[WebSocket, int] = {}
 anim_client_session: Dict[WebSocket, Optional[str]] = {}
 audio_clients: "set[WebSocket]" = set()
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -114,16 +117,16 @@ async def create_audio_session(
     global active_session_id
     now_ms = server_time_fn()
     sid = str(uuid.uuid4())
+    protocol2_ws: List[WebSocket] = []
     async with sessions_lock:
         if active_session_id and active_session_id in sessions:
             prev = sessions[active_session_id]
             prev.deprecated_at_ms = now_ms
             prev.producer_connected = False
             prev.anim_subscriber_count = 0
-        protocol2_clients = 0
         for ws in list(anim_clients):
             if anim_client_protocol.get(ws, 1) >= 2:
-                protocol2_clients += 1
+                protocol2_ws.append(ws)
                 anim_client_session[ws] = sid
         sessions[sid] = SessionState(
             session_id=sid,
@@ -132,7 +135,7 @@ async def create_audio_session(
             latest_audio_server_time_ms=now_ms,
             next_frame_index=0,
             producer_connected=True,
-            anim_subscriber_count=protocol2_clients,
+            anim_subscriber_count=len(protocol2_ws),
             generation_epoch=0,
             conversation_id=conversation_id,
             reply_id=reply_id,
@@ -140,11 +143,36 @@ async def create_audio_session(
         active_session_id = sid
     drained_anim = _drain_queue_nowait(anim_queue)
     drained_audio = _drain_queue_nowait(audio_in_queue)
-    import logging
-    logging.getLogger(__name__).info(
+    logger.info(
         "Created session %s (boot=%s). Drained anim=%d audio=%d",
         sid, server_boot_id, drained_anim, drained_audio,
     )
+    if protocol2_ws:
+        switch_msg = json.dumps(
+            {
+                "type": "anim_session_switch",
+                "stream_session_id": sid,
+                "session_id": sid,
+                "server_boot_id": server_boot_id,
+                "server_time_ms": server_time_fn(),
+            }
+        )
+        dead: List[WebSocket] = []
+        for ws in protocol2_ws:
+            try:
+                await ws.send_text(switch_msg)
+            except Exception:
+                dead.append(ws)
+        if dead:
+            async with sessions_lock:
+                for ws in dead:
+                    anim_clients.discard(ws)
+                    anim_client_protocol.pop(ws, None)
+                    old_sid = anim_client_session.pop(ws, None)
+                    if old_sid and old_sid in sessions:
+                        sessions[old_sid].anim_subscriber_count = max(
+                            0, sessions[old_sid].anim_subscriber_count - 1
+                        )
     return sid
 
 

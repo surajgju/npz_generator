@@ -532,6 +532,13 @@ function connectAnim() {
       }
       header = msg;
       if (!msg) return;
+      if (msg.type === "anim_session_switch") {
+        const sid = msg.stream_session_id || msg.session_id || currentSessionId;
+        switchSession(sid, "live_playing", "server_session_switch");
+        currentSessionId = sid;
+        if (Number.isFinite(msg.server_time_ms)) observeServerTime(msg.server_time_ms);
+        return;
+      }
       if (msg.type === "anim_subscribe_ack") {
         serverBootId = msg.server_boot_id || serverBootId;
         serverClockId = msg.server_clock_id || serverClockId;

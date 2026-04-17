@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional
 
@@ -43,7 +44,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 anim_queue: asyncio.Queue = asyncio.Queue(maxsize=int(STREAM_FPS * 10))
-audio_in_queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+AUDIO_IN_QUEUE_MAX_CHUNKS: int = int(os.environ.get("AUDIO_IN_QUEUE_MAX_CHUNKS", "512"))
+audio_in_queue: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_IN_QUEUE_MAX_CHUNKS)
 inference_lock: asyncio.Lock = asyncio.Lock()
 epoch_drop_count: int = 0
 
@@ -815,9 +817,15 @@ async def inference_worker(generator, retargeter) -> None:
     pending_samples: Dict[str, int] = defaultdict(int)
     pending_epoch: Dict[str, int] = {}
     seen_first_batch: Dict[str, bool] = defaultdict(lambda: False)
+    last_diag_log: Dict[str, float] = {}   # per-session last diagnostic log time
 
     while True:
-        item = await audio_in_queue.get()
+        try:
+            item = await audio_in_queue.get()
+        except Exception as e:
+            logger.exception("Fatal error getting from audio_in_queue: %s", e)
+            continue
+
         audio_np, sr, chunk_id, session_id, generation_epoch, source, conversation_id, reply_id = item
 
         async with sessions_lock:
@@ -838,6 +846,7 @@ async def inference_worker(generator, retargeter) -> None:
             pending_chunks.pop(session_id, None)
             pending_samples.pop(session_id, None)
             seen_first_batch[session_id] = False
+            last_diag_log.pop(session_id, None)
         pending_epoch[session_id] = generation_epoch
 
         audio_arr = np.asarray(audio_np, dtype=np.float32)
@@ -845,6 +854,16 @@ async def inference_worker(generator, retargeter) -> None:
             continue
         pending_chunks[session_id].append((chunk_id, audio_arr))
         pending_samples[session_id] += int(audio_arr.shape[0])
+
+        # Diagnostic logging every 30 seconds per session
+        now = time.time()
+        last = last_diag_log.get(session_id, 0)
+        if now - last > 30:
+            logger.info(
+                "Inference pending session=%s samples=%d chunks=%d batch_samples=%d",
+                session_id, pending_samples[session_id], len(pending_chunks[session_id]), batch_samples
+            )
+            last_diag_log[session_id] = now
 
         # Consume buffered audio in fixed-size batches.
         while pending_samples[session_id] >= batch_samples:
@@ -885,11 +904,14 @@ async def inference_worker(generator, retargeter) -> None:
                     )
             except Exception as exc:
                 logger.exception(
-                    "Inference failed for chunk %s (batched_samples=%d): %s",
-                    batch_chunk_id,
-                    int(batch_audio.shape[0]),
-                    exc,
+                    "Inference crashed for session=%s chunk=%s (batched_samples=%d): %s",
+                    session_id, batch_chunk_id, int(batch_audio.shape[0]), exc
                 )
+                # Reset this session's pending buffers to recover
+                pending_chunks.pop(session_id, None)
+                pending_samples.pop(session_id, None)
+                seen_first_batch[session_id] = False
+                last_diag_log.pop(session_id, None)
                 continue
 
             if not coeffs:
@@ -900,7 +922,6 @@ async def inference_worker(generator, retargeter) -> None:
                 continue
 
             if not seen_first_batch[session_id]:
-                # Defensive: first batch marker should already be true.
                 seen_first_batch[session_id] = True
 
             # First emitted chunk for a stream: reset root offset.
@@ -923,12 +944,10 @@ async def inference_worker(generator, retargeter) -> None:
                 trans = _resample_frames_linear(trans, target_count)
 
                 # Resample poses using SLERP on quaternions
-                # poses shape: (frames_count, joint_count*3) axis-angle
                 joint_count = poses.shape[1] // 3
                 poses_aa = poses.reshape(frames_count, joint_count, 3)
-                poses_quat = axis_angle_to_quat(poses_aa)          # (frames, joints, 4)
+                poses_quat = axis_angle_to_quat(poses_aa)
 
-                # Build index mapping for SLERP
                 src_idx = np.linspace(0, frames_count - 1, target_count)
                 new_quats = []
                 for i in range(target_count):
@@ -939,9 +958,8 @@ async def inference_worker(generator, retargeter) -> None:
                     q_high = poses_quat[high]
                     q_interp = slerp_quat(q_low, q_high, t)
                     new_quats.append(q_interp)
-                new_poses_quat = np.stack(new_quats, axis=0)       # (target, joints, 4)
-                # Convert back to axis-angle
-                new_poses_aa = quat_to_axis_angle(new_poses_quat)  # (target, joints, 3)
+                new_poses_quat = np.stack(new_quats, axis=0)
+                new_poses_aa = quat_to_axis_angle(new_poses_quat)
                 poses = new_poses_aa.reshape(target_count, -1)
                 frames_count = target_count
             # --------------------------------------------------------------
@@ -991,7 +1009,6 @@ async def inference_worker(generator, retargeter) -> None:
                 "Enqueued %d anim frames (session=%s queue=%d fps=%d chunk=%s)",
                 frames_count, session_id, anim_queue.qsize(), STREAM_FPS, batch_chunk_id,
             )
-            
 def _log_inference_stats(
     retargeter, chunk_id, session_id, frames_count,
     poses, expressions, morphs, root_pos,

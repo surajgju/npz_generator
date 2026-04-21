@@ -1,3 +1,4 @@
+from utils.animation_smoothing import EMAFilter, blend_chunks, FramePacer
 import argparse
 import os
 import re

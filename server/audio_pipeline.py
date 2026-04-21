@@ -51,7 +51,7 @@ FLUSH_REASON_IDLE_TIMEOUT = "idle_timeout"
 # ---------------------------------------------------------------------------
 
 anim_queue: asyncio.Queue = asyncio.Queue(maxsize=int(STREAM_FPS * 10))
-AUDIO_IN_QUEUE_MAX_CHUNKS: int = 128
+AUDIO_IN_QUEUE_MAX_CHUNKS: int = int(os.environ.get("AUDIO_IN_QUEUE_MAX_CHUNKS", "16"))
 audio_in_queue: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_IN_QUEUE_MAX_CHUNKS)
 epoch_drop_count: int = 0
 

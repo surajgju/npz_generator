@@ -10,6 +10,16 @@ import logging
 import os
 from typing import Dict, Union
 
+try:
+    from dotenv import load_dotenv
+    # Look for .env.local in the current dir or 'server' dir
+    if os.path.exists(".env.local"):
+        load_dotenv(".env.local")
+    elif os.path.exists("server/.env.local"):
+        load_dotenv("server/.env.local")
+except ImportError:
+    pass
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)

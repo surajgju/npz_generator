@@ -24,7 +24,7 @@ Raw model outputs are normalized and mapped in `server/retargeter.py` using para
   - Pose channels use quaternion **SLERP** interpolation in `audio_pipeline.py` (axis-angle -> quaternion -> SLERP -> axis-angle) to avoid rotation ghosting artifacts.
   - Expressions and root translation still use `_resample_frames_linear`.
 - **Slow-Motion Debugging**: A `SLOW_MOTION_FACTOR` can be applied to stretch the animation in time (e.g., 5.0 for 5x slower) while maintaining a steady broadcast rate, allowing for frame-by-frame irregularity analysis.
-- **Inference Ingress Buffering**: `audio_in_queue` is sized by `AUDIO_IN_QUEUE_MAX_CHUNKS` (default `512`) to absorb bursty Gemini Live chunk delivery and reduce dropped pre-inference chunks.
+- **Inference Ingress Buffering**: `audio_in_queue` is sized by `AUDIO_IN_QUEUE_MAX_CHUNKS` (default `16`, configurable via `.env.local`) to bound maximum animation latency and prevent backlog accumulation if the inference worker lags.
 
 ## 3. Frontend Architecture & Synchronization
 The WebGL frontend (Three.js) is designed for low-latency visual stability and reconnect recovery.
@@ -150,7 +150,7 @@ The backend is split into specialized modules for scalability and maintainabilit
   - `STALL_HOLD_MS=300`, `STALL_EASE_MS=700`
   - `STALL_IDLE_BLEND_MS=1200`
   - `SESSION_MISMATCH_GRACE_MS=1200`
-  - `AUDIO_IN_QUEUE_MAX_CHUNKS=512`
+  - `AUDIO_IN_QUEUE_MAX_CHUNKS=16`
 - **Handled Edge Cases**:
   - Snapshot end behind live audio: worker seeds playhead to audio/live edge immediately.
   - No live frame after snapshot: tail lock timeout -> `resync_request`.

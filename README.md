@@ -173,20 +173,30 @@ flowchart TD
 
 ## 🛠️ Advanced Configuration
 
-Fine-tune your animation quality via CLI or config files:
+The entire pipeline is highly configurable via **`server/.env.local`**. All essential parameters for performance, logic, and visual stability are centralized here.
 
-- **Signal Processing**:
-  - `expression_target`: Scales facial PCA coefficients for quiet audio.
-  - `expression_smooth_alpha`: Alpha value for EMA smoothing (default: `1.0`).
-- **Pipeline Performance**:
-  - `overlap_sec`: Controls chunk overlap for seamless motion blending (default: `0.25s`).
-  - `STREAM_FPS`: Sets the target animation rate for real-time vertex streaming (default: `20`).
-- **Session/Recovery**:
-  - `SNAPSHOT_SECONDS` (default: `3.0`)
-  - `MAX_SESSIONS` (default: `8`)
-  - `SESSION_IDLE_TTL_MS` (default: `45000`)
-  - `DEPRECATED_TTL_MS` (default: `15000`)
-  - `SESSION_GC_INTERVAL_MS` (default: `5000`)
+### 1. Performance & Inference Tuning
+- **`STREAM_FPS`**: Sets the target animation rate for real-time vertex streaming (default: `30`).
+- **`INFERENCE_BATCH_SAMPLES`**: Controls how many audio samples are processed per inference step (default: `3200`). Lower values reduce latency; higher values increase CPU throughput.
+- **`AUDIO_IN_QUEUE_MAX_CHUNKS`**: Bounds the maximum backlog of audio waiting for inference (default: `16`). This prevents massive animation lag by dropping stale chunks.
+- **`DEFAULT_OVERLAP_SEC`**: Controls chunk overlap for seamless motion blending (default: `0.25s`).
+
+### 2. Signal & Retargeting Defaults
+- **`EXPRESSION_MAX_ABS`, `MOUTH_MAX_ABS`, `EYE_BROW_MAX_ABS`**: Safety ceilings for facial morph targets.
+- **`EXPRESSION_TARGET`, `EXPRESSION_GAIN_MAX`**: Control the intensity and automatic gain scaling for facial expressions.
+
+### 3. Session & GC Management
+- **`SNAPSHOT_SECONDS`**: (default: `3.0`)
+- **`MAX_SESSIONS`**: (default: `8`)
+- **`SESSION_IDLE_TTL_MS`**: (default: `45000`)
+- **`SESSION_GC_INTERVAL_MS`**: (default: `5000`)
+
+### 4. Frontend Playback (Vite Environment)
+- **`VITE_SESSION_MISMATCH_GRACE_MS`**: (default: `1200`)
+- **`VITE_AUDIO_START_BUFFER_SEC`**: (default: `0.4`)
+- **`VITE_STALL_IDLE_BLEND_MS`**: (default: `2200`)
+
+To apply changes, simply edit `server/.env.local` and restart the server.
 
 ### Reconnect & Stall Defaults (Implemented)
 - `STREAM_FPS=20`

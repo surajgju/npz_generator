@@ -153,7 +153,7 @@ The backend is split into specialized modules for scalability and maintainabilit
 
 ## 9. Operational Defaults and Edge Cases
 - **Defaults**:
-  - `STREAM_FPS=20`
+  - `STREAM_FPS=30`
   - `SNAPSHOT_SECONDS=3.0` (`SNAPSHOT_FRAMES=ceil(3.0*STREAM_FPS)`)
   - `MAX_TAIL_LOCK_MS=3000`
   - `STARTUP_SUPPRESS_MS=4000`

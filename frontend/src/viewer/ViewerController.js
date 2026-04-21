@@ -21,6 +21,13 @@ let conversationSessionEl = null;
 let playStateEl = null;
 let lodLevelEl = null;
 let bufferFillEl = null;
+let transportAgeEl = null;
+let inputWaitEl = null;
+let inferMsEl = null;
+let resampleMsEl = null;
+let retargetMsEl = null;
+let outputWaitEl = null;
+let flushReasonEl = null;
 let fitViewBtn = null;
 let viewFaceBtn = null;
 let viewFrontBtn = null;
@@ -1165,7 +1172,8 @@ function exposeViewerDebug() {
 }
 
 const NORMAL_EVERY = 15;
-let streamFps = 20;
+let streamFps = null;
+let streamFpsReady = false;
 let maxBufferSeconds = 10;
 
 let currentFrameIndex = 0;
@@ -1182,7 +1190,7 @@ let transformControls = null;
 let gizmoAnchor = null;
 let isDragging = false;
 let lastRateTime = performance.now();
-let currentPlayFps = streamFps;
+let currentPlayFps = 0;
 
 let audioCtx = null;
 let audioEnabled = false;
@@ -1205,10 +1213,10 @@ let animOffsetSec = 0;
 let animOffsetSet = false;
 const AUDIO_JITTER_SEC = 0.08;
 const AUDIO_START_LEAD_SEC = Number(import.meta.env.VITE_AUDIO_START_LEAD_SEC || 0.03);
-const AUDIO_START_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_START_BUFFER_SEC || 0.18);
-const MESH_START_BUFFER_SEC = Number(import.meta.env.VITE_MESH_START_BUFFER_SEC || 0.18);
-const AUDIO_LOW_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_LOW_BUFFER_SEC || 0.12);
-const SESSION_MISMATCH_GRACE_MS = Number(import.meta.env.VITE_SESSION_MISMATCH_GRACE_MS || 1200);
+const AUDIO_START_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_START_BUFFER_SEC || 0.4);
+const MESH_START_BUFFER_SEC = Number(import.meta.env.VITE_MESH_START_BUFFER_SEC || 0.25);
+const AUDIO_LOW_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_LOW_BUFFER_SEC || 0.25);
+const SESSION_MISMATCH_GRACE_MS = Number(import.meta.env.VITE_SESSION_MISMATCH_GRACE_MS || 3000);
 const STARTUP_SUPPRESS_MS = 4000;
 const STALL_HOLD_MS = 300;
 const STALL_EASE_MS = 700;
@@ -1230,6 +1238,7 @@ let workerLiveDropped = 0;
 let workerResyncSkipped = 0;
 let workerInFps = 0;
 let workerPlaybackFps = 0;
+let workerTiming = null;
 let frameDirty = false;
 let heldFrameData = null;
 let lagIdleBlend = 0;
@@ -1668,11 +1677,11 @@ function initMorphDebugPanel() {
 }
 
 function applyAnimInit(msg) {
-  streamFps = msg.streamFps || streamFps;
+  updateStreamFpsState(msg.streamFps);
   if (Number.isFinite(msg.bufferSeconds)) {
     maxBufferSeconds = msg.bufferSeconds;
   }
-  streamFpsEl.textContent = `${streamFps}`;
+  streamFpsEl.textContent = hasReadyStreamFps() ? `${streamFps}` : "-";
   if (msg.blink) {
     if (Array.isArray(msg.blink.intervalSec)) {
       idleConfig.blink.intervalSec = msg.blink.intervalSec.map((v) => Number(v));
@@ -1903,12 +1912,19 @@ function initWorker() {
     worker = null;
   }
   pipelineModeEl.textContent = "Worker";
+  streamFps = null;
+  streamFpsReady = false;
+  workerTiming = null;
+  currentPlayFps = 0;
   worker = new Worker(new URL("./anim_worker.js", import.meta.url), { type: "module" });
   startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
   const known = loadKnownSessionState();
   worker.onmessage = (event) => {
     const msg = event.data;
     if (msg.type === "init") {
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
+      workerReady = true;
       if (avatarLoaded) {
         applyAnimInit(msg);
       } else {
@@ -1920,8 +1936,10 @@ function initWorker() {
         if (DEBUG) warn("Dropping out-of-order frame", { incomingIndex, lastWorkerFrameIndexSeen });
         return;
       }
-      streamFps = msg.streamFps || streamFps;
-      streamFpsEl.textContent = `${streamFps}`;
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
+      streamFpsEl.textContent = hasReadyStreamFps() ? `${streamFps}` : "-";
+      updateWorkerTiming(msg.timing);
       workerQueueLen = msg.queueLen ?? workerQueueLen;
       workerSnapshotDropped = msg.snapshotDropCount ?? workerSnapshotDropped;
       workerLiveDropped = msg.liveDropCount ?? workerLiveDropped;
@@ -1949,6 +1967,8 @@ function initWorker() {
         tryStartPlayback();
       }
     } else if (msg.type === "handshake") {
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
       if (msg.sessionId) workerSessionId = msg.sessionId;
       clearMismatchIfAligned();
       if (msg.serverBootId) serverBootId = msg.serverBootId;
@@ -1975,6 +1995,7 @@ function initWorker() {
       if (DEBUG) warn("Worker requested resync", msg);
     } else if (msg.type === "session_switch") {
       if (msg.sessionId) workerSessionId = msg.sessionId;
+      workerTiming = null;
       heldFrameData = null;
       lagIdleBlend = 0;
       lagIdleStarted = false;
@@ -1984,10 +2005,12 @@ function initWorker() {
       startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
       persistKnownSessionState();
     } else if (msg.type === "status") {
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
+      updateWorkerTiming(msg.timing);
       if (msg.status === "connected") {
         statusEl.textContent = "Connected";
         pipelineModeEl.textContent = "Worker";
-        workerReady = true;
         workerAlive = true;
         resyncing = false;
         if (workerFallbackTimer) {
@@ -2001,6 +2024,7 @@ function initWorker() {
         sessionStorage.removeItem("viewer_known_session_id");
         sessionStorage.removeItem("viewer_last_applied_frame");
         workerSessionId = null;
+        workerTiming = null;
         pipelineModeEl.textContent = "Resync";
         statusEl.textContent = "Resyncing";
         workerAlive = false;
@@ -2020,6 +2044,7 @@ function initWorker() {
         pipelineModeEl.textContent = "Error";
         statusEl.textContent = "Disconnected";
         workerAlive = false;
+        workerTiming = null;
         if (audioCtx) {
           audioCtx.suspend();
         }
@@ -2030,7 +2055,9 @@ function initWorker() {
       workerSnapshotDropped = msg.snapshotDropCount ?? workerSnapshotDropped;
       workerLiveDropped = msg.liveDropCount ?? workerLiveDropped;
       workerResyncSkipped = msg.resyncSkipped ?? workerResyncSkipped;
-      streamFps = msg.streamFps || streamFps;
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
+      updateWorkerTiming(msg.timing);
       workerMaxIndex = Number.isFinite(msg.maxIndex) ? msg.maxIndex : workerMaxIndex;
       workerMinIndex = Number.isFinite(msg.minIndexEstimate) ? msg.minIndexEstimate : workerMinIndex;
       if (msg.sessionId) workerSessionId = msg.sessionId;
@@ -2051,7 +2078,9 @@ function initWorker() {
             resyncSkipped: workerResyncSkipped,
             maxIndex: msg.maxIndex,
             minIndex: msg.minIndexEstimate,
-            streamFps,
+            streamFps: hasReadyStreamFps() ? streamFps : "-",
+            transportagems: workerTiming?.transportagems ?? "-",
+            infer_ms: workerTiming?.infer_ms ?? "-",
             state: msg.playbackState,
             sessionId: workerSessionId,
           },
@@ -2308,7 +2337,50 @@ function audioBufferedSeconds() {
   return Math.max(0, audioScheduledTime - audioCtx.currentTime);
 }
 
+function hasReadyStreamFps() {
+  return Number.isFinite(streamFps) && streamFps > 0;
+}
+
+function updateStreamFpsState(nextFps) {
+  if (Number.isFinite(nextFps) && nextFps > 0) {
+    streamFps = nextFps;
+    streamFpsReady = true;
+  }
+}
+
+function getDisplayFrameBudgetMs() {
+  return hasReadyStreamFps() ? 1000 / streamFps : 50;
+}
+
+function formatMetric(value, suffix = "", digits = 1) {
+  if (!Number.isFinite(value)) return "-";
+  return `${Number(value).toFixed(digits)}${suffix}`;
+}
+
+function updateWorkerTiming(timing) {
+  if (!timing || typeof timing !== "object") return;
+  workerTiming = { ...(workerTiming || {}), ...timing };
+}
+
+function updateInferBudgetColor() {
+  if (!inferMsEl) return;
+  const inferMs = Number(workerTiming?.infer_ms);
+  if (!Number.isFinite(inferMs)) {
+    inferMsEl.style.color = "";
+    return;
+  }
+  const frameBudgetMs = getDisplayFrameBudgetMs();
+  if (inferMs <= 0.75 * frameBudgetMs) {
+    inferMsEl.style.color = "#4ade80";
+  } else if (inferMs <= frameBudgetMs) {
+    inferMsEl.style.color = "#facc15";
+  } else {
+    inferMsEl.style.color = "#f87171";
+  }
+}
+
 function meshBufferedSeconds() {
+  if (!hasReadyStreamFps()) return 0;
   return workerQueueLen / streamFps;
 }
 
@@ -2409,6 +2481,7 @@ function beginSessionRecovery(reason) {
   workerMaxIndex = -1;
   workerMinIndex = -1;
   workerQueueLen = 0;
+  workerTiming = null;
   frameDirty = false;
   lagIdleBlend = 0;
   lagIdleStarted = false;
@@ -2425,6 +2498,7 @@ function beginSessionRecovery(reason) {
 }
 
 function computeAnimOffsetSec() {
+  if (!hasReadyStreamFps()) return 0;
   if (workerMinIndex >= 0) {
     return workerMinIndex / streamFps;
   }
@@ -2451,14 +2525,15 @@ function maybeSetAnimOffset() {
 }
 
 function computePlaybackFps(bufferSec) {
+  if (!hasReadyStreamFps()) return 0;
   const maxFps = streamFps;
   const minFps = Math.max(8, streamFps * 0.85);
   const t = Math.min(1, Math.max(0, (bufferSec - 0.5) / 3.5));
   return minFps + t * (maxFps - minFps);
 }
 
-function computeWorkerTickElapsed(nowMs) {
-  if (audioStarted && audioCtx && audioStartTime !== null) {
+function computeWorkerTickElapsed(nowMs, useMonotonicFallback = false) {
+  if (!useMonotonicFallback && audioStarted && audioCtx && audioStartTime !== null) {
     maybeSetAnimOffset();
     const synced = Math.max(0, audioCtx.currentTime - audioStartTime + animOffsetSec);
     fallbackTickElapsedSec = Math.max(fallbackTickElapsedSec, synced);
@@ -2476,6 +2551,7 @@ function computeWorkerTickElapsed(nowMs) {
 
 function tryStartPlayback() {
   if (audioStarted || !audioEnabled || !audioCtx) return;
+  if (!streamFpsReady || !workerReady) return;
   if (resyncing || hasSessionMismatch()) return;
   const meshBuf = Math.max(workerQueueLen / streamFps, (workerMaxIndex + 1) / streamFps);
   const audioBuf = audioQueuedSec;
@@ -2515,6 +2591,11 @@ function updatePlaybackFrameWorker() {
     }
     return;
   }
+  if (!streamFpsReady) {
+    currentPlayFps = 0;
+    playStateEl.textContent = "awaiting_init";
+    return;
+  }
   if (manualPaused) {
     playStateEl.textContent = "paused";
     return;
@@ -2524,7 +2605,9 @@ function updatePlaybackFrameWorker() {
     // return;
   }
   tryStartPlayback();
-  const elapsed = computeWorkerTickElapsed(nowMs);
+  const audioBuf = audioBufferedSeconds();
+  const useMonotonicFallback = audioBuf < AUDIO_LOW_BUFFER_SEC;
+  const elapsed = computeWorkerTickElapsed(nowMs, useMonotonicFallback);
   if (worker) {
     worker.postMessage({ type: "tick", elapsed });
   }
@@ -2532,9 +2615,12 @@ function updatePlaybackFrameWorker() {
     playStateEl.textContent = "buffering";
     return;
   }
-  if (audioBufferedSeconds() < AUDIO_LOW_BUFFER_SEC) {
+  if (resyncing || hasSessionMismatch()) {
+    playStateEl.textContent = "resyncing";
+  } else if (audioBuf < AUDIO_LOW_BUFFER_SEC) {
     playStateEl.textContent = "holding";
-    return;
+  } else {
+    playStateEl.textContent = "playing";
   }
   if (elapsed < 0) {
     playStateEl.textContent = "buffering";
@@ -2553,7 +2639,6 @@ function updatePlaybackFrameWorker() {
     }
     frameDirty = false;
     playCount += 1;
-    playStateEl.textContent = "playing";
     lastFrameUpdate = nowMs;
     stallSinceMs = null;
   } else if (heldFrameData) {
@@ -2605,7 +2690,7 @@ function updatePlaybackFrameWorker() {
   }
   const bufferSec = meshBufferedSeconds();
   currentPlayFps = computePlaybackFps(bufferSec);
-  if (workerMaxIndex >= 0) {
+  if (streamFpsReady && workerMaxIndex >= 0) {
     const audioFrame = Math.floor(elapsed * streamFps);
     const drift = audioFrame - workerMaxIndex;
     const allowResync = bufferSec < 2.0;
@@ -2654,9 +2739,17 @@ function updateHud() {
   queueLenEl.textContent = `${workerQueueLen}`;
   const displayPlayFps = currentPlayFps;
   playFpsEl.textContent = `${Math.round(displayPlayFps)}`;
-  streamFpsEl.textContent = `${streamFps}`;
+  streamFpsEl.textContent = hasReadyStreamFps() ? `${streamFps}` : "-";
   audioBufferEl.textContent = `${audioBufferedSeconds().toFixed(1)}s`;
   bufferFillEl.style.width = `${Math.min(100, (bufferSec / maxBufferSeconds) * 100)}%`;
+  if (transportAgeEl) transportAgeEl.textContent = formatMetric(Number(workerTiming?.transportagems), "ms", 1);
+  if (inputWaitEl) inputWaitEl.textContent = formatMetric(Number(workerTiming?.inputqueuewait_ms), "ms", 1);
+  if (inferMsEl) inferMsEl.textContent = formatMetric(Number(workerTiming?.infer_ms), "ms", 1);
+  if (resampleMsEl) resampleMsEl.textContent = formatMetric(Number(workerTiming?.resample_ms), "ms", 1);
+  if (retargetMsEl) retargetMsEl.textContent = formatMetric(Number(workerTiming?.retarget_ms), "ms", 1);
+  if (outputWaitEl) outputWaitEl.textContent = formatMetric(Number(workerTiming?.outputqueuewait_ms), "ms", 1);
+  if (flushReasonEl) flushReasonEl.textContent = workerTiming?.flush_reason || "-";
+  updateInferBudgetColor();
   if (DEBUG) {
     const now = performance.now();
     if (now - lastDebugSummary > 1000) {
@@ -2668,9 +2761,16 @@ function updateHud() {
           pipeline: pipelineModeEl.textContent,
           bufferSec: bufferSec.toFixed(2),
           queueLen: workerQueueLen,
+          transportagems: workerTiming?.transportagems ?? "-",
           inFps: inFpsEl.textContent,
           outFps: outFpsEl.textContent,
-          streamFps,
+          streamFps: hasReadyStreamFps() ? streamFps : "-",
+          inputqueuewait_ms: workerTiming?.inputqueuewait_ms ?? "-",
+          infer_ms: workerTiming?.infer_ms ?? "-",
+          resample_ms: workerTiming?.resample_ms ?? "-",
+          retarget_ms: workerTiming?.retarget_ms ?? "-",
+          outputqueuewait_ms: workerTiming?.outputqueuewait_ms ?? "-",
+          flush_reason: workerTiming?.flush_reason ?? "-",
           audioBuf: audioBufferedSeconds().toFixed(2),
           audioStarted,
           workerReady,
@@ -3057,6 +3157,13 @@ function collectDom() {
   playStateEl = document.getElementById("playState");
   lodLevelEl = document.getElementById("lodLevel");
   bufferFillEl = document.getElementById("bufferFill");
+  transportAgeEl = document.getElementById("transportAge");
+  inputWaitEl = document.getElementById("inputWait");
+  inferMsEl = document.getElementById("inferMs");
+  resampleMsEl = document.getElementById("resampleMs");
+  retargetMsEl = document.getElementById("retargetMs");
+  outputWaitEl = document.getElementById("outputWait");
+  flushReasonEl = document.getElementById("flushReason");
   fitViewBtn = document.getElementById("fitView");
   viewFaceBtn = document.getElementById("viewFace");
   viewFrontBtn = document.getElementById("viewFront");

@@ -24,7 +24,7 @@ function App() {
       },
       {
         label: "Start WebSocket Server",
-        cmd: "STREAM_FPS=15 ./venv/bin/python -m uvicorn server.app:app --reload --port 8000",
+        cmd: "./venv/bin/python -m uvicorn server.app:app --reload --port 8000",
       },
       {
         label: "Stream Audio (Simulator)",
@@ -81,6 +81,10 @@ function App() {
           <span>Status</span>
           <span id="status">Connecting...</span>
         </div>
+        <div className="row section-title">
+          <span>Pipeline</span>
+          <span></span>
+        </div>
         <div className="row">
           <span>Buffer</span>
           <span id="bufferSec">0.0s</span>
@@ -102,11 +106,11 @@ function App() {
         </div>
         <div className="row">
           <span>Play FPS</span>
-          <span id="playFps">30</span>
+          <span id="playFps">0</span>
         </div>
         <div className="row">
           <span>Stream FPS</span>
-          <span id="streamFps">20</span>
+          <span id="streamFps">-</span>
         </div>
         <div className="row">
           <span>Pipeline</span>
@@ -135,8 +139,40 @@ function App() {
           <span id="playState">buffering</span>
         </div>
         <div className="row">
+          <span>Transport Age</span>
+          <span id="transportAge">-</span>
+        </div>
+        <div className="row">
           <span>LOD</span>
           <span id="lodLevel">LOD0</span>
+        </div>
+        <div className="row section-title">
+          <span>Backend</span>
+          <span></span>
+        </div>
+        <div className="row">
+          <span>Input Wait</span>
+          <span id="inputWait">-</span>
+        </div>
+        <div className="row">
+          <span>Infer</span>
+          <span id="inferMs">-</span>
+        </div>
+        <div className="row">
+          <span>Resample</span>
+          <span id="resampleMs">-</span>
+        </div>
+        <div className="row">
+          <span>Retarget</span>
+          <span id="retargetMs">-</span>
+        </div>
+        <div className="row">
+          <span>Output Wait</span>
+          <span id="outputWait">-</span>
+        </div>
+        <div className="row">
+          <span>Flush Reason</span>
+          <span id="flushReason">-</span>
         </div>
         <div className="row section-title">
           <span>Expressions</span>

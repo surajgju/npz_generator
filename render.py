@@ -13,6 +13,7 @@ from scipy.spatial.transform import Rotation as R
 
 from npz_logging import setup_logging
 from server.retargeter import SmplxRetargeter
+from streamsettings import DEFAULT_RENDER_FPS
 import logging
 
 setup_logging()
@@ -423,7 +424,7 @@ def parse_args() -> RenderConfig:
     parser.add_argument("--output", default=DEFAULT_OUTPUT_PATH, help="Output MP4 path.")
     parser.add_argument("--width", type=int, default=1024, help="Output width.")
     parser.add_argument("--height", type=int, default=1024, help="Output height.")
-    parser.add_argument("--fps", type=int, default=30, help="Output FPS.")
+    parser.add_argument("--fps", type=int, default=DEFAULT_RENDER_FPS, help="Output FPS.")
     parser.add_argument("--camera", choices=["full", "body", "face"], default="body", help="Camera framing mode.")
     parser.add_argument("--camera-smooth", type=float, default=0.2, help="0-1 camera smoothing factor.")
     parser.add_argument("--camera-distance", type=float, default=None, help="Override camera distance.")

@@ -16,14 +16,14 @@ from typing import Deque, Dict, List, Optional, Tuple
 import sys
 import numpy as np
 from fastapi import WebSocket
+from streamsettings import BASE_MOTION_FPS, STREAM_FPS
 
 # ---------------------------------------------------------------------------
 # Config (read once at import time so every module shares the same values)
 # ---------------------------------------------------------------------------
 
-STREAM_FPS: int = int(os.environ.get("STREAM_FPS", "20"))
 SLOW_MOTION_FACTOR: float = float(os.environ.get("SLOW_MOTION_FACTOR", "1.0"))
-BASE_FPS: int = 30
+BASE_FPS: int = BASE_MOTION_FPS
 SNAPSHOT_SECONDS: float = float(os.environ.get("SNAPSHOT_SECONDS", "3.0"))
 SNAPSHOT_FRAMES: int = int(math.ceil(SNAPSHOT_SECONDS * STREAM_FPS))
 MAX_SESSIONS: int = int(os.environ.get("MAX_SESSIONS", "8"))

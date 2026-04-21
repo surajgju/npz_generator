@@ -7,6 +7,7 @@ import librosa
 from typing import Optional, Dict
 import logging
 from npz_logging import setup_logging
+from streamsettings import BASE_MOTION_FPS, DEFAULT_OVERLAP_SEC
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ class LiveMotionGenerator:
     Streaming-ready generator that accepts audio chunks and returns SMPL-X coefficients.
     Models are loaded once and kept on device to avoid cold starts.
     """
-    def __init__(self, device=None, model_folder="./models/", overlap_sec: float = 0.25):
+    def __init__(self, device=None, model_folder="./models/", overlap_sec: float = DEFAULT_OVERLAP_SEC):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info("Initializing LiveMotionGenerator on %s...", self.device)
 
@@ -55,7 +56,11 @@ class LiveMotionGenerator:
         self._prev_last_pose: Optional[np.ndarray] = None
         self._prev_last_expr: Optional[np.ndarray] = None
         self._prev_last_trans: Optional[np.ndarray] = None
-        self.target_fps = 30
+        self.target_fps = BASE_MOTION_FPS
+        self.last_process_timings = {
+            "infer_ms": 0.0,
+            "resample_ms": 0.0,
+        }
 
         logger.info("Generator ready. Audio SR: %s, Pose FPS: %s", self.sr, self.pose_fps)
 
@@ -73,20 +78,35 @@ class LiveMotionGenerator:
             audio_chunk = librosa.resample(audio_chunk, orig_sr=sample_rate, target_sr=self.sr)
         return audio_chunk
 
-    def process_audio_chunk(self, audio_chunk: np.ndarray, sample_rate: int, chunk_id: Optional[str] = None) -> Optional[Dict[str, np.ndarray]]:
+    def process_audio_chunk(
+        self,
+        audio_chunk: np.ndarray,
+        sample_rate: int,
+        chunk_id: Optional[str] = None,
+        overlap_source_audio: Optional[np.ndarray] = None,
+    ) -> Optional[Dict[str, np.ndarray]]:
         """
         Convert a short audio chunk into SMPL-X coefficients.
-        Returns dict with poses/expressions/trans at 30 FPS.
+        Returns dict with poses/expressions/trans at the configured base motion FPS.
         """
         audio_chunk = self._prepare_audio(audio_chunk, sample_rate)
         if len(audio_chunk) == 0:
             logger.warning("Chunk %s: empty audio after prepare", chunk_id)
             return None
+        if overlap_source_audio is None:
+            overlap_source = audio_chunk
+        else:
+            overlap_source = self._prepare_audio(overlap_source_audio, sample_rate)
+            if len(overlap_source) == 0:
+                overlap_source = audio_chunk
 
         overlap_samples = int(self.overlap_sec * self.sr)
         has_prev = self._prev_overlap is not None and len(self._prev_overlap) > 0
         if has_prev:
             audio_chunk = np.concatenate([self._prev_overlap, audio_chunk], axis=0)
+            overlap_history = np.concatenate([self._prev_overlap, overlap_source], axis=0)
+        else:
+            overlap_history = overlap_source
         logger.debug(
             "Chunk %s: audio_len=%.3fs (samples=%d) overlap_sec=%.3f has_prev=%s",
             chunk_id,
@@ -96,13 +116,14 @@ class LiveMotionGenerator:
             has_prev,
         )
 
-        if overlap_samples > 0 and len(audio_chunk) >= overlap_samples:
-            self._prev_overlap = audio_chunk[-overlap_samples:].copy()
+        if overlap_samples > 0 and len(overlap_history) >= overlap_samples:
+            self._prev_overlap = overlap_history[-overlap_samples:].copy()
         else:
-            self._prev_overlap = audio_chunk.copy()
+            self._prev_overlap = overlap_history.copy()
 
         audio_ts = torch.from_numpy(audio_chunk).float().to(self.device).unsqueeze(0)
 
+        infer_started_ns = time.perf_counter_ns()
         with torch.no_grad():
             trans_zero = torch.zeros(1, 1, 3).to(self.device)
             latent_dict = self.model.inference(audio_ts, self.speaker_id, self.motion_vq, masked_motion=None, mask=None)
@@ -129,6 +150,7 @@ class LiveMotionGenerator:
                 get_global_motion=True,
                 ref_trans=trans_zero[:, 0],
             )
+        infer_ms = (time.perf_counter_ns() - infer_started_ns) / 1_000_000.0
 
         motion_pred = all_pred["motion_axis_angle"]
         t = motion_pred.shape[1]
@@ -136,12 +158,18 @@ class LiveMotionGenerator:
         face_pred = all_pred["expression"].cpu().numpy().reshape(t, -1)
         trans_pred = all_pred["trans"].cpu().numpy().reshape(t, -1)
 
-        upsample = 30 // self.pose_fps
+        resample_started_ns = time.perf_counter_ns()
+        upsample = BASE_MOTION_FPS // self.pose_fps
         if upsample > 1:
             from emage_utils.motion_io import time_upsample_numpy
             motion_pred = time_upsample_numpy(motion_pred, upsample)
             face_pred = time_upsample_numpy(face_pred, upsample)
             trans_pred = time_upsample_numpy(trans_pred, upsample)
+        resample_ms = (time.perf_counter_ns() - resample_started_ns) / 1_000_000.0
+        self.last_process_timings = {
+            "infer_ms": infer_ms,
+            "resample_ms": resample_ms,
+        }
 
         overlap_frames = int(round(self.overlap_sec * self.target_fps))
         if has_prev and overlap_frames > 0 and overlap_frames < motion_pred.shape[0]:

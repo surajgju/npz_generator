@@ -163,7 +163,7 @@ flowchart TD
 | Directory/File | Description |
 | :--- | :--- |
 | `frontend/` | React + Three.js application source code. |
-| `web/` | Target for frontend build. Served by FastAPI. |
+| `frontend/dist/` | Frontend build output. |
 | `server/` | **Modularized Backend**: `app.py` (coordinator), `session.py` (state), `audio_pipeline.py` (ML/Audio), `conversation.py` (PTT). |
 | `emage_utils/` | Core EMAGE model implementation and VQ-VAE utils. |
 | `scripts/` | Export utilities and audio streaming simulators. |

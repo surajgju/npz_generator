@@ -13,14 +13,18 @@ import asyncio
 import importlib
 import json
 import logging
+import multiprocessing as mp
 import os
 import re
+import queue as queue_module
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 from fastapi import WebSocket
+from streamsettings import DEFAULT_INFERENCE_BATCH_SAMPLES, DEFAULT_OVERLAP_SEC
 
 from . import session as session_state
 from .session import (
@@ -39,15 +43,31 @@ from .session import (
 
 logger = logging.getLogger(__name__)
 
+FLUSH_REASON_BATCH_COMPLETE = "batch_complete"
+FLUSH_REASON_IDLE_TIMEOUT = "idle_timeout"
+
 # ---------------------------------------------------------------------------
 # Shared queues and concurrency primitives
 # ---------------------------------------------------------------------------
 
 anim_queue: asyncio.Queue = asyncio.Queue(maxsize=int(STREAM_FPS * 10))
-AUDIO_IN_QUEUE_MAX_CHUNKS: int = int(os.environ.get("AUDIO_IN_QUEUE_MAX_CHUNKS", "512"))
+AUDIO_IN_QUEUE_MAX_CHUNKS: int = 128
 audio_in_queue: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_IN_QUEUE_MAX_CHUNKS)
-inference_lock: asyncio.Lock = asyncio.Lock()
 epoch_drop_count: int = 0
+
+
+@dataclass
+class InferenceProcessService:
+    input_queue: Any
+    output_queue: Any
+    control_queue: Any
+    stop_event: Any
+    ready_event: Any
+    process: mp.Process
+    batch_samples: int
+    overlap_sec: float
+    retarget_map_path: str
+    startup_timeout_sec: float
 
 # ---------------------------------------------------------------------------
 # Gemini Live Audio Engine
@@ -570,17 +590,19 @@ async def ingest_audio_chunk(
             stream_session_id, chunk_id, sample_count, len(audio_clients), source,
         )
 
+    enqueue_monotonic_ns = time.monotonic_ns()
     try:
         audio_in_queue.put_nowait((
             audio_np, sr, chunk_id, stream_session_id,
-            generation_epoch, source, conversation_id, reply_id,
+            generation_epoch, source, conversation_id, reply_id, enqueue_monotonic_ns,
         ))
     except asyncio.QueueFull:
         try:
             old = audio_in_queue.get_nowait()
+            enqueue_monotonic_ns = time.monotonic_ns()
             audio_in_queue.put_nowait((
                 audio_np, sr, chunk_id, stream_session_id,
-                generation_epoch, source, conversation_id, reply_id,
+                generation_epoch, source, conversation_id, reply_id, enqueue_monotonic_ns,
             ))
             logger.warning(
                 "Audio queue full; dropped oldest chunk %s",
@@ -612,7 +634,10 @@ async def broadcast_anim_loop(server_clock_id: str, server_time_fn) -> None:
         item = await anim_queue.get()
         if item is None:
             continue
-        if len(item) >= 6:
+        timing = None
+        if len(item) >= 7:
+            session_id, generation_epoch, frame_id_hint, root_pos, bone_quats, morphs, timing = item
+        elif len(item) >= 6:
             session_id, generation_epoch, frame_id_hint, root_pos, bone_quats, morphs = item
         else:
             session_id, root_pos, bone_quats, morphs = item
@@ -637,6 +662,7 @@ async def broadcast_anim_loop(server_clock_id: str, server_time_fn) -> None:
             )
             if frame_id <= st.latest_frame:
                 continue  # reject out-of-order / duplicate
+            st.next_frame_index = max(st.next_frame_index, frame_id + 1)
             st.latest_frame = frame_id
             st.last_activity_ms = now_ms
             st.frame_ring.append(
@@ -651,7 +677,6 @@ async def broadcast_anim_loop(server_clock_id: str, server_time_fn) -> None:
             active_sid = session_state.active_session_id
 
         if session_id != active_sid:
-            await asyncio.sleep(1 / STREAM_FPS)
             continue
 
         payload = _payload_bytes(root_pos, bone_quats, morphs)
@@ -672,6 +697,8 @@ async def broadcast_anim_loop(server_clock_id: str, server_time_fn) -> None:
                     "nmorphs": int(morphs.shape[0]),
                     "dtype": "f32",
                 }
+                if timing:
+                    header["timing"] = timing
                 await ws.send_text(json.dumps(header))
                 await ws.send_bytes(payload)
             except Exception:
@@ -794,137 +821,504 @@ def slerp_quat(q1: np.ndarray, q2: np.ndarray, t: float) -> np.ndarray:
 
 
 
-async def inference_worker(generator, retargeter) -> None:
-    """Dequeue audio chunks, run inference, push retargeted frames to anim_queue."""
-    global epoch_drop_count
-
-    min_required_samples = _min_samples_for_generator_call(generator)
+def _safe_queue_size(queue_obj: Any) -> int:
     try:
-        configured_batch_samples = int(
-            os.environ.get("INFERENCE_BATCH_SAMPLES", str(min_required_samples))
-        )
-    except ValueError:
-        configured_batch_samples = min_required_samples
-    batch_samples = max(min_required_samples, configured_batch_samples)
-    logger.info(
-        "Inference batching enabled min_required_samples=%d batch_samples=%d",
-        min_required_samples,
-        batch_samples,
-    )
+        return int(queue_obj.qsize())
+    except Exception:
+        return -1
 
-    # Per-session micro-batch buffers so tiny realtime chunks do not crash the model.
-    pending_chunks: Dict[str, deque] = defaultdict(deque)
-    pending_samples: Dict[str, int] = defaultdict(int)
-    pending_epoch: Dict[str, int] = {}
-    seen_first_batch: Dict[str, bool] = defaultdict(lambda: False)
-    last_diag_log: Dict[str, float] = {}   # per-session last diagnostic log time
 
+def _put_mp_queue_with_drop(queue_obj: Any, item: Any) -> bool:
+    try:
+        queue_obj.put_nowait(item)
+        return True
+    except queue_module.Full:
+        try:
+            queue_obj.get_nowait()
+        except Exception:
+            pass
+        try:
+            queue_obj.put_nowait(item)
+            return True
+        except Exception:
+            return False
+
+
+def _put_mp_queue_blocking(queue_obj: Any, item: Any, stop_event: Any, timeout: float = 0.1) -> bool:
+    while not stop_event.is_set():
+        try:
+            queue_obj.put(item, timeout=timeout)
+            return True
+        except queue_module.Full:
+            continue
+        except Exception:
+            return False
+    return False
+
+
+def _enqueue_anim_frame(item: Any) -> bool:
+    try:
+        anim_queue.put_nowait(item)
+        return True
+    except asyncio.QueueFull:
+        try:
+            anim_queue.get_nowait()
+            anim_queue.put_nowait(item)
+            return True
+        except Exception:
+            return False
+
+
+def _bootstrap_batch_audio(batch_audio: np.ndarray, min_required_samples: int) -> np.ndarray:
+    if batch_audio.size >= min_required_samples:
+        return batch_audio
+    pad = min_required_samples - int(batch_audio.size)
+    if pad <= 0:
+        return batch_audio
+    if batch_audio.size <= 0:
+        return np.zeros((min_required_samples,), dtype=np.float32)
+    return np.pad(batch_audio, (pad, 0), mode="edge")
+
+
+def _drain_mp_queue_nowait(queue_obj: Any) -> int:
+    drained = 0
     while True:
         try:
-            item = await audio_in_queue.get()
-        except Exception as e:
-            logger.exception("Fatal error getting from audio_in_queue: %s", e)
+            queue_obj.get_nowait()
+            drained += 1
+        except queue_module.Empty:
+            return drained
+        except Exception:
+            return drained
+
+
+def _clear_pending_session_state(
+    pending_chunks: Dict[str, deque],
+    pending_samples: Dict[str, int],
+    pending_sr: Dict[str, int],
+    pending_epoch: Dict[str, int],
+    seen_first_batch: Dict[str, bool],
+    session_next_frame_index: Dict[str, int],
+    last_diag_log: Dict[str, float],
+    pending_last_chunk_at: Dict[str, float],
+    *,
+    session_id: Optional[str] = None,
+) -> None:
+    if session_id is None:
+        pending_chunks.clear()
+        pending_samples.clear()
+        pending_sr.clear()
+        pending_epoch.clear()
+        seen_first_batch.clear()
+        session_next_frame_index.clear()
+        last_diag_log.clear()
+        pending_last_chunk_at.clear()
+        return
+    pending_chunks.pop(session_id, None)
+    pending_samples.pop(session_id, None)
+    pending_sr.pop(session_id, None)
+    pending_epoch.pop(session_id, None)
+    seen_first_batch.pop(session_id, None)
+    session_next_frame_index.pop(session_id, None)
+    last_diag_log.pop(session_id, None)
+    pending_last_chunk_at.pop(session_id, None)
+
+
+def _drain_inference_control_queue(
+    control_queue: Any,
+    pending_chunks: Dict[str, deque],
+    pending_samples: Dict[str, int],
+    pending_sr: Dict[str, int],
+    pending_epoch: Dict[str, int],
+    seen_first_batch: Dict[str, bool],
+    session_next_frame_index: Dict[str, int],
+    last_diag_log: Dict[str, float],
+    pending_last_chunk_at: Dict[str, float],
+    reset_token: int,
+) -> int:
+    while True:
+        try:
+            message = control_queue.get_nowait()
+        except queue_module.Empty:
+            return reset_token
+        except Exception:
+            return reset_token
+        if not isinstance(message, dict):
             continue
-
-        audio_np, sr, chunk_id, session_id, generation_epoch, source, conversation_id, reply_id = item
-
-        async with sessions_lock:
-            st = sessions.get(session_id)
-            if st is None:
-                continue
-            if generation_epoch != st.generation_epoch:
-                epoch_drop_count += 1
-                logger.info(
-                    "Skipping stale inference chunk session=%s epoch=%d active_epoch=%d source=%s",
-                    session_id, generation_epoch, st.generation_epoch, source,
-                )
-                continue
-
-        # Reset per-session buffers when generation changes (interrupt/new reply).
-        prev_epoch = pending_epoch.get(session_id)
-        if prev_epoch is not None and prev_epoch != generation_epoch:
-            pending_chunks.pop(session_id, None)
-            pending_samples.pop(session_id, None)
-            seen_first_batch[session_id] = False
-            last_diag_log.pop(session_id, None)
-        pending_epoch[session_id] = generation_epoch
-
-        audio_arr = np.asarray(audio_np, dtype=np.float32)
-        if audio_arr.size == 0:
-            continue
-        pending_chunks[session_id].append((chunk_id, audio_arr))
-        pending_samples[session_id] += int(audio_arr.shape[0])
-
-        # Diagnostic logging every 30 seconds per session
-        now = time.time()
-        last = last_diag_log.get(session_id, 0)
-        if now - last > 30:
-            logger.info(
-                "Inference pending session=%s samples=%d chunks=%d batch_samples=%d",
-                session_id, pending_samples[session_id], len(pending_chunks[session_id]), batch_samples
+        msg_type = message.get("type")
+        if msg_type == "reset_all":
+            _clear_pending_session_state(
+                pending_chunks,
+                pending_samples,
+                pending_sr,
+                pending_epoch,
+                seen_first_batch,
+                session_next_frame_index,
+                last_diag_log,
+                pending_last_chunk_at,
             )
-            last_diag_log[session_id] = now
+            reset_token += 1
+        elif msg_type == "drop_session":
+            _clear_pending_session_state(
+                pending_chunks,
+                pending_samples,
+                pending_sr,
+                pending_epoch,
+                seen_first_batch,
+                session_next_frame_index,
+                last_diag_log,
+                pending_last_chunk_at,
+                session_id=message.get("session_id"),
+            )
+            reset_token += 1
 
-        # Consume buffered audio in fixed-size batches.
-        while pending_samples[session_id] >= batch_samples:
-            remaining = batch_samples
+
+def start_inference_service(
+    retarget_map_path: str,
+    *,
+    overlap_sec: float = DEFAULT_OVERLAP_SEC,
+    batch_samples: Optional[int] = None,
+    startup_timeout_sec: Optional[float] = None,
+) -> InferenceProcessService:
+    ctx = mp.get_context("spawn")
+    input_queue = ctx.Queue(maxsize=AUDIO_IN_QUEUE_MAX_CHUNKS)
+    output_queue = ctx.Queue(maxsize=max(32, STREAM_FPS * 6))
+    control_queue = ctx.Queue(maxsize=8)
+    stop_event = ctx.Event()
+    ready_event = ctx.Event()
+    configured_batch_samples = max(1, DEFAULT_INFERENCE_BATCH_SAMPLES)
+    service_batch_samples = max(1, batch_samples or configured_batch_samples)
+    process = ctx.Process(
+        target=_inference_process_main,
+        args=(
+            input_queue,
+            output_queue,
+            control_queue,
+            stop_event,
+            ready_event,
+            retarget_map_path,
+            overlap_sec,
+            service_batch_samples,
+        ),
+        name="npz-inference",
+        daemon=True,
+    )
+    timeout = startup_timeout_sec
+    if timeout is None:
+        try:
+            timeout = float(os.environ.get("INFERENCE_STARTUP_TIMEOUT_SEC", "300"))
+        except ValueError:
+            timeout = 300.0
+    process.start()
+    logger.info(
+        "Inference process starting pid=%s batch_samples=%d overlap_sec=%.3f input_q=%d output_q=%d",
+        process.pid,
+        service_batch_samples,
+        overlap_sec,
+        AUDIO_IN_QUEUE_MAX_CHUNKS,
+        max(32, STREAM_FPS * 6),
+    )
+    return InferenceProcessService(
+        input_queue=input_queue,
+        output_queue=output_queue,
+        control_queue=control_queue,
+        stop_event=stop_event,
+        ready_event=ready_event,
+        process=process,
+        batch_samples=service_batch_samples,
+        overlap_sec=overlap_sec,
+        retarget_map_path=retarget_map_path,
+        startup_timeout_sec=float(timeout),
+    )
+
+
+async def wait_for_inference_service_ready(
+    service: InferenceProcessService,
+    timeout_sec: Optional[float] = None,
+) -> None:
+    timeout = float(service.startup_timeout_sec if timeout_sec is None else timeout_sec)
+    deadline = time.monotonic() + timeout
+    while True:
+        if service.ready_event.is_set():
+            if service.process.exitcode is not None and service.process.exitcode != 0:
+                raise RuntimeError(
+                    f"Inference process exited during startup with code {service.process.exitcode}"
+                )
+            return
+        if service.process.exitcode is not None:
+            raise RuntimeError(
+                f"Inference process failed during startup with code {service.process.exitcode}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(0.2, remaining))
+    raise TimeoutError(
+        f"Inference process did not become ready within {timeout:.1f}s"
+    )
+
+
+async def stop_inference_service(service: Optional[InferenceProcessService]) -> None:
+    if service is None:
+        return
+    try:
+        service.stop_event.set()
+    except Exception:
+        pass
+    try:
+        _put_mp_queue_with_drop(service.input_queue, None)
+    except Exception:
+        pass
+
+    def _join() -> None:
+        try:
+            service.process.join(timeout=5.0)
+        except Exception:
+            pass
+        if service.process.is_alive():
+            try:
+                service.process.terminate()
+            except Exception:
+                pass
+            try:
+                service.process.join(timeout=5.0)
+            except Exception:
+                pass
+        if service.process.is_alive():
+            try:
+                service.process.kill()
+            except Exception:
+                pass
+            try:
+                service.process.join(timeout=5.0)
+            except Exception:
+                pass
+
+    await asyncio.to_thread(_join)
+    for queue_obj in (service.input_queue, service.output_queue, service.control_queue):
+        try:
+            queue_obj.close()
+        except Exception:
+            pass
+        try:
+            queue_obj.cancel_join_thread()
+        except Exception:
+            pass
+
+
+async def reset_inference_service_session(
+    service: Optional[InferenceProcessService],
+    *,
+    reason: str = "session_switch",
+) -> None:
+    if service is None:
+        return
+
+    def _reset() -> tuple[int, int, bool]:
+        drained_input = _drain_mp_queue_nowait(service.input_queue)
+        drained_output = _drain_mp_queue_nowait(service.output_queue)
+        sent = _put_mp_queue_with_drop(
+            service.control_queue,
+            {
+                "type": "reset_all",
+                "reason": reason,
+                "server_time_ms": int(time.monotonic_ns() / 1_000_000),
+            },
+        )
+        return drained_input, drained_output, sent
+
+    drained_input, drained_output, sent = await asyncio.to_thread(_reset)
+    logger.info(
+        "Inference service reset reason=%s drained_input=%d drained_output=%d control_sent=%s",
+        reason,
+        drained_input,
+        drained_output,
+        sent,
+    )
+
+
+def _inference_process_main(
+    input_queue: Any,
+    output_queue: Any,
+    control_queue: Any,
+    stop_event: Any,
+    ready_event: Any,
+    retarget_map_path: str,
+    overlap_sec: float,
+    batch_samples: int,
+) -> None:
+    from npz_logging import setup_logging
+    from live_streaming_pipeline import LiveMotionGenerator
+    from .retargeter import SmplxRetargeter
+
+    setup_logging()
+    logger.info(
+        "Inference process booting pid=%s batch_samples=%d overlap_sec=%.3f",
+        os.getpid(),
+        batch_samples,
+        overlap_sec,
+    )
+    try:
+        generator = LiveMotionGenerator(overlap_sec=overlap_sec)
+        retargeter = SmplxRetargeter(retarget_map_path)
+        min_required_samples = _min_samples_for_generator_call(generator)
+        logger.info(
+            "Inference process ready pid=%s min_required_samples=%d batch_samples=%d",
+            os.getpid(),
+            min_required_samples,
+            batch_samples,
+        )
+        ready_event.set()
+
+        try:
+            flush_idle_sec = max(
+                0.0,
+                float(os.environ.get("INFERENCE_IDLE_FLUSH_SEC", "0.2")),
+            )
+        except ValueError:
+            flush_idle_sec = 0.2
+
+        pending_chunks: Dict[str, deque] = defaultdict(deque)
+        pending_samples: Dict[str, int] = defaultdict(int)
+        pending_sr: Dict[str, int] = {}
+        pending_epoch: Dict[str, int] = {}
+        seen_first_batch: Dict[str, bool] = defaultdict(lambda: False)
+        session_next_frame_index: Dict[str, int] = defaultdict(int)
+        last_diag_log: Dict[str, float] = {}
+        last_backend_summary_log: Dict[str, float] = {}
+        pending_last_chunk_at: Dict[str, float] = {}
+        reset_token = 0
+
+        def drain_control() -> None:
+            nonlocal reset_token
+            reset_token = _drain_inference_control_queue(
+                control_queue,
+                pending_chunks,
+                pending_samples,
+                pending_sr,
+                pending_epoch,
+                seen_first_batch,
+                session_next_frame_index,
+                last_diag_log,
+                pending_last_chunk_at,
+                reset_token,
+            )
+
+        def run_pending_batch(
+            session_id: str,
+            target_samples: int,
+            *,
+            flush_reason: Optional[str] = None,
+        ) -> bool:
+            normalized_flush_reason = flush_reason or FLUSH_REASON_BATCH_COMPLETE
+            available = int(pending_samples.get(session_id, 0))
+            if available <= 0:
+                _clear_pending_session_state(
+                    pending_chunks,
+                    pending_samples,
+                    pending_sr,
+                    pending_epoch,
+                    seen_first_batch,
+                    session_next_frame_index,
+                    last_diag_log,
+                    pending_last_chunk_at,
+                    session_id=session_id,
+                )
+                return False
+
+            remaining = min(max(1, int(target_samples)), available)
             consumed_ids: List[Optional[str]] = []
             parts: List[np.ndarray] = []
+            earliest_enqueue_ns: Optional[int] = None
 
             while remaining > 0 and pending_chunks[session_id]:
-                cid, arr = pending_chunks[session_id][0]
+                cid, arr, queued_at_ns = pending_chunks[session_id][0]
                 take = min(remaining, int(arr.shape[0]))
                 if take <= 0:
                     pending_chunks[session_id].popleft()
                     continue
                 parts.append(arr[:take])
                 consumed_ids.append(cid)
+                if earliest_enqueue_ns is None or queued_at_ns < earliest_enqueue_ns:
+                    earliest_enqueue_ns = queued_at_ns
                 pending_samples[session_id] -= take
                 remaining -= take
                 if take == int(arr.shape[0]):
                     pending_chunks[session_id].popleft()
                 else:
-                    pending_chunks[session_id][0] = (cid, arr[take:])
+                    pending_chunks[session_id][0] = (cid, arr[take:], queued_at_ns)
 
             if not parts:
-                break
+                return False
 
-            batch_audio = (
-                parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
-            )
+            if pending_samples.get(session_id, 0) <= 0 and not pending_chunks.get(session_id):
+                pending_last_chunk_at.pop(session_id, None)
+
+            batch_audio = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
             batch_chunk_id = _coalesce_chunk_ids(consumed_ids)
+            batch_audio_for_model = batch_audio
+            batch_reset_token = reset_token
+            batch_sr = pending_sr.get(session_id, 16000)
+            batch_started_ns = time.monotonic_ns()
+            inputqueuewait_ms = 0.0
+            if earliest_enqueue_ns is not None:
+                inputqueuewait_ms = max(0.0, (batch_started_ns - earliest_enqueue_ns) / 1_000_000.0)
+
+            if not seen_first_batch[session_id]:
+                _reset_generator_stream_state(generator)
+                seen_first_batch[session_id] = True
+                if batch_audio.size < min_required_samples:
+                    batch_audio_for_model = _bootstrap_batch_audio(batch_audio, min_required_samples)
 
             try:
-                async with inference_lock:
-                    if not seen_first_batch[session_id]:
-                        _reset_generator_stream_state(generator)
-                        seen_first_batch[session_id] = True
-                    coeffs = await asyncio.to_thread(
-                        lambda: generator.process_audio_chunk(batch_audio, sr, batch_chunk_id)
-                    )
+                generator_started_ns = time.perf_counter_ns()
+                coeffs = generator.process_audio_chunk(
+                    batch_audio_for_model,
+                    batch_sr,
+                    batch_chunk_id,
+                    overlap_source_audio=batch_audio,
+                )
+                generator_elapsed_ms = (time.perf_counter_ns() - generator_started_ns) / 1_000_000.0
             except Exception as exc:
                 logger.exception(
-                    "Inference crashed for session=%s chunk=%s (batched_samples=%d): %s",
-                    session_id, batch_chunk_id, int(batch_audio.shape[0]), exc
+                    "Inference crashed for session=%s chunk=%s (batched_samples=%d flush_reason=%s): %s",
+                    session_id,
+                    batch_chunk_id,
+                    int(batch_audio.shape[0]),
+                    normalized_flush_reason,
+                    exc,
                 )
-                # Reset this session's pending buffers to recover
-                pending_chunks.pop(session_id, None)
-                pending_samples.pop(session_id, None)
-                seen_first_batch[session_id] = False
-                last_diag_log.pop(session_id, None)
-                continue
+                _clear_pending_session_state(
+                    pending_chunks,
+                    pending_samples,
+                    pending_sr,
+                    pending_epoch,
+                    seen_first_batch,
+                    session_next_frame_index,
+                    last_diag_log,
+                    pending_last_chunk_at,
+                    session_id=session_id,
+                )
+                return False
+
+            drain_control()
+            if reset_token != batch_reset_token:
+                logger.info(
+                    "Dropping computed batch after reset session=%s chunk=%s",
+                    session_id,
+                    batch_chunk_id,
+                )
+                return False
 
             if not coeffs:
                 logger.warning(
-                    "No coeffs generated for chunk %s (audio_len=%d)",
-                    batch_chunk_id, batch_audio.shape[0],
+                    "No coeffs generated for chunk %s (audio_len=%d flush_reason=%s)",
+                    batch_chunk_id,
+                    batch_audio.shape[0],
+                    normalized_flush_reason,
                 )
-                continue
+                return False
 
-            if not seen_first_batch[session_id]:
-                seen_first_batch[session_id] = True
-
-            # First emitted chunk for a stream: reset root offset.
             if batch_chunk_id is not None and str(batch_chunk_id).startswith("0"):
                 retargeter.reset_root_offset()
 
@@ -932,18 +1326,19 @@ async def inference_worker(generator, retargeter) -> None:
             expressions = coeffs["expressions"]
             trans = coeffs["trans"]
             frames_count = int(poses.shape[0])
+            generator_timings = getattr(generator, "last_process_timings", {}) or {}
+            infer_ms = float(generator_timings.get("infer_ms", generator_elapsed_ms))
+            resample_ms = float(generator_timings.get("resample_ms", 0.0))
 
-            # ------------------ RESAMPLING BLOCK (UPDATED) ------------------
             if (STREAM_FPS != BASE_FPS or SLOW_MOTION_FACTOR != 1.0) and frames_count > 1:
+                stream_resample_started_ns = time.perf_counter_ns()
                 target_count = max(
                     1,
                     int(round(frames_count * (STREAM_FPS / BASE_FPS) * SLOW_MOTION_FACTOR)),
                 )
-                # Resample expressions and translation linearly (they are scalar/vector)
                 expressions = _resample_frames_linear(expressions, target_count)
                 trans = _resample_frames_linear(trans, target_count)
 
-                # Resample poses using SLERP on quaternions
                 joint_count = poses.shape[1] // 3
                 poses_aa = poses.reshape(frames_count, joint_count, 3)
                 poses_quat = axis_angle_to_quat(poses_aa)
@@ -962,53 +1357,247 @@ async def inference_worker(generator, retargeter) -> None:
                 new_poses_aa = quat_to_axis_angle(new_poses_quat)
                 poses = new_poses_aa.reshape(target_count, -1)
                 frames_count = target_count
-            # --------------------------------------------------------------
+                resample_ms += (time.perf_counter_ns() - stream_resample_started_ns) / 1_000_000.0
 
+            retarget_started_ns = time.perf_counter_ns()
             root_pos, bone_quats, morphs = retargeter.retarget(poses, expressions, trans)
+            retarget_ms = (time.perf_counter_ns() - retarget_started_ns) / 1_000_000.0
 
             if frames_count > 0:
                 _log_inference_stats(
-                    retargeter, batch_chunk_id, session_id, frames_count,
-                    poses, expressions, morphs, root_pos,
+                    retargeter,
+                    batch_chunk_id,
+                    session_id,
+                    frames_count,
+                    poses,
+                    expressions,
+                    morphs,
+                    root_pos,
                 )
 
-            dropped = 0
-            async with sessions_lock:
-                st = sessions.get(session_id)
-                if st is None:
-                    continue
-                if generation_epoch != st.generation_epoch:
-                    epoch_drop_count += 1
-                    continue
-                start_frame_idx = st.next_frame_index
-                st.next_frame_index += frames_count
+            frame_start = session_next_frame_index[session_id]
+            session_next_frame_index[session_id] += frames_count
 
+            timing = {
+                "inputqueuewait_ms": round(inputqueuewait_ms, 3),
+                "infer_ms": round(infer_ms, 3),
+                "resample_ms": round(resample_ms, 3),
+                "retarget_ms": round(retarget_ms, 3),
+                "outputqueuewait_ms": 0.0,
+                "batch_samples": int(batch_audio.shape[0]),
+                "frames_count": int(frames_count),
+                "flush_reason": normalized_flush_reason,
+            }
+            enqueued_frames = 0
+            outputqueuewait_ms = 0.0
             for i in range(frames_count):
-                frame_index = start_frame_idx + i
-                try:
-                    anim_queue.put_nowait((
-                        session_id, generation_epoch, frame_index,
-                        root_pos[i], bone_quats[i], morphs[i],
-                    ))
-                except asyncio.QueueFull:
-                    try:
-                        anim_queue.get_nowait()
-                        dropped += 1
-                        anim_queue.put_nowait((
-                            session_id, generation_epoch, frame_index,
-                            root_pos[i], bone_quats[i], morphs[i],
-                        ))
-                    except Exception:
+                if (i % 8) == 0:
+                    drain_control()
+                    if reset_token != batch_reset_token:
+                        logger.info(
+                            "Stopping frame enqueue after reset session=%s chunk=%s enqueued=%d/%d",
+                            session_id,
+                            batch_chunk_id,
+                            enqueued_frames,
+                            frames_count,
+                        )
                         break
+                frame_index = frame_start + i
+                enqueue_started_ns = time.perf_counter_ns()
+                frame_timing = dict(timing)
+                frame_timing["outputqueuewait_ms"] = round(outputqueuewait_ms, 3)
+                if not _put_mp_queue_blocking(
+                    output_queue,
+                    (
+                        session_id,
+                        pending_epoch.get(session_id, 0),
+                        frame_index,
+                        root_pos[i],
+                        bone_quats[i],
+                        morphs[i],
+                        frame_timing,
+                    ),
+                    stop_event,
+                ):
+                    break
+                outputqueuewait_ms += (time.perf_counter_ns() - enqueue_started_ns) / 1_000_000.0
+                enqueued_frames += 1
 
-            if dropped > 0:
-                logger.warning(
-                    "Dropped %d anim frames due to full queue (session=%s)", dropped, session_id
-                )
+            timing["outputqueuewait_ms"] = round(outputqueuewait_ms, 3)
+
             logger.info(
-                "Enqueued %d anim frames (session=%s queue=%d fps=%d chunk=%s)",
-                frames_count, session_id, anim_queue.qsize(), STREAM_FPS, batch_chunk_id,
+                "Enqueued %d anim frames (session=%s queue=%d fps=%d chunk=%s flush_reason=%s)",
+                enqueued_frames,
+                session_id,
+                _safe_queue_size(output_queue),
+                STREAM_FPS,
+                batch_chunk_id,
+                normalized_flush_reason,
             )
+            now = time.time()
+            last_summary = last_backend_summary_log.get(session_id, 0.0)
+            if normalized_flush_reason == FLUSH_REASON_IDLE_TIMEOUT or (now - last_summary) >= 10.0:
+                logger.info(
+                    "Backend timing session=%s chunk=%s inputqueuewait_ms=%.3f infer_ms=%.3f resample_ms=%.3f retarget_ms=%.3f outputqueuewait_ms=%.3f batch_samples=%d frames_count=%d flush_reason=%s",
+                    session_id,
+                    batch_chunk_id,
+                    timing["inputqueuewait_ms"],
+                    timing["infer_ms"],
+                    timing["resample_ms"],
+                    timing["retarget_ms"],
+                    timing["outputqueuewait_ms"],
+                    timing["batch_samples"],
+                    timing["frames_count"],
+                    timing["flush_reason"],
+                )
+                last_backend_summary_log[session_id] = now
+            return enqueued_frames > 0
+
+        while not stop_event.is_set():
+            drain_control()
+
+            if flush_idle_sec > 0:
+                now = time.time()
+                idle_sessions = [
+                    sid
+                    for sid, last_chunk_at in pending_last_chunk_at.items()
+                    if pending_samples.get(sid, 0) > 0 and (now - last_chunk_at) >= flush_idle_sec
+                ]
+                for sid in idle_sessions:
+                    if stop_event.is_set():
+                        break
+                    run_pending_batch(
+                        sid,
+                        pending_samples.get(sid, 0),
+                        flush_reason=FLUSH_REASON_IDLE_TIMEOUT,
+                    )
+
+            try:
+                item = input_queue.get(timeout=0.1)
+            except queue_module.Empty:
+                continue
+            except Exception as exc:
+                logger.exception("Fatal error getting from inference input queue: %s", exc)
+                continue
+
+            if item is None:
+                if stop_event.is_set():
+                    break
+                continue
+
+            if len(item) >= 9:
+                audio_np, sr, chunk_id, session_id, generation_epoch, source, conversation_id, reply_id, enqueue_monotonic_ns = item
+            else:
+                audio_np, sr, chunk_id, session_id, generation_epoch, source, conversation_id, reply_id = item
+                enqueue_monotonic_ns = time.monotonic_ns()
+
+            prev_epoch = pending_epoch.get(session_id)
+            if prev_epoch is not None and prev_epoch != generation_epoch:
+                _clear_pending_session_state(
+                    pending_chunks,
+                    pending_samples,
+                    pending_sr,
+                    pending_epoch,
+                    seen_first_batch,
+                    session_next_frame_index,
+                    last_diag_log,
+                    pending_last_chunk_at,
+                    session_id=session_id,
+                )
+            pending_epoch[session_id] = generation_epoch
+            pending_sr[session_id] = int(sr)
+
+            audio_arr = np.asarray(audio_np, dtype=np.float32)
+            if audio_arr.size == 0:
+                continue
+
+            pending_chunks[session_id].append((chunk_id, audio_arr, int(enqueue_monotonic_ns)))
+            pending_samples[session_id] += int(audio_arr.shape[0])
+            pending_last_chunk_at[session_id] = time.time()
+
+            now = time.time()
+            last = last_diag_log.get(session_id, 0)
+            if now - last > 30:
+                logger.info(
+                    "Inference pending session=%s samples=%d chunks=%d batch_samples=%d",
+                    session_id,
+                    pending_samples[session_id],
+                    len(pending_chunks[session_id]),
+                    batch_samples,
+                )
+                last_diag_log[session_id] = now
+
+            while pending_samples[session_id] >= batch_samples and not stop_event.is_set():
+                if not run_pending_batch(
+                    session_id,
+                    batch_samples,
+                    flush_reason=FLUSH_REASON_BATCH_COMPLETE,
+                ):
+                    break
+
+        logger.info("Inference process exiting pid=%s", os.getpid())
+    except Exception:
+        logger.exception("Inference process crashed")
+        raise
+
+
+async def _feed_audio_to_inference_process(service: InferenceProcessService) -> None:
+    while not service.stop_event.is_set():
+        item = await audio_in_queue.get()
+        if item is None:
+            continue
+        if service.process.exitcode is not None:
+            raise RuntimeError(
+                f"Inference process exited with code {service.process.exitcode} while audio was queued"
+            )
+        ok = await asyncio.to_thread(_put_mp_queue_with_drop, service.input_queue, item)
+        if not ok:
+            logger.warning(
+                "Inference input queue full; dropped oldest chunk session=%s chunk=%s",
+                item[3] if len(item) > 3 else "?",
+                item[2] if len(item) > 2 else "?",
+            )
+
+
+async def _drain_inference_output(service: InferenceProcessService) -> None:
+    while not service.stop_event.is_set():
+        try:
+            item = await asyncio.to_thread(service.output_queue.get, True, 0.1)
+        except queue_module.Empty:
+            if service.process.exitcode is not None:
+                if service.stop_event.is_set():
+                    return
+                raise RuntimeError(
+                    f"Inference process exited with code {service.process.exitcode}"
+                )
+            continue
+        except Exception as exc:
+            logger.exception("Fatal error getting from inference output queue: %s", exc)
+            continue
+
+        if item is None:
+            continue
+        _enqueue_anim_frame(item)
+
+
+async def inference_worker(service: InferenceProcessService) -> None:
+    """Bridge audio chunks to the spawned inference process and forward its frames."""
+    await wait_for_inference_service_ready(service)
+    audio_task = asyncio.create_task(_feed_audio_to_inference_process(service))
+    output_task = asyncio.create_task(_drain_inference_output(service))
+    try:
+        await asyncio.gather(audio_task, output_task)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Inference bridge stopped due to error")
+        raise
+    finally:
+        for task in (audio_task, output_task):
+            task.cancel()
+        await asyncio.gather(audio_task, output_task, return_exceptions=True)
+        await stop_inference_service(service)
+
 def _log_inference_stats(
     retargeter, chunk_id, session_id, frames_count,
     poses, expressions, morphs, root_pos,

@@ -1,6 +1,7 @@
 let ws = null;
 let wsHost = null;
-let streamFps = 20;
+let streamFps = null;
+let streamFpsReady = false;
 let bones = [];
 let morphs = [];
 let nbones = 0;
@@ -51,6 +52,7 @@ let interpBuffer = null;
 let tickCount = 0;
 let lastAppliedFrame = -1;
 let neutralFrame = null;
+let latestTimingSnapshot = null;
 
 let serverOffsetMs = 0;
 let hasServerOffset = false;
@@ -61,10 +63,56 @@ let targetLiveFrame = null;
 let tailLockStartMs = 0;
 let seenLiveAtOrBeyondTarget = false;
 let lastResyncRequestMs = 0;
-const MAX_TAIL_LOCK_MS = 3000;
+const MAX_TAIL_LOCK_MS = 10000;
 const FAST_TRACK_DRIFT_MS = 250;
-const SNAP_DRIFT_MS = 2000;
+const SNAP_DRIFT_MS = 5000;
 const DRIFT_WARN_COOLDOWN_MS = 1000;
+
+function hasReadyStreamFps() {
+  return Number.isFinite(streamFps) && streamFps > 0;
+}
+
+function updateStreamFps(nextFps) {
+  if (Number.isFinite(nextFps) && nextFps > 0) {
+    streamFps = nextFps;
+    streamFpsReady = true;
+  }
+}
+
+function sanitizeTimingValue(value, digits = 3) {
+  if (!Number.isFinite(value)) return null;
+  return Number(value.toFixed(digits));
+}
+
+function buildTimingSnapshot(timing, serverTimeMs) {
+  const snapshot = {};
+  if (timing && typeof timing === "object") {
+    for (const key of [
+      "inputqueuewait_ms",
+      "infer_ms",
+      "resample_ms",
+      "retarget_ms",
+      "outputqueuewait_ms",
+      "batch_samples",
+      "frames_count",
+      "flush_reason",
+    ]) {
+      const value = timing[key];
+      if (typeof value === "string" && value) {
+        snapshot[key] = value;
+      } else if (Number.isFinite(value)) {
+        snapshot[key] = sanitizeTimingValue(value);
+      }
+    }
+  }
+  if (Number.isFinite(serverTimeMs)) {
+    snapshot.transportagems = sanitizeTimingValue(
+      Math.max(0, serverNowEstimateMs() - serverTimeMs)
+    );
+  }
+  return Object.keys(snapshot).length > 0 ? snapshot : null;
+}
+
 function resetTimelineState() {
   targetLiveFrame = null;
   tailLockStartMs = 0;
@@ -78,6 +126,7 @@ function switchSession(nextSessionId, mode = "live_playing", reason = "session_s
   if (!nextSessionId || nextSessionId === currentSessionId) return false;
   currentSessionId = nextSessionId;
   knownSessionId = nextSessionId;
+  latestTimingSnapshot = null;
   resetTimelineState();
   playbackState = mode;
   postMessage({
@@ -110,7 +159,7 @@ function resetBuffer() {
 }
 
 function ensureCapacity() {
-  capacity = Math.max(1, Math.ceil(streamFps * bufferSeconds));
+  capacity = Math.max(1, Math.ceil((hasReadyStreamFps() ? streamFps : 1) * bufferSeconds));
   resetBuffer();
 }
 
@@ -331,9 +380,7 @@ function applyMorphSmoothing(buffer) {
 }
 
 function emitFrame(frameIndex, data) {
-  if (frameIndex < lastAppliedFrame && DEBUG) {
-    debugLog("emitFrame backward index", { frameIndex, lastAppliedFrame, sessionId: currentSessionId });
-  }
+  if (frameIndex < lastAppliedFrame) return;
   const out = new Float32Array(data.length);
   out.set(data);
   postMessage(
@@ -341,11 +388,13 @@ function emitFrame(frameIndex, data) {
       type: "frame",
       buffer: out.buffer,
       frameIndex,
-      streamFps,
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
       queueLen: storedCount,
       snapshotDropCount,
       liveDropCount,
       resyncSkipped,
+      timing: latestTimingSnapshot,
       nbones,
       nmorphs,
       sessionId: currentSessionId,
@@ -383,11 +432,13 @@ function maybeSendStats() {
     liveDropCount,
     resyncSkipped,
     inFps,
-    streamFps,
+    streamFps: hasReadyStreamFps() ? streamFps : null,
+    streamFpsReady,
     maxIndex,
     minIndexEstimate,
     playbackState,
     targetLiveFrame,
+    timing: latestTimingSnapshot,
     sessionId: currentSessionId,
   });
   recvCount = 0;
@@ -416,6 +467,10 @@ function onTick(elapsed) {
     maybeSendStats();
     return;
   }
+  if (!hasReadyStreamFps()) {
+    maybeSendStats();
+    return;
+  }
   if (playbackState === "tail_lock_align") {
     const target = Number.isFinite(targetLiveFrame) ? targetLiveFrame : maxIndex;
     const best = getNearestFrameAtOrBefore(target) || getLatestFrame();
@@ -434,10 +489,12 @@ function onTick(elapsed) {
           buffer: holdOut.buffer,
           frameIndex: best.frame,
           streamFps,
+          streamFpsReady,
           queueLen: storedCount,
           snapshotDropCount,
           liveDropCount,
           resyncSkipped,
+          timing: latestTimingSnapshot,
           nbones,
           nmorphs,
           sessionId: currentSessionId,
@@ -557,7 +614,13 @@ function connectAnim() {
   ws.binaryType = "arraybuffer";
   let header = null;
   ws.onopen = () => {
-    postMessage({ type: "status", status: "connected" });
+    postMessage({
+      type: "status",
+      status: "connected",
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
+      timing: latestTimingSnapshot,
+    });
     ws.send(
       JSON.stringify({
         type: "anim_subscribe",
@@ -570,8 +633,22 @@ function connectAnim() {
       })
     );
   };
-  ws.onclose = () => postMessage({ type: "status", status: "closed" });
-  ws.onerror = () => postMessage({ type: "status", status: "error" });
+  ws.onclose = () =>
+    postMessage({
+      type: "status",
+      status: "closed",
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
+      timing: latestTimingSnapshot,
+    });
+  ws.onerror = () =>
+    postMessage({
+      type: "status",
+      status: "error",
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
+      timing: latestTimingSnapshot,
+    });
   ws.onmessage = (event) => {
     if (typeof event.data === "string") {
       let msg = null;
@@ -609,7 +686,7 @@ function connectAnim() {
         const modeFromAck = msg.mode === "resume" ? "snapshot_loading" : "live_playing";
         switchSession(ackSessionId, modeFromAck, "subscribe_ack");
         currentSessionId = ackSessionId;
-        streamFps = msg.stream_fps || streamFps;
+        updateStreamFps(msg.stream_fps);
         observeServerTime(msg.server_time_ms);
         if (msg.mode === "reset_required") {
           postMessage({
@@ -631,6 +708,8 @@ function connectAnim() {
           serverBootId,
           serverClockId,
           sessionId: currentSessionId,
+          streamFps: hasReadyStreamFps() ? streamFps : null,
+          streamFpsReady,
           buildId,
         });
         return;
@@ -659,7 +738,7 @@ function connectAnim() {
           : serverNowEstimateMs();
         const audioLiveEdgeFrame = Number.isFinite(msg.audio_live_edge_frame) ? msg.audio_live_edge_frame : -1;
         const expectedFrame =
-          liveHeadFrame >= 0
+          liveHeadFrame >= 0 && hasReadyStreamFps()
             ? liveHeadFrame + Math.round(((serverNowEstimateMs() - liveHeadServerTimeMs) * streamFps) / 1000)
             : -1;
         targetLiveFrame = Math.max(expectedFrame, audioLiveEdgeFrame, liveHeadFrame);
@@ -676,7 +755,7 @@ function connectAnim() {
         return;
       }
       if (msg.type === "anim_init") {
-        streamFps = msg.fps || streamFps;
+        updateStreamFps(msg.fps);
         bones = msg.bones || [];
         morphs = msg.morphs || [];
         if (Number.isFinite(msg.bufferSeconds)) bufferSeconds = msg.bufferSeconds;
@@ -708,7 +787,8 @@ function connectAnim() {
         ensureCapacity();
         postMessage({
           type: "init",
-          streamFps,
+          streamFps: hasReadyStreamFps() ? streamFps : null,
+          streamFpsReady,
           bones,
           morphs,
           bufferSeconds,
@@ -728,6 +808,7 @@ function connectAnim() {
           switchSession(sid, nextMode, "anim_header");
         }
         if (Number.isFinite(msg.server_time_ms)) observeServerTime(msg.server_time_ms);
+        latestTimingSnapshot = buildTimingSnapshot(msg.timing, msg.server_time_ms) || latestTimingSnapshot;
         if (sid) currentSessionId = sid;
       }
       return;
@@ -768,6 +849,7 @@ self.onmessage = (event) => {
     onTick(msg.elapsed);
     tickCount += 1;
   } else if (msg.type === "reset") {
+    latestTimingSnapshot = null;
     resetTimelineState();
     playbackState = "live_playing";
   }

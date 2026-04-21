@@ -46,9 +46,9 @@ if ROOT_DIR not in sys.path:
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
-from live_streaming_pipeline import LiveMotionGenerator
 from npz_logging import setup_logging
 from retargeter import SmplxRetargeter
+from streamsettings import DEFAULT_OVERLAP_SEC, log_resolved_stream_settings
 from . import session as session_state
 from .session import (
     STREAM_FPS,
@@ -73,6 +73,10 @@ from .audio_pipeline import (
     ingest_audio_chunk,
     pcm16_bytes_to_float32,
     GeminiLiveAudioEngine,
+    start_inference_service,
+    stop_inference_service,
+    reset_inference_service_session,
+    wait_for_inference_service_ready,
 )
 from .conversation import ConversationRuntime, CONVERSATION_AUDIO_SR
 
@@ -108,7 +112,6 @@ def _server_time_ms() -> int:
 # Shared ML models (initialised once at import time)
 # ---------------------------------------------------------------------------
 
-generator = LiveMotionGenerator(overlap_sec=0.25)
 retargeter = SmplxRetargeter(os.path.join(SERVER_DIR, "retarget_map.json"))
 
 # ---------------------------------------------------------------------------
@@ -211,6 +214,7 @@ def _log_conversation_dependency_health() -> None:
 
 @app.on_event("startup")
 async def _startup():
+    log_resolved_stream_settings(logger)
     logger.info(
         "Server startup boot=%s clock=%s protocol=%d fps=%d",
         SERVER_BOOT_ID, SERVER_CLOCK_ID, PROTOCOL_VERSION, STREAM_FPS,
@@ -219,12 +223,42 @@ async def _startup():
     app.state.broadcast_task = asyncio.create_task(
         broadcast_anim_loop(SERVER_CLOCK_ID, _server_time_ms)
     )
+    try:
+        app.state.inference_service = start_inference_service(
+            retargeter.config_path,
+            overlap_sec=DEFAULT_OVERLAP_SEC,
+        )
+        await wait_for_inference_service_ready(app.state.inference_service)
+    except Exception:
+        service = getattr(app.state, "inference_service", None)
+        if service is not None:
+            await stop_inference_service(service)
+        broadcast_task = getattr(app.state, "broadcast_task", None)
+        if broadcast_task is not None:
+            broadcast_task.cancel()
+            await asyncio.gather(broadcast_task, return_exceptions=True)
+        raise
     app.state.infer_task = asyncio.create_task(
-        inference_worker(generator, retargeter)
+        inference_worker(app.state.inference_service)
     )
     app.state.gc_task = asyncio.create_task(
         session_gc_loop(_server_time_ms)
     )
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    service = getattr(app.state, "inference_service", None)
+    if service is not None:
+        await stop_inference_service(service)
+    tasks = []
+    for attr in ("infer_task", "broadcast_task", "gc_task"):
+        task = getattr(app.state, attr, None)
+        if task is not None:
+            task.cancel()
+            tasks.append(task)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 # ---------------------------------------------------------------------------
 # Helper: create_audio_session bound to server constants
@@ -234,7 +268,7 @@ async def _create_audio_session(
     conversation_id: Optional[str] = None,
     reply_id: Optional[str] = None,
 ) -> str:
-    return await create_audio_session(
+    session_id = await create_audio_session(
         server_boot_id=SERVER_BOOT_ID,
         anim_queue=anim_queue,
         audio_in_queue=audio_in_queue,
@@ -242,6 +276,11 @@ async def _create_audio_session(
         conversation_id=conversation_id,
         reply_id=reply_id,
     )
+    await reset_inference_service_session(
+        getattr(app.state, "inference_service", None),
+        reason="session_switch",
+    )
+    return session_id
 
 # ---------------------------------------------------------------------------
 # WebSocket routes
@@ -483,4 +522,4 @@ async def ws_anim(websocket: WebSocket):
 
 
 # Mount static site last so WebSocket routes take precedence.
-# app.mount("/", StaticFiles(directory="web", html=True), name="web")
+# app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="frontend")

@@ -13,8 +13,17 @@ The server uses the **EMAGE (Expressive Motion Generation)** architecture, a sta
   - **Expressions (100 coeffs)**: PCA (Principal Component Analysis) coefficients for the SMPL-X facial mesh.
   - **Translation (3 coeffs)**: Global X/Y/Z root movement.
 
-## 2. Server-Side Retargeting & Signal Processing
-Raw model outputs are normalized and mapped in `server/retargeter.py` using parameters from `retarget_map.json`:
+## 2. Environment Configuration & Tuning
+The pipeline is highly configurable via `server/.env.local`. All essential parameters for performance, logic, and visual stability are centralized here:
+- **Core Settings**: `STREAM_FPS`, `INFERENCE_BATCH_SAMPLES`, `BASE_MOTION_FPS`.
+- **Latency & Backlog**: `AUDIO_IN_QUEUE_MAX_CHUNKS` (default `16`), `INFERENCE_IDLE_FLUSH_SEC`.
+- **GC & Stability**: `MAX_SESSIONS`, `SESSION_IDLE_TTL_MS`, `SESSION_GC_INTERVAL_MS`.
+- **Frontend Sync (Vite)**: `VITE_SESSION_MISMATCH_GRACE_MS`, `VITE_AUDIO_START_BUFFER_SEC`, etc.
+
+The `streamsettings.py` module acts as the single source of truth, loading `.env.local` and resolving these values for all backend components.
+
+## 3. Server-Side Retargeting & Signal Processing
+Raw model outputs are normalized and mapped in `server/retargeter.py` using parameters from `retarget_map.json` and global environment defaults:
 - **Dynamic Gain**: An automatic gain control (AGC) mechanism (`expression_target`) scales PCA coefficients based on the rolling average magnitude of the last `N` frames. This ensures expressions remain expressive even for quiet audio.
 - **Normalization targets**:
   - `expression_norm_target`: Target standard deviation for PCA coefficients.
@@ -24,9 +33,10 @@ Raw model outputs are normalized and mapped in `server/retargeter.py` using para
   - Pose channels use quaternion **SLERP** interpolation in `audio_pipeline.py` (axis-angle -> quaternion -> SLERP -> axis-angle) to avoid rotation ghosting artifacts.
   - Expressions and root translation still use `_resample_frames_linear`.
 - **Slow-Motion Debugging**: A `SLOW_MOTION_FACTOR` can be applied to stretch the animation in time (e.g., 5.0 for 5x slower) while maintaining a steady broadcast rate, allowing for frame-by-frame irregularity analysis.
-- **Inference Ingress Buffering**: `audio_in_queue` is sized by `AUDIO_IN_QUEUE_MAX_CHUNKS` (default `16`, configurable via `.env.local`) to bound maximum animation latency and prevent backlog accumulation if the inference worker lags.
+- **Inference Ingress Buffering**: `audio_in_queue` is sized by `AUDIO_IN_QUEUE_MAX_CHUNKS` (default `16`) to bound maximum animation latency and prevent backlog accumulation if the inference worker lags.
+- **Global ML Bounds**: `EXPRESSION_MAX_ABS`, `MOUTH_MAX_ABS`, and `EYE_BROW_MAX_ABS` provide a safety ceiling for retargeted coefficients, configurable via environment.
 
-## 3. Frontend Architecture & Synchronization
+## 4. Frontend Architecture & Synchronization
 The WebGL frontend (Three.js) is designed for low-latency visual stability and reconnect recovery.
 - **Modular Multi-Threaded Pipeline**:
   - **Main Thread UI (`ViewerController.js`)**: Orchestrates rendering, audio playback, HUD metrics, and DOM interactions.
@@ -55,12 +65,12 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
   - Assistant response chunks are routed to `ingest_audio_chunk` in `audio_pipeline.py`, fanning out to `/ws/audio_out` and the ML inference queue.
   - Frontend flushes audio scheduler on `stream_session_id` change to prevent cross-reply drift.
 
-## 4. SMPL-X Morph Target Strategy
+## 5. SMPL-X Morph Target Strategy
 - **Base vs. Additive**: We use **Additive Blending**. Morph influences are applied on top of the "Base Face" (Neutral Mean).
 - **Persistence Layer**: To avoid flickering during network dropouts, the last applied expression is cached. Each new frame is applied as an influence delta or replacement, ensuring the avatar never snaps back to a "blank stare" mid-sentence.
 - **Mesh Detection**: The system dynamically identifies morph target indices by scanning the geometry labels (e.g., searching for "Exp000", "Exp010") to maintain compatibility across different exports of the SMPL-X model.
 
-## 5. Protocol Details (Current)
+## 6. Protocol Details (Current)
 - **Protocol Version**: `2` (with legacy v1 fallback for `/ws/anim`).
 - **Server Identity**:
   - `server_boot_id`: new UUID each server boot.
@@ -106,7 +116,7 @@ The WebGL frontend (Three.js) is designed for low-latency visual stability and r
   - `[3:3 + nbones*4]`: Bone Quaternions (X, Y, Z, W).
   - `[3 + nbones*4:]`: Morph influences.
 
-## 6. Modular Server Architecture & Session Lifecycle
+## 7. Modular Server Architecture & Session Lifecycle
 The backend is split into specialized modules for scalability and maintainability:
 - **`app.py`**: Thin coordinator. Owns FastAPI WebSockets and API routing (Static asset mounting has been removed in favor of React/Vite development server on port 5173).
 - **`session.py`**: Owns `SessionState` dataclasses, the shared session registry, and the GC loop.
@@ -127,7 +137,7 @@ The backend is split into specialized modules for scalability and maintainabilit
 - **WASM Performance**:
   - Middleware in `app.py` sets COOP/COEP/CORP for SharedArrayBuffer compatibility.
 
-## 7. Current Debug Configuration
+## 8. Current Debug Configuration
 - **Debug Defaults**:
   - `DEBUG` is off by default in viewer and worker paths.
   - high-frequency logs are reduced to periodic summaries.
@@ -141,7 +151,7 @@ The backend is split into specialized modules for scalability and maintainabilit
   - startup watchdog is suppressed briefly during reconnect/bootstrap.
   - Worker auto-restarts on `reset_required` after clearing stale session cache.
 
-## 8. Operational Defaults and Edge Cases
+## 9. Operational Defaults and Edge Cases
 - **Defaults**:
   - `STREAM_FPS=20`
   - `SNAPSHOT_SECONDS=3.0` (`SNAPSHOT_FRAMES=ceil(3.0*STREAM_FPS)`)

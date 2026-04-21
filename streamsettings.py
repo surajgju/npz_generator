@@ -52,6 +52,19 @@ EXPRESSION_MAX_ABS: float = _env_float("EXPRESSION_MAX_ABS", 0.85)
 MOUTH_MAX_ABS: float = _env_float("MOUTH_MAX_ABS", 0.70)
 EYE_BROW_MAX_ABS: float = _env_float("EYE_BROW_MAX_ABS", 0.55)
 
+# --- Retargeter Advanced Defaults ---
+EXPRESSION_NORM_MIN: float = _env_float("EXPRESSION_NORM_MIN", 0.2)
+EXPRESSION_NORM_MAX: float = _env_float("EXPRESSION_NORM_MAX", 2.5)
+EXPRESSION_TARGET: float = _env_float("EXPRESSION_TARGET", 0.35)
+EXPRESSION_GAIN_MIN: float = _env_float("EXPRESSION_GAIN_MIN", 0.3)
+EXPRESSION_GAIN_MAX: float = _env_float("EXPRESSION_GAIN_MAX", 3.0)
+EXPRESSION_OFFSET_STRENGTH: float = _env_float("EXPRESSION_OFFSET_STRENGTH", 0.5)
+EXPRESSION_FALLBACK_GAIN: float = _env_float("EXPRESSION_FALLBACK_GAIN", 3.0)
+EXPRESSION_FALLBACK_THRESH: float = _env_float("EXPRESSION_FALLBACK_THRESH", 0.05)
+
+# --- App Constants ---
+ALLOWED_ORIGINS: str = os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+
 # Backward-compatible aliases for modules/tests that still refer to these names.
 BASE_FPS: int = BASE_MOTION_FPS
 

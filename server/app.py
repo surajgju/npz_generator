@@ -48,7 +48,7 @@ if SERVER_DIR not in sys.path:
 
 from npz_logging import setup_logging
 from retargeter import SmplxRetargeter
-from streamsettings import DEFAULT_OVERLAP_SEC, log_resolved_stream_settings
+from streamsettings import DEFAULT_OVERLAP_SEC, log_resolved_stream_settings, ALLOWED_ORIGINS
 from . import session as session_state
 from .session import (
     STREAM_FPS,
@@ -97,7 +97,7 @@ _BOOT_MONO_NS: int = time.monotonic_ns()
  
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=ALLOWED_ORIGINS.split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

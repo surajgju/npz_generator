@@ -4,7 +4,19 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 import numpy as np
-from streamsettings import EYE_BROW_MAX_ABS, EXPRESSION_MAX_ABS, MOUTH_MAX_ABS
+from streamsettings import (
+    EYE_BROW_MAX_ABS,
+    EXPRESSION_MAX_ABS,
+    MOUTH_MAX_ABS,
+    EXPRESSION_NORM_MIN,
+    EXPRESSION_NORM_MAX,
+    EXPRESSION_TARGET,
+    EXPRESSION_GAIN_MIN,
+    EXPRESSION_GAIN_MAX,
+    EXPRESSION_OFFSET_STRENGTH,
+    EXPRESSION_FALLBACK_GAIN,
+    EXPRESSION_FALLBACK_THRESH,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +170,8 @@ class SmplxRetargeter:
         self._expression_norm_p95 = None
         self._expression_norm_mean = None
         self._expression_norm_target = 1.0
-        self._expression_norm_min = 0.2
-        self._expression_norm_max = 2.5
+        self._expression_norm_min = float(EXPRESSION_NORM_MIN)
+        self._expression_norm_max = float(EXPRESSION_NORM_MAX)
         self._expression_norm_scales = None
         self._logged_norm_scales = False
         self._logged_norm_morph = False
@@ -167,12 +179,12 @@ class SmplxRetargeter:
         self._logged_expression_offset = False
         self._expression_smooth_alpha = None
         self._expression_smooth_prev = None
-        self._expression_target = 0.35
-        self._expression_gain_min = 0.3
-        self._expression_gain_max = 3.0
-        self._expression_offset_strength = 0.5
-        self._expression_fallback_gain = 3.0
-        self._expression_fallback_thresh = 0.05
+        self._expression_target = float(EXPRESSION_TARGET)
+        self._expression_gain_min = float(EXPRESSION_GAIN_MIN)
+        self._expression_gain_max = float(EXPRESSION_GAIN_MAX)
+        self._expression_offset_strength = float(EXPRESSION_OFFSET_STRENGTH)
+        self._expression_fallback_gain = float(EXPRESSION_FALLBACK_GAIN)
+        self._expression_fallback_thresh = float(EXPRESSION_FALLBACK_THRESH)
         self._jaw_scale = 1.0
         self._jaw_idx = SMPLX_JOINT_NAMES.index("jaw")
         self._buffer_seconds = None

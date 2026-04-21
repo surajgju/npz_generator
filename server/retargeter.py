@@ -161,6 +161,7 @@ class SmplxRetargeter:
         self._logged_root_offset = False
         self._root_bone_idx: Optional[int] = None
         self._global_align_quat = None
+        self._zero_global_orient: bool = False
         self._direct_expr = False
         self._expr_indices: List[int] = []
         self._max_expr_index = -1
@@ -265,6 +266,11 @@ class SmplxRetargeter:
                     self._global_align_quat = ga
             except Exception:
                 pass
+        if "zero_global_orient" in data:
+            try:
+                self._zero_global_orient = bool(data.get("zero_global_orient", False))
+            except Exception:
+                self._zero_global_orient = False
         if "expression_scale" in data:
             try:
                 self._expression_scale = float(data.get("expression_scale", 1.0))
@@ -619,6 +625,11 @@ class SmplxRetargeter:
         bone_quats[..., 3] = 1.0
         for smplx_idx, bone_idx in self._bone_map.items():
             if smplx_idx >= joint_count or bone_idx >= nbones:
+                continue
+            # Zero out the global orient (pelvis/joint-0) to prevent EMAGE's training-space
+            # body orientation from tilting the GLB avatar backward.
+            if self._zero_global_orient and smplx_idx == 0:
+                bone_quats[:, bone_idx] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
                 continue
             axis_angle = joints[:, smplx_idx]
             raw_mag = float(np.mean(np.linalg.norm(axis_angle, axis=1))) if axis_angle.size else 0.0

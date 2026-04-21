@@ -945,10 +945,8 @@ function applyIdlePoseAdditive(nowSec, blend) {
   slerpBoneTowardIdle(idleBones.spine2, idleRestQuats.spine2, spinePitch * 0.35, spineYaw * 0.35, 0, blend);
   slerpBoneTowardIdle(idleBones.spine3, idleRestQuats.spine3, spinePitch * 0.25, spineYaw * 0.25, 0, blend);
 
-  const shoulderPitch = (-8 * Math.PI) / 180;
+  // NOTE: shoulders excluded — server drives them during live playback.
   const elbowBend = (-5 * Math.PI) / 180;
-  slerpBoneTowardIdle(idleBones.leftShoulder, idleRestQuats.leftShoulder, shoulderPitch, 0, 0, blend);
-  slerpBoneTowardIdle(idleBones.rightShoulder, idleRestQuats.rightShoulder, shoulderPitch, 0, 0, blend);
   slerpBoneTowardIdle(idleBones.leftElbow, idleRestQuats.leftElbow, elbowBend, 0, 0, blend);
   slerpBoneTowardIdle(idleBones.rightElbow, idleRestQuats.rightElbow, elbowBend, 0, 0, blend);
 
@@ -1068,22 +1066,10 @@ function applySpeechBodyOverlay(nowSec, targetEnergy, energyScale = 1) {
     0,
     blend
   );
-  slerpBoneTowardIdle(
-    idleBones.leftShoulder,
-    idleRestQuats.leftShoulder,
-    SPEECH_SHOULDER_MAX_PITCH * pulse,
-    0,
-    0,
-    blend
-  );
-  slerpBoneTowardIdle(
-    idleBones.rightShoulder,
-    idleRestQuats.rightShoulder,
-    SPEECH_SHOULDER_MAX_PITCH * pulse,
-    0,
-    0,
-    blend
-  );
+  // NOTE: shoulders are intentionally excluded here — their animation
+  // comes from the server (SMPL-X body_pose joints 13/14 = left/right collar,
+  // 16/17 = left/right shoulder). Overriding them during live playback
+  // would jam the server-driven shoulder gestures.
 }
 
 function applyUtteranceTail(nowMs) {

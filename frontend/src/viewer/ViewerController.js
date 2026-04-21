@@ -305,6 +305,49 @@ function resetAllMorphsToBase() {
   }
 }
 
+function refreshSpeechMorphIndices() {
+  mouthMorphIndices = debugMouthPreferredNames
+    .map((name) => morphNames.indexOf(name))
+    .filter((idx) => idx >= 0);
+  mouthMorphIndexSet = new Set(mouthMorphIndices);
+}
+
+function resetLivePlaybackFilters() {
+  stabilizedRootOffset.set(0, 0, 0);
+  rootStabilizerReady = false;
+  speechEnergySmoothed = 0;
+  speechBodyBlend = 0;
+  speechOverlayLastSec = 0;
+  idleTailArmed = false;
+  idleTailStartMs = null;
+}
+
+function stabilizeRootTranslation(rootX, rootY, rootZ, advanceRootSmoothing) {
+  if (!rootStabilizerReady) {
+    stabilizedRootOffset.set(rootX, rootY, rootZ);
+    rootStabilizerReady = true;
+    return stabilizedRootOffset;
+  }
+  if (advanceRootSmoothing) {
+    for (const axis of ["x", "z"]) {
+      const raw = axis === "x" ? rootX : rootZ;
+      const prev = stabilizedRootOffset[axis];
+      const delta = raw - prev;
+      if (Math.abs(delta) <= ROOT_XZ_DEADBAND_M) {
+        continue;
+      }
+      stabilizedRootOffset[axis] =
+        prev +
+        Math.max(
+          -ROOT_XZ_MAX_STEP_M,
+          Math.min(ROOT_XZ_MAX_STEP_M, delta * ROOT_XZ_EMA_ALPHA)
+        );
+    }
+  }
+  stabilizedRootOffset.y = rootY;
+  return stabilizedRootOffset;
+}
+
 function resetIdlePose() {
   if (idleRestQuats.head && idleBones.head) idleBones.head.quaternion.copy(idleRestQuats.head);
   if (idleRestQuats.neck && idleBones.neck) idleBones.neck.quaternion.copy(idleRestQuats.neck);
@@ -969,6 +1012,96 @@ function easeInOut(t) {
   return 0.5 - 0.5 * Math.cos(Math.PI * Math.max(0, Math.min(1, t)));
 }
 
+function updateSpeechBodyBlend(nowSec, targetBlend) {
+  const target = Math.max(0, Math.min(1, targetBlend));
+  if (!speechOverlayLastSec) {
+    speechOverlayLastSec = nowSec;
+    speechBodyBlend = target;
+    return speechBodyBlend;
+  }
+  const dt = Math.max(0, Math.min(0.1, nowSec - speechOverlayLastSec));
+  speechOverlayLastSec = nowSec;
+  const duration = target > speechBodyBlend ? SPEECH_BODY_FADE_IN_SEC : SPEECH_BODY_FADE_OUT_SEC;
+  const step = duration > 0 ? Math.min(1, dt / duration) : 1;
+  speechBodyBlend += (target - speechBodyBlend) * step;
+  return speechBodyBlend;
+}
+
+function applySpeechBodyOverlay(nowSec, targetEnergy, energyScale = 1) {
+  if (!avatarLoaded) return;
+  cacheIdleBones();
+  const blend = updateSpeechBodyBlend(nowSec, targetEnergy) * Math.max(0, energyScale);
+  if (blend <= 0.001) return;
+  const phase = (nowSec / SPEECH_BODY_SWAY_PERIOD_SEC) * Math.PI * 2;
+  const pulse = 0.88 + 0.12 * Math.sin(phase);
+  const sway = Math.sin(phase * 0.6) * 0.5;
+
+  slerpBoneTowardIdle(
+    idleBones.spine1,
+    idleRestQuats.spine1,
+    SPEECH_SPINE_MAX_PITCH,
+    0,
+    0,
+    blend * pulse
+  );
+  slerpBoneTowardIdle(
+    idleBones.spine2,
+    idleRestQuats.spine2,
+    SPEECH_SPINE_MAX_PITCH * 0.8,
+    0,
+    0,
+    blend * pulse
+  );
+  slerpBoneTowardIdle(
+    idleBones.spine3,
+    idleRestQuats.spine3,
+    SPEECH_SPINE_MAX_PITCH * 0.6,
+    0,
+    0,
+    blend * pulse
+  );
+  slerpBoneTowardIdle(
+    idleBones.neck,
+    idleRestQuats.neck,
+    SPEECH_NECK_MAX_PITCH * pulse,
+    SPEECH_NECK_MAX_YAW * sway,
+    0,
+    blend
+  );
+  slerpBoneTowardIdle(
+    idleBones.leftShoulder,
+    idleRestQuats.leftShoulder,
+    SPEECH_SHOULDER_MAX_PITCH * pulse,
+    0,
+    0,
+    blend
+  );
+  slerpBoneTowardIdle(
+    idleBones.rightShoulder,
+    idleRestQuats.rightShoulder,
+    SPEECH_SHOULDER_MAX_PITCH * pulse,
+    0,
+    0,
+    blend
+  );
+}
+
+function applyUtteranceTail(nowMs) {
+  if (!idleTailArmed) return 1;
+  if (idleTailStartMs === null) {
+    idleTailStartMs = nowMs;
+  }
+  const progress = Math.max(0, Math.min(1, (nowMs - idleTailStartMs) / SPEECH_BODY_TAIL_MS));
+  applyStallEase(progress);
+  cacheIdleBones();
+  slerpBoneTowardIdle(idleBones.jaw, idleRestQuats.jaw, 0, 0, 0, progress);
+  if (progress >= 1) {
+    idleTailArmed = false;
+    idleTailStartMs = null;
+  }
+  return 1 - progress;
+}
+
 function applyMorphTargets(targets, value) {
   for (const t of targets) {
     const base = t.base ?? 0;
@@ -1107,10 +1240,14 @@ let boneRestQuats = [];
 let boneRestPos = [];
 let rootBone = null;
 let rootRestPos = new THREE.Vector3();
+let stabilizedRootOffset = new THREE.Vector3();
+let rootStabilizerReady = false;
 let morphTargetMap = new Map();
 let morphAliasCount = 0;
 let loggedAliasSummary = false;
 let morphNames = [];
+let mouthMorphIndices = [];
+let mouthMorphIndexSet = new Set();
 let expMeshCount = 0;
 let avatarLoaded = false;
 let frameCount = 0;
@@ -1269,9 +1406,25 @@ let resyncing = false;
 let buildLogged = false;
 let sessionMismatchWarned = false;
 let lastSessionResetAt = 0;
+let speechEnergySmoothed = 0;
+let speechBodyBlend = 0;
+let speechOverlayLastSec = 0;
+let idleTailArmed = false;
+let idleTailStartMs = null;
 
 const MORPH_EMA_ALPHA = 0.35;
-const MORPH_CLAMP = 2.5;
+const MORPH_CLAMP = Number(import.meta.env.VITE_EXPRESSION_MAX_ABS || 0.85);
+const ROOT_XZ_DEADBAND_M = Number(import.meta.env.VITE_ROOT_XZ_DEADBAND_M || 0.005);
+const ROOT_XZ_EMA_ALPHA = Number(import.meta.env.VITE_ROOT_XZ_EMA_ALPHA || 0.15);
+const ROOT_XZ_MAX_STEP_M = Number(import.meta.env.VITE_ROOT_XZ_MAX_STEP_M || 0.015);
+const SPEECH_BODY_FADE_IN_SEC = 0.12;
+const SPEECH_BODY_FADE_OUT_SEC = 0.18;
+const SPEECH_BODY_TAIL_MS = 180;
+const SPEECH_SPINE_MAX_PITCH = (1.5 * Math.PI) / 180;
+const SPEECH_NECK_MAX_PITCH = (0.8 * Math.PI) / 180;
+const SPEECH_NECK_MAX_YAW = (0.8 * Math.PI) / 180;
+const SPEECH_SHOULDER_MAX_PITCH = (-1.0 * Math.PI) / 180;
+const SPEECH_BODY_SWAY_PERIOD_SEC = 2.4;
 
 const gltfLoader = new GLTFLoader();
 const tempQuat = new THREE.Quaternion();
@@ -1709,6 +1862,8 @@ function applyAnimInit(msg) {
   }
   if (msg.mouth && Array.isArray(msg.mouth.morphs)) {
     debugMouthPreferredNames = msg.mouth.morphs.slice();
+  } else {
+    debugMouthPreferredNames = [];
   }
   morphNames = msg.morphs || [];
   smoothedMorphs = new Float32Array(morphNames.length);
@@ -1755,9 +1910,11 @@ function applyAnimInit(msg) {
   autoDetectBlinkMorphs();
   refreshIdleBlinkTargets();
   refreshDebugMorphTargets();
+  refreshSpeechMorphIndices();
+  resetLivePlaybackFilters();
 }
 
-function applyAnimFrame(frame) {
+function applyAnimFrame(frame, { advanceRootSmoothing = true } = {}) {
   if (!avatarLoaded || !boneOrder.length) return;
   const nb = boneOrder.length;
   const nm = morphNames.length;
@@ -1776,7 +1933,8 @@ function applyAnimFrame(frame) {
     offset += 4;
   }
   if (rootBone) {
-    tempVec.set(rootX, rootY, rootZ);
+    const rootOffset = stabilizeRootTranslation(rootX, rootY, rootZ, advanceRootSmoothing);
+    tempVec.copy(rootOffset);
     rootBone.position.copy(rootRestPos).add(tempVec);
   }
   // Offset already advanced inside the loop above.
@@ -1788,12 +1946,13 @@ function applyAnimFrame(frame) {
     });
   }
   let maxAbs = 0;
+  let mouthEnergy = 0;
+  let mouthCount = 0;
   if (!smoothedMorphs || smoothedMorphs.length !== nm) {
     smoothedMorphs = new Float32Array(nm);
   }
   for (let i = 0; i < nm; i++) {
-    const name = morphNames[i];
-    const targets = morphTargetMap.get(name);
+    const targets = morphTargetMap.get(morphNames[i]);
     let v = frame[offset + i];
     if (v > MORPH_CLAMP) v = MORPH_CLAMP;
     else if (v < -MORPH_CLAMP) v = -MORPH_CLAMP;
@@ -1808,7 +1967,13 @@ function applyAnimFrame(frame) {
     }
     const av = Math.abs(v);
     if (av > maxAbs) maxAbs = av;
+    if (mouthMorphIndexSet.has(i)) {
+      mouthEnergy += Math.abs(smoothed);
+      mouthCount += 1;
+    }
   }
+  const nextSpeechEnergy = mouthCount > 0 ? mouthEnergy / mouthCount : maxAbs;
+  speechEnergySmoothed = speechEnergySmoothed * 0.7 + nextSpeechEnergy * 0.3;
   lastAppliedAt = performance.now();
   const sample = {};
   for (const name of ["Exp000", "Exp010", "Exp020"]) {
@@ -1916,6 +2081,7 @@ function initWorker() {
   streamFpsReady = false;
   workerTiming = null;
   currentPlayFps = 0;
+  resetLivePlaybackFilters();
   worker = new Worker(new URL("./anim_worker.js", import.meta.url), { type: "module" });
   startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
   const known = loadKnownSessionState();
@@ -1989,9 +2155,11 @@ function initWorker() {
     } else if (msg.type === "snapshot_anchor") {
       startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
       resyncing = true;
+      resetLivePlaybackFilters();
     } else if (msg.type === "resync") {
       resyncing = true;
       startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+      resetLivePlaybackFilters();
       if (DEBUG) warn("Worker requested resync", msg);
     } else if (msg.type === "session_switch") {
       if (msg.sessionId) workerSessionId = msg.sessionId;
@@ -1999,6 +2167,7 @@ function initWorker() {
       heldFrameData = null;
       lagIdleBlend = 0;
       lagIdleStarted = false;
+      resetLivePlaybackFilters();
       clearMismatchIfAligned();
       resyncing = false;
       sessionMismatchWarned = false;
@@ -2031,6 +2200,7 @@ function initWorker() {
         workerReady = false;
         resyncing = true;
         startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+        resetLivePlaybackFilters();
         scheduleWorkerRestart("reset_required");
       } else if (msg.status === "error" || msg.status === "closed") {
         if (workerRestartPending) {
@@ -2359,7 +2529,15 @@ function formatMetric(value, suffix = "", digits = 1) {
 
 function updateWorkerTiming(timing) {
   if (!timing || typeof timing !== "object") return;
+  const prevFlushReason = workerTiming?.flush_reason;
   workerTiming = { ...(workerTiming || {}), ...timing };
+  if (timing.flush_reason === "idle_timeout" && prevFlushReason !== "idle_timeout") {
+    idleTailArmed = true;
+    idleTailStartMs = null;
+  } else if (timing.flush_reason === "batch_complete" && prevFlushReason !== "batch_complete") {
+    idleTailArmed = false;
+    idleTailStartMs = null;
+  }
 }
 
 function updateInferBudgetColor() {
@@ -2486,6 +2664,7 @@ function beginSessionRecovery(reason) {
   lagIdleBlend = 0;
   lagIdleStarted = false;
   lastWorkerFrameIndexSeen = -1;
+  resetLivePlaybackFilters();
   if (worker) worker.postMessage({ type: "reset" });
   if (DEBUG) {
     warn("Session recovery started", {
@@ -2630,7 +2809,8 @@ function updatePlaybackFrameWorker() {
   // Keep rendering alive during lag by replaying last frame and blending idle additively.
   if (workerFrame && frameDirty) {
     resetAllMorphsToBase();
-    applyAnimFrame(workerFrame);
+    applyAnimFrame(workerFrame, { advanceRootSmoothing: true });
+    applySpeechBodyOverlay(nowSec, Math.min(1, speechEnergySmoothed / 0.35));
     heldFrameData = workerFrame;
     lagIdleBlend = 0;
     lagIdleStarted = false;
@@ -2643,8 +2823,9 @@ function updatePlaybackFrameWorker() {
     stallSinceMs = null;
   } else if (heldFrameData) {
     resetAllMorphsToBase();
-    applyAnimFrame(heldFrameData);
+    applyAnimFrame(heldFrameData, { advanceRootSmoothing: false });
     const stalledForMs = Math.max(0, nowMs - lastFrameUpdate);
+    let speechOverlayScale = 1;
     if (stalledForMs <= STALL_HOLD_MS) {
       playStateEl.textContent = "stalled_hold";
       lagIdleBlend = 0;
@@ -2662,6 +2843,11 @@ function updatePlaybackFrameWorker() {
       applyIdlePoseAdditive(nowSec, lagIdleBlend);
       playStateEl.textContent = "stalled_idle";
     }
+    if (idleTailArmed) {
+      speechOverlayScale = applyUtteranceTail(nowMs);
+      playStateEl.textContent = "tail_decay";
+    }
+    applySpeechBodyOverlay(nowSec, Math.min(1, speechEnergySmoothed / 0.35), speechOverlayScale);
     if (DEBUG && !frameDirty && playCount % 30 === 0) {
       log("Audio holding - replaying last frame", {
         elapsed: elapsed.toFixed(3),

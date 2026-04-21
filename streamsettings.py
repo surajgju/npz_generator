@@ -46,6 +46,11 @@ STREAM_FPS: int = _env_int("STREAM_FPS", 20)
 DEFAULT_OVERLAP_SEC: float = _env_float("DEFAULT_OVERLAP_SEC", 0.25)
 DEFAULT_INFERENCE_BATCH_SAMPLES: int = _env_int("INFERENCE_BATCH_SAMPLES", 2400)
 DEFAULT_RENDER_FPS: int = _env_int("DEFAULT_RENDER_FPS", BASE_MOTION_FPS)
+LIVE_INFERENCE_BATCH_SAMPLES: int = _env_int("LIVE_INFERENCE_BATCH_SAMPLES", 8000)
+LIVE_IDLE_FLUSH_MS: float = _env_float("LIVE_IDLE_FLUSH_MS", 150.0)
+EXPRESSION_MAX_ABS: float = _env_float("EXPRESSION_MAX_ABS", 0.85)
+MOUTH_MAX_ABS: float = _env_float("MOUTH_MAX_ABS", 0.70)
+EYE_BROW_MAX_ABS: float = _env_float("EYE_BROW_MAX_ABS", 0.55)
 
 # Backward-compatible aliases for modules/tests that still refer to these names.
 BASE_FPS: int = BASE_MOTION_FPS
@@ -60,6 +65,11 @@ def resolved_stream_settings() -> Dict[str, Union[int, float]]:
         "default_overlap_sec": DEFAULT_OVERLAP_SEC,
         "default_inference_batch_samples": DEFAULT_INFERENCE_BATCH_SAMPLES,
         "default_render_fps": DEFAULT_RENDER_FPS,
+        "live_inference_batch_samples": LIVE_INFERENCE_BATCH_SAMPLES,
+        "live_idle_flush_ms": LIVE_IDLE_FLUSH_MS,
+        "expression_max_abs": EXPRESSION_MAX_ABS,
+        "mouth_max_abs": MOUTH_MAX_ABS,
+        "eye_brow_max_abs": EYE_BROW_MAX_ABS,
     }
 
 
@@ -70,11 +80,16 @@ def log_resolved_stream_settings(logger: logging.Logger, *, prefix: str = "Resol
     _logged_settings = True
     settings = resolved_stream_settings()
     logger.info(
-        "%s base_motion_fps=%d stream_fps=%d default_overlap_sec=%.3f default_inference_batch_samples=%d default_render_fps=%d",
+        "%s base_motion_fps=%d stream_fps=%d default_overlap_sec=%.3f default_inference_batch_samples=%d default_render_fps=%d live_inference_batch_samples=%d live_idle_flush_ms=%.1f expression_max_abs=%.3f mouth_max_abs=%.3f eye_brow_max_abs=%.3f",
         prefix,
         settings["base_motion_fps"],
         settings["stream_fps"],
         settings["default_overlap_sec"],
         settings["default_inference_batch_samples"],
         settings["default_render_fps"],
+        settings["live_inference_batch_samples"],
+        settings["live_idle_flush_ms"],
+        settings["expression_max_abs"],
+        settings["mouth_max_abs"],
+        settings["eye_brow_max_abs"],
     )

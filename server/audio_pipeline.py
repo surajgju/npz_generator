@@ -24,7 +24,11 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 from fastapi import WebSocket
-from streamsettings import DEFAULT_INFERENCE_BATCH_SAMPLES, DEFAULT_OVERLAP_SEC
+from streamsettings import (
+    DEFAULT_OVERLAP_SEC,
+    LIVE_IDLE_FLUSH_MS,
+    LIVE_INFERENCE_BATCH_SAMPLES,
+)
 
 from . import session as session_state
 from .session import (
@@ -900,6 +904,7 @@ def _clear_pending_session_state(
     seen_first_batch: Dict[str, bool],
     session_next_frame_index: Dict[str, int],
     last_diag_log: Dict[str, float],
+    last_backend_summary_log: Dict[str, float],
     pending_last_chunk_at: Dict[str, float],
     *,
     session_id: Optional[str] = None,
@@ -912,6 +917,7 @@ def _clear_pending_session_state(
         seen_first_batch.clear()
         session_next_frame_index.clear()
         last_diag_log.clear()
+        last_backend_summary_log.clear()
         pending_last_chunk_at.clear()
         return
     pending_chunks.pop(session_id, None)
@@ -921,6 +927,7 @@ def _clear_pending_session_state(
     seen_first_batch.pop(session_id, None)
     session_next_frame_index.pop(session_id, None)
     last_diag_log.pop(session_id, None)
+    last_backend_summary_log.pop(session_id, None)
     pending_last_chunk_at.pop(session_id, None)
 
 
@@ -933,6 +940,7 @@ def _drain_inference_control_queue(
     seen_first_batch: Dict[str, bool],
     session_next_frame_index: Dict[str, int],
     last_diag_log: Dict[str, float],
+    last_backend_summary_log: Dict[str, float],
     pending_last_chunk_at: Dict[str, float],
     reset_token: int,
 ) -> int:
@@ -955,6 +963,7 @@ def _drain_inference_control_queue(
                 seen_first_batch,
                 session_next_frame_index,
                 last_diag_log,
+                last_backend_summary_log,
                 pending_last_chunk_at,
             )
             reset_token += 1
@@ -967,6 +976,7 @@ def _drain_inference_control_queue(
                 seen_first_batch,
                 session_next_frame_index,
                 last_diag_log,
+                last_backend_summary_log,
                 pending_last_chunk_at,
                 session_id=message.get("session_id"),
             )
@@ -986,7 +996,7 @@ def start_inference_service(
     control_queue = ctx.Queue(maxsize=8)
     stop_event = ctx.Event()
     ready_event = ctx.Event()
-    configured_batch_samples = max(1, DEFAULT_INFERENCE_BATCH_SAMPLES)
+    configured_batch_samples = max(1, LIVE_INFERENCE_BATCH_SAMPLES)
     service_batch_samples = max(1, batch_samples or configured_batch_samples)
     process = ctx.Process(
         target=_inference_process_main,
@@ -1170,13 +1180,7 @@ def _inference_process_main(
         )
         ready_event.set()
 
-        try:
-            flush_idle_sec = max(
-                0.0,
-                float(os.environ.get("INFERENCE_IDLE_FLUSH_SEC", "0.2")),
-            )
-        except ValueError:
-            flush_idle_sec = 0.2
+        flush_idle_sec = max(0.0, float(LIVE_IDLE_FLUSH_MS) / 1000.0)
 
         pending_chunks: Dict[str, deque] = defaultdict(deque)
         pending_samples: Dict[str, int] = defaultdict(int)
@@ -1200,6 +1204,7 @@ def _inference_process_main(
                 seen_first_batch,
                 session_next_frame_index,
                 last_diag_log,
+                last_backend_summary_log,
                 pending_last_chunk_at,
                 reset_token,
             )
@@ -1221,6 +1226,7 @@ def _inference_process_main(
                     seen_first_batch,
                     session_next_frame_index,
                     last_diag_log,
+                    last_backend_summary_log,
                     pending_last_chunk_at,
                     session_id=session_id,
                 )
@@ -1296,6 +1302,7 @@ def _inference_process_main(
                     seen_first_batch,
                     session_next_frame_index,
                     last_diag_log,
+                    last_backend_summary_log,
                     pending_last_chunk_at,
                     session_id=session_id,
                 )
@@ -1438,9 +1445,11 @@ def _inference_process_main(
             last_summary = last_backend_summary_log.get(session_id, 0.0)
             if normalized_flush_reason == FLUSH_REASON_IDLE_TIMEOUT or (now - last_summary) >= 10.0:
                 logger.info(
-                    "Backend timing session=%s chunk=%s inputqueuewait_ms=%.3f infer_ms=%.3f resample_ms=%.3f retarget_ms=%.3f outputqueuewait_ms=%.3f batch_samples=%d frames_count=%d flush_reason=%s",
+                    "Backend timing session=%s chunk=%s pending_chunks=%d pending_samples=%d inputqueuewait_ms=%.3f infer_ms=%.3f resample_ms=%.3f retarget_ms=%.3f outputqueuewait_ms=%.3f batch_samples=%d frames_count=%d flush_reason=%s",
                     session_id,
                     batch_chunk_id,
+                    len(pending_chunks.get(session_id, ())),
+                    int(pending_samples.get(session_id, 0)),
                     timing["inputqueuewait_ms"],
                     timing["infer_ms"],
                     timing["resample_ms"],
@@ -1461,7 +1470,9 @@ def _inference_process_main(
                 idle_sessions = [
                     sid
                     for sid, last_chunk_at in pending_last_chunk_at.items()
-                    if pending_samples.get(sid, 0) > 0 and (now - last_chunk_at) >= flush_idle_sec
+                    if pending_samples.get(sid, 0) > 0
+                    and pending_samples.get(sid, 0) < batch_samples
+                    and (now - last_chunk_at) >= flush_idle_sec
                 ]
                 for sid in idle_sessions:
                     if stop_event.is_set():
@@ -1501,6 +1512,7 @@ def _inference_process_main(
                     seen_first_batch,
                     session_next_frame_index,
                     last_diag_log,
+                    last_backend_summary_log,
                     pending_last_chunk_at,
                     session_id=session_id,
                 )

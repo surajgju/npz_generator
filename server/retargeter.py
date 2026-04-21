@@ -4,6 +4,7 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 import numpy as np
+from streamsettings import EYE_BROW_MAX_ABS, EXPRESSION_MAX_ABS, MOUTH_MAX_ABS
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ class SmplxRetargeter:
         self._max_expr_index = -1
         self._expression_scale = 1.0
         self._expression_clip = None
+        self._expression_max_abs = float(EXPRESSION_MAX_ABS)
         self._expression_norm_p95 = None
         self._expression_norm_mean = None
         self._expression_norm_target = 1.0
@@ -184,9 +186,12 @@ class SmplxRetargeter:
         self._saccade_pitch_deg = 1.0
         self._mouth_morphs = []
         self._mouth_morph_indices: List[int] = []
+        self._upper_face_morph_indices: List[int] = []
         self._mouth_viseme_map = {}
         self._mouth_gain = 1.0
         self._mouth_clip = None
+        self._mouth_max_abs = float(MOUTH_MAX_ABS)
+        self._eye_brow_max_abs = float(EYE_BROW_MAX_ABS)
         self._mouth_smooth_alpha = None
         self._mouth_safety = {
             "jaw_close_thresh": 0.12,
@@ -199,6 +204,7 @@ class SmplxRetargeter:
         self.last_morph_abs_max = 0.0
         self.last_mouth_abs_max = 0.0
         self.last_mouth_energy = 0.0
+        self.last_mouth_gain = 1.0
         self.last_clip_count = 0
         self.last_jaw_raw_mag = 0.0
         self.last_jaw_mag = 0.0
@@ -206,6 +212,7 @@ class SmplxRetargeter:
         self._load_config()
         self._prepare_direct_expression_map()
         self._prepare_mouth_indices()
+        self._prepare_upper_face_indices()
         if self.root_bone and self.root_bone in self.bones:
             self._root_bone_idx = self.bones.index(self.root_bone)
 
@@ -496,6 +503,15 @@ class SmplxRetargeter:
                 self._mouth_morphs,
             )
 
+    def _prepare_upper_face_indices(self):
+        if not self.morphs:
+            self._upper_face_morph_indices = []
+            return
+        mouth_index_set = set(self._mouth_morph_indices)
+        self._upper_face_morph_indices = [
+            idx for idx in range(len(self.morphs)) if idx not in mouth_index_set
+        ]
+
     def reset_root_offset(self):
         """Reset the root translation offset and expression history. Used when starting a new stream."""
         self._root_offset = None
@@ -508,6 +524,7 @@ class SmplxRetargeter:
         self.last_morph_abs_max = 0.0
         self.last_mouth_abs_max = 0.0
         self.last_mouth_energy = 0.0
+        self.last_mouth_gain = 1.0
         self.last_clip_count = 0
         self.last_jaw_raw_mag = 0.0
         self.last_jaw_mag = 0.0
@@ -551,7 +568,9 @@ class SmplxRetargeter:
                 "mouthEnergyThresh": float(self._mouth_safety.get("mouth_energy_thresh", 0.25)),
                 "reduceFactor": float(self._mouth_safety.get("reduce_factor", 0.55)),
                 "gain": float(self._mouth_gain),
-                "clip": None if self._mouth_clip is None else float(self._mouth_clip),
+                "clip": float(min(self._mouth_max_abs, self._mouth_clip))
+                if self._mouth_clip is not None
+                else float(self._mouth_max_abs),
                 "smoothAlpha": None if self._mouth_smooth_alpha is None else float(self._mouth_smooth_alpha),
             }
         if self._client_morph_smooth_alpha is not None:
@@ -739,22 +758,67 @@ class SmplxRetargeter:
                 self.last_morph_abs_max = float(np.max(np.abs(morphs)))
             except Exception:
                 self.last_morph_abs_max = 0.0
+        clip_count = 0
         if self._mouth_morph_indices and morphs.size:
             mouth_vals = morphs[:, self._mouth_morph_indices]
             if mouth_vals.size:
-                if self._mouth_gain != 1.0:
-                    morphs[:, self._mouth_morph_indices] *= float(self._mouth_gain)
-                self.last_mouth_abs_max = float(np.max(np.abs(morphs[:, self._mouth_morph_indices])))
-                self.last_mouth_energy = float(np.mean(np.abs(morphs[:, self._mouth_morph_indices])))
-        if self._expression_clip is not None and morphs.size:
-            clip_before = morphs.copy()
-            morphs = np.clip(morphs, -self._expression_clip, self._expression_clip)
-            try:
-                self.last_clip_count = int(np.count_nonzero(np.abs(clip_before - morphs) > 1e-6))
-            except Exception:
-                self.last_clip_count = 0
+                mouth_gain = float(self._mouth_gain)
+                pre_gain_abs_max = float(np.max(np.abs(mouth_vals)))
+                if pre_gain_abs_max > 1e-6:
+                    target_gain = (self._mouth_max_abs * 0.95) / pre_gain_abs_max
+                    mouth_gain = max(0.0, min(mouth_gain, target_gain))
+                self.last_mouth_gain = float(mouth_gain)
+                if mouth_gain != 1.0:
+                    morphs[:, self._mouth_morph_indices] *= mouth_gain
+                mouth_clip = float(self._mouth_max_abs)
+                if self._mouth_clip is not None:
+                    mouth_clip = min(mouth_clip, float(self._mouth_clip))
+                clipped = np.clip(
+                    morphs[:, self._mouth_morph_indices],
+                    -mouth_clip,
+                    mouth_clip,
+                )
+                clip_count += int(
+                    np.count_nonzero(
+                        np.abs(morphs[:, self._mouth_morph_indices] - clipped) > 1e-6
+                    )
+                )
+                morphs[:, self._mouth_morph_indices] = clipped
+                self.last_mouth_abs_max = float(
+                    np.max(np.abs(morphs[:, self._mouth_morph_indices]))
+                )
+                self.last_mouth_energy = float(
+                    np.mean(np.abs(morphs[:, self._mouth_morph_indices]))
+                )
         else:
-            self.last_clip_count = 0
+            self.last_mouth_gain = 1.0
+        if self._upper_face_morph_indices and morphs.size:
+            clipped = np.clip(
+                morphs[:, self._upper_face_morph_indices],
+                -self._eye_brow_max_abs,
+                self._eye_brow_max_abs,
+            )
+            clip_count += int(
+                np.count_nonzero(
+                    np.abs(morphs[:, self._upper_face_morph_indices] - clipped) > 1e-6
+                )
+            )
+            morphs[:, self._upper_face_morph_indices] = clipped
+        expression_clip = float(self._expression_max_abs)
+        if self._expression_clip is not None:
+            expression_clip = min(expression_clip, float(self._expression_clip))
+        if morphs.size:
+            clipped = np.clip(morphs, -expression_clip, expression_clip)
+            clip_count += int(np.count_nonzero(np.abs(morphs - clipped) > 1e-6))
+            morphs = clipped
+        self.last_clip_count = clip_count
+        try:
+            self.last_morph_abs_max = float(np.max(np.abs(morphs))) if morphs.size else 0.0
+        except Exception:
+            self.last_morph_abs_max = 0.0
+        if self._mouth_morph_indices and morphs.size:
+            self.last_mouth_abs_max = float(np.max(np.abs(morphs[:, self._mouth_morph_indices])))
+            self.last_mouth_energy = float(np.mean(np.abs(morphs[:, self._mouth_morph_indices])))
         if used_norm and not self._logged_norm_morph and morphs.size:
             logger.info("Expression norm morph_abs_max=%.4f", float(np.max(np.abs(morphs))))
             self._logged_norm_morph = True

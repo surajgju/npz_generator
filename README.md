@@ -191,7 +191,7 @@ Fine-tune your animation quality via CLI or config files:
 ### Reconnect & Stall Defaults (Implemented)
 - `STREAM_FPS=20`
 - Worker:
-  - `MAX_TAIL_LOCK_MS=350` (bounded wait for first live frame after snapshot tail alignment)
+  - `MAX_TAIL_LOCK_MS=3000` (bounded wait for first live frame after snapshot tail alignment)
 - Viewer:
   - `STARTUP_SUPPRESS_MS=4000` (suppresses expected startup watchdog noise)
   - `STALL_HOLD_MS=300` then `STALL_EASE_MS=700` (freeze-then-ease behavior)

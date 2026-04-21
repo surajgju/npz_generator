@@ -1212,7 +1212,7 @@ const SESSION_MISMATCH_GRACE_MS = Number(import.meta.env.VITE_SESSION_MISMATCH_G
 const STARTUP_SUPPRESS_MS = 4000;
 const STALL_HOLD_MS = 300;
 const STALL_EASE_MS = 700;
-const STALL_IDLE_BLEND_MS = Number(import.meta.env.VITE_STALL_IDLE_BLEND_MS || 1200);
+const STALL_IDLE_BLEND_MS = Number(import.meta.env.VITE_STALL_IDLE_BLEND_MS || 2200);
 const workerEnabled = typeof Worker !== "undefined";
 const WS_HOST =
   (import.meta && import.meta.env && import.meta.env.VITE_WS_HOST) ||

@@ -164,17 +164,6 @@ export function ConversationPanel() {
   return (
     <div className="cv-panel" data-connected={isConnected} data-state={state}>
 
-      {/* ── Connection badge (top-right corner) ── */}
-      <button
-        id="cv-connect-btn"
-        className={`cv-connect-badge ${isConnected ? "connected" : ""}`}
-        onClick={handleConnectToggle}
-        title={isConnected ? "Disconnect voice" : "Connect voice"}
-      >
-        <PowerIcon size={14} />
-        <span>{isConnected ? "Connected" : "Connect Voice"}</span>
-      </button>
-
       {/* ── Central orb ── */}
       <div
         className={`cv-orb-wrap ${isConnected ? "active" : ""} ${isPttActive ? "listening" : ""} ${isSpeaking ? "speaking" : ""}`}

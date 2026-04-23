@@ -3300,7 +3300,22 @@ async function onEnableAudio() {
   silentStartTime = null;
   startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  await audioCtx.resume();
+  
+  const resumeAudio = () => {
+    if (audioCtx && audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
+    }
+  };
+  window.addEventListener("click", resumeAudio, { once: true });
+  window.addEventListener("keydown", resumeAudio, { once: true });
+  window.addEventListener("touchstart", resumeAudio, { once: true });
+
+  try {
+    await audioCtx.resume();
+  } catch (e) {
+    // Browser policy may block this; it will resume on first user interaction.
+  }
+  
   connectConversationSocket();
   conversationClient.connectAudioOut();
 }
@@ -3355,7 +3370,6 @@ function bindUi() {
   if (toggleWireframeEl) toggleWireframeEl.addEventListener("change", onToggleWireframe);
   if (toggleAutoRotateEl) toggleAutoRotateEl.addEventListener("change", onToggleAutoRotate);
   if (toggleTranslateEl) toggleTranslateEl.addEventListener("change", onToggleTranslate);
-  if (enableAudioBtn) enableAudioBtn.addEventListener("click", onEnableAudio);
   if (connectConversationBtn) connectConversationBtn.addEventListener("click", onConnectConversation);
   if (interruptReplyBtn) interruptReplyBtn.addEventListener("click", onInterruptReply);
   if (disconnectMicButton) disconnectMicButton.addEventListener("click", onDisconnectMic);
@@ -3391,7 +3405,6 @@ function unbindUi() {
   if (toggleWireframeEl) toggleWireframeEl.removeEventListener("change", onToggleWireframe);
   if (toggleAutoRotateEl) toggleAutoRotateEl.removeEventListener("change", onToggleAutoRotate);
   if (toggleTranslateEl) toggleTranslateEl.removeEventListener("change", onToggleTranslate);
-  if (enableAudioBtn) enableAudioBtn.removeEventListener("click", onEnableAudio);
   if (connectConversationBtn) connectConversationBtn.removeEventListener("click", onConnectConversation);
   if (interruptReplyBtn) interruptReplyBtn.removeEventListener("click", onInterruptReply);
   if (disconnectMicButton) disconnectMicButton.removeEventListener("click", onDisconnectMic);
@@ -3448,7 +3461,6 @@ function collectDom() {
   toggleWireframeEl = document.getElementById("toggleWireframe");
   toggleAutoRotateEl = document.getElementById("toggleAutoRotate");
   toggleTranslateEl = document.getElementById("toggleTranslate");
-  enableAudioBtn = document.getElementById("enableAudio");
   connectConversationBtn = document.getElementById("connectConversation");
   pttButton = document.getElementById("pttButton");
   disconnectMicButton = document.getElementById("disconnectMic");
@@ -3471,6 +3483,9 @@ export async function initViewer() {
     error("Canvas element not found (#canvas).");
     return;
   }
+  
+  onEnableAudio().catch(console.error);
+  
   initThree(canvas);
   bindUi();
   await loadAvatar();

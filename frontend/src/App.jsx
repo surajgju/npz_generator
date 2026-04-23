@@ -249,7 +249,6 @@ function App() {
           <span></span>
         </div>
         <div className="btns">
-          <button id="enableAudio">Enable Audio</button>
           {/*
             ── Ghost conversation control buttons ──
             These are visually hidden but remain in the DOM so ViewerController

@@ -2229,6 +2229,7 @@ function initWorker() {
     } else if (msg.type === "resync") {
       resyncing = true;
       startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+      lastWorkerFrameIndexSeen = -1; // Reset to allow new sequence
       resetLivePlaybackFilters();
       if (DEBUG) warn("Worker requested resync", msg);
     } else if (msg.type === "session_switch") {
@@ -2237,6 +2238,7 @@ function initWorker() {
       heldFrameData = null;
       lagIdleBlend = 0;
       lagIdleStarted = false;
+      lastWorkerFrameIndexSeen = -1; // Allow new frame index sequence
       resetLivePlaybackFilters();
       clearMismatchIfAligned();
       resyncing = false;

@@ -27,7 +27,14 @@ class LiveMotionGenerator:
     Models are loaded once and kept on device to avoid cold starts.
     """
     def __init__(self, device=None, model_folder="./models/", overlap_sec: float = DEFAULT_OVERLAP_SEC):
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         logger.info("Initializing LiveMotionGenerator on %s...", self.device)
 
         face_motion_vq = EmageVQVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/face").to(self.device)
@@ -214,7 +221,14 @@ class SmplxVertexStreamer:
     """Compute SMPL-X vertices from coefficients on the server."""
     def __init__(self, device=None, model_path="models", gender="neutral"):
         import smplx
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         self.model = smplx.create(
             model_path=model_path,
             model_type="smplx",

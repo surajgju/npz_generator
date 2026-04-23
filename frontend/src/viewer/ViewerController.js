@@ -70,9 +70,11 @@ let lastHudLog = null;
 let lastStatsLog = null;
 
 const idleConfig = {
-  blink: { intervalSec: [3.0, 6.0], durationSec: 0.12, strength: 0.6 },
+  blink: { intervalSec: [2.5, 5.0], durationSec: 0.15, strength: 0.6 },
   saccade: { intervalSec: [1.0, 3.0], yawDeg: 2.0, pitchDeg: 1.0 },
-  headSway: { yawDeg: 2.0, pitchDeg: 1.0, rollDeg: 0.5, periodSec: [5.0, 7.0] },
+  headSway: { yawDeg: 3.0, pitchDeg: 1.5, rollDeg: 0.5, periodSec: [5.0, 7.0] },
+  // Discrete neck look-around: random glance target every 2-3s, very slow blend
+  neckLook: { intervalSec: [2.0, 3.5], yawDeg: 60.0, pitchDeg: 8.0, blendSpeed: 0.008 },
   neckScale: 0.5,
 };
 let idleActive = false;
@@ -90,6 +92,12 @@ let idleBlinkPreferredNames = [];
 let idleBlinkAutoNames = [];
 let idleBlinkTargets = [];
 let idleBlinkStrengthScale = 1.0;
+// Neck look-around state (discrete glance, separate from sinusoidal sway)
+let idleNeckLookNextAt = null;
+let idleNeckLookTargetYaw = 0;
+let idleNeckLookTargetPitch = 0;
+let idleNeckLookCurrentYaw = 0;
+let idleNeckLookCurrentPitch = 0;
 let lastBlinkNames = "";
 let lastBlinkAutoNames = "";
 let debugMorphNames = {
@@ -134,6 +142,8 @@ let idleBones = {
   leftEye: null,
   rightEye: null,
   jaw: null,
+  leftCollar: null,
+  rightCollar: null,
   leftShoulder: null,
   rightShoulder: null,
   leftElbow: null,
@@ -148,6 +158,8 @@ let idleRestQuats = {
   leftEye: null,
   rightEye: null,
   jaw: null,
+  leftCollar: null,
+  rightCollar: null,
   leftShoulder: null,
   rightShoulder: null,
   leftElbow: null,
@@ -204,6 +216,10 @@ function cacheIdleBones() {
   idleBones.rightEye =
     findBoneByName("right_eye_smplhf") || findBoneByIncludes(["right_eye", "reye"]);
   idleBones.jaw = findBoneByName("jaw") || findBoneByIncludes(["jaw"]);
+  idleBones.leftCollar =
+    findBoneByName("left_collar") || findBoneByIncludes(["left_collar", "l_collar"]);
+  idleBones.rightCollar =
+    findBoneByName("right_collar") || findBoneByIncludes(["right_collar", "r_collar"]);
   idleBones.leftShoulder =
     findBoneByName("left_shoulder") || findBoneByIncludes(["left_shoulder", "l_shoulder"]);
   idleBones.rightShoulder =
@@ -220,6 +236,12 @@ function cacheIdleBones() {
   idleRestQuats.leftEye = idleBones.leftEye ? idleBones.leftEye.quaternion.clone() : null;
   idleRestQuats.rightEye = idleBones.rightEye ? idleBones.rightEye.quaternion.clone() : null;
   idleRestQuats.jaw = idleBones.jaw ? idleBones.jaw.quaternion.clone() : null;
+  idleRestQuats.leftCollar = idleBones.leftCollar
+    ? idleBones.leftCollar.quaternion.clone()
+    : null;
+  idleRestQuats.rightCollar = idleBones.rightCollar
+    ? idleBones.rightCollar.quaternion.clone()
+    : null;
   idleRestQuats.leftShoulder = idleBones.leftShoulder
     ? idleBones.leftShoulder.quaternion.clone()
     : null;
@@ -320,6 +342,7 @@ function resetLivePlaybackFilters() {
   speechOverlayLastSec = 0;
   idleTailArmed = false;
   idleTailStartMs = null;
+  serverSilentSinceMs = null;
 }
 
 function stabilizeRootTranslation(rootX, rootY, rootZ, advanceRootSmoothing) {
@@ -356,6 +379,10 @@ function resetIdlePose() {
   if (idleRestQuats.rightEye && idleBones.rightEye)
     idleBones.rightEye.quaternion.copy(idleRestQuats.rightEye);
   if (idleRestQuats.jaw && idleBones.jaw) idleBones.jaw.quaternion.copy(idleRestQuats.jaw);
+  if (idleRestQuats.leftCollar && idleBones.leftCollar)
+    idleBones.leftCollar.quaternion.copy(idleRestQuats.leftCollar);
+  if (idleRestQuats.rightCollar && idleBones.rightCollar)
+    idleBones.rightCollar.quaternion.copy(idleRestQuats.rightCollar);
   if (idleRestQuats.leftShoulder && idleBones.leftShoulder)
     idleBones.leftShoulder.quaternion.copy(idleRestQuats.leftShoulder);
   if (idleRestQuats.rightShoulder && idleBones.rightShoulder)
@@ -802,37 +829,61 @@ function autoDetectFaceRegions() {
 }
 
 
+function updateIdleNeckLook(elapsed) {
+  const cfg = idleConfig.neckLook;
+  const interval = cfg.intervalSec || [2.0, 3.5];
+  if (idleNeckLookNextAt === null) {
+    idleNeckLookNextAt = elapsed + randRange(interval[0], interval[1]);
+  }
+  if (elapsed >= idleNeckLookNextAt) {
+    const yawRad = (cfg.yawDeg || 12.0) * (Math.PI / 180);
+    const pitchRad = (cfg.pitchDeg || 5.0) * (Math.PI / 180);
+    idleNeckLookTargetYaw = randRange(-yawRad, yawRad);
+    idleNeckLookTargetPitch = randRange(-pitchRad, pitchRad);
+    idleNeckLookNextAt = elapsed + randRange(interval[0], interval[1]);
+  }
+  const speed = cfg.blendSpeed || 0.06;
+  idleNeckLookCurrentYaw += (idleNeckLookTargetYaw - idleNeckLookCurrentYaw) * speed;
+  idleNeckLookCurrentPitch += (idleNeckLookTargetPitch - idleNeckLookCurrentPitch) * speed;
+  return { yaw: idleNeckLookCurrentYaw, pitch: idleNeckLookCurrentPitch };
+}
+
 function applyIdlePose(nowSec) {
   if (!idleActive || !avatarLoaded) return;
   if (!idleRestQuats.head && idleBones.head) {
     cacheIdleBones();
   }
   const elapsed = nowSec - idleStartSec;
-  // Blend blinks atop existing morphs instead of resetting everything.
   const headCfg = idleConfig.headSway;
   const basePeriod = idleHeadPeriodSec || 6.0;
-  const yawAmp = (headCfg.yawDeg || 2.0) * (Math.PI / 180);
-  const pitchAmp = (headCfg.pitchDeg || 1.0) * (Math.PI / 180);
+  const swayYawAmp = (headCfg.yawDeg || 3.0) * (Math.PI / 180);
+  const swayPitchAmp = (headCfg.pitchDeg || 1.5) * (Math.PI / 180);
   const rollAmp = (headCfg.rollDeg || 0.5) * (Math.PI / 180);
-  const yaw = Math.sin((elapsed / basePeriod) * Math.PI * 2 + idleHeadPhase) * yawAmp;
-  const pitch =
-    Math.sin((elapsed / (basePeriod * 1.3)) * Math.PI * 2 + idleHeadPhase * 0.7) * pitchAmp;
+  const swayYaw = Math.sin((elapsed / basePeriod) * Math.PI * 2 + idleHeadPhase) * swayYawAmp;
+  const swayPitch =
+    Math.sin((elapsed / (basePeriod * 1.3)) * Math.PI * 2 + idleHeadPhase * 0.7) * swayPitchAmp;
   const roll =
     Math.sin((elapsed / (basePeriod * 1.7)) * Math.PI * 2 + idleHeadPhase * 1.3) * rollAmp;
+
+  // Discrete look-around: head glances every 2-3s at human-like speed
+  const { yaw: lookYaw, pitch: lookPitch } = updateIdleNeckLook(elapsed);
+  const totalYaw = swayYaw + lookYaw;
+  const totalPitch = swayPitch + lookPitch;
+
   if (idleBones.head && idleRestQuats.head) {
-    tempEuler.set(pitch, yaw, roll, "YXZ");
+    tempEuler.set(totalPitch, totalYaw, roll, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.head.quaternion.copy(idleRestQuats.head).multiply(tempQuat2);
   }
   if (idleBones.neck && idleRestQuats.neck) {
     const scale = idleConfig.neckScale ?? 0.5;
-    tempEuler.set(pitch * scale, yaw * scale, roll * scale, "YXZ");
+    tempEuler.set(totalPitch * scale, totalYaw * scale, roll * scale, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.neck.quaternion.copy(idleRestQuats.neck).multiply(tempQuat2);
   }
-  // Subtle spine sway.
-  const spineYaw = yaw * 0.5;
-  const spinePitch = pitch * 0.4;
+  // Subtle spine sway following the head.
+  const spineYaw = swayYaw * 0.5;
+  const spinePitch = swayPitch * 0.4;
   const spineBones = [
     [idleBones.spine1, idleRestQuats.spine1, 0.4],
     [idleBones.spine2, idleRestQuats.spine2, 0.35],
@@ -844,19 +895,39 @@ function applyIdlePose(nowSec) {
     tempQuat2.setFromEuler(tempEuler);
     bone.quaternion.copy(rest).multiply(tempQuat2);
   }
-  // Relax arms from T-pose.
-  const shoulderPitch = (-8 * Math.PI) / 180;
-  const elbowBend = (-5 * Math.PI) / 180;
+  // ── Arm rest pose ──
+  // In SMPL-X GLB the collar (clavicle) bone's LOCAL space:
+  //   Z-axis = elevation (negative Z = depress/lower the shoulder girdle)
+  // The shoulder (upper arm) LOCAL space:
+  //   Z-axis = abduction/adduction (negative Z = adduct = arm toward body)
+  //   X-axis = flexion/extension (negative X = forward lean)
+  // Drive collars to depress the shoulder girdle, then adduct via shoulder Z.
+  const collarDepress = (-20 * Math.PI) / 180; // depress clavicle slightly
+  if (idleBones.leftCollar && idleRestQuats.leftCollar) {
+    tempEuler.set(0, 0, collarDepress, "YXZ");
+    tempQuat2.setFromEuler(tempEuler);
+    idleBones.leftCollar.quaternion.copy(idleRestQuats.leftCollar).multiply(tempQuat2);
+  }
+  if (idleBones.rightCollar && idleRestQuats.rightCollar) {
+    tempEuler.set(0, 0, collarDepress, "YXZ");
+    tempQuat2.setFromEuler(tempEuler);
+    idleBones.rightCollar.quaternion.copy(idleRestQuats.rightCollar).multiply(tempQuat2);
+  }
+  // Shoulder: adduct (bring arm in from T-pose) via Z, plus slight forward X lean.
+  const shoulderAdductLeft  = ( 55 * Math.PI) / 180; // left shoulder adduct
+  const shoulderAdductRight = (-55 * Math.PI) / 180; // right shoulder adduct
+  const shoulderForward     = (-10 * Math.PI) / 180; // slight forward lean
   if (idleBones.leftShoulder && idleRestQuats.leftShoulder) {
-    tempEuler.set(shoulderPitch, 0, 0, "YXZ");
+    tempEuler.set(shoulderForward, 0, shoulderAdductLeft, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.leftShoulder.quaternion.copy(idleRestQuats.leftShoulder).multiply(tempQuat2);
   }
   if (idleBones.rightShoulder && idleRestQuats.rightShoulder) {
-    tempEuler.set(shoulderPitch, 0, 0, "YXZ");
+    tempEuler.set(shoulderForward, 0, shoulderAdductRight, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.rightShoulder.quaternion.copy(idleRestQuats.rightShoulder).multiply(tempQuat2);
   }
+  const elbowBend = (-10 * Math.PI) / 180;
   if (idleBones.leftElbow && idleRestQuats.leftElbow) {
     tempEuler.set(elbowBend, 0, 0, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
@@ -867,21 +938,23 @@ function applyIdlePose(nowSec) {
     tempQuat2.setFromEuler(tempEuler);
     idleBones.rightElbow.quaternion.copy(idleRestQuats.rightElbow).multiply(tempQuat2);
   }
+  // ── Eye saccade + bone-driven blink ──
+  // Blink: rotate the eye bones downward on X (local "look down" closes
+  // the upper eyelid in SMPL-X). This avoids touching Exp morphs which
+  // are face-global and affect the nasolabial fold.
+  const blinkVal = updateIdleBlink(elapsed) * (idleConfig.blink.strength || 0.6);
+  // Max downward rotation for a full blink: ~30°
+  const blinkMaxRad = (30 * Math.PI) / 180;
+  const blinkRot = blinkVal * blinkMaxRad;
   if (idleBones.leftEye && idleBones.rightEye && idleRestQuats.leftEye && idleRestQuats.rightEye) {
     const { yaw: eyeYaw, pitch: eyePitch } = updateIdleSaccade(elapsed);
-    tempEuler.set(eyePitch, eyeYaw, 0, "YXZ");
+    // Combine saccade + blink on X axis (blink = additional downward pitch)
+    tempEuler.set(eyePitch + blinkRot, eyeYaw, 0, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.leftEye.quaternion.copy(idleRestQuats.leftEye).multiply(tempQuat2);
     idleBones.rightEye.quaternion.copy(idleRestQuats.rightEye).multiply(tempQuat2);
-  }
-  if (idleBlinkTargets.length) {
-    const blinkVal =
-      updateIdleBlink(elapsed) * (idleConfig.blink.strength || 0.6) * idleBlinkStrengthScale;
-    for (const t of idleBlinkTargets) {
-      const base = t.base ?? 0;
-      const v = Math.max(-1, Math.min(1, base + blinkVal));
-      t.mesh.morphTargetInfluences[t.index] = Math.max(-1, Math.min(1, (t.base ?? 0) + blinkVal));
-    }
+  } else {
+    // Fallback: eyes not found, skip
   }
 }
 
@@ -894,6 +967,11 @@ function beginLagIdleOverlay(nowSec) {
   idleSaccadePitch = 0;
   idleSaccadeTargetYaw = 0;
   idleSaccadeTargetPitch = 0;
+  idleNeckLookNextAt = null;
+  idleNeckLookTargetYaw = 0;
+  idleNeckLookTargetPitch = 0;
+  idleNeckLookCurrentYaw = 0;
+  idleNeckLookCurrentPitch = 0;
   idleHeadPeriodSec = randRange(idleConfig.headSway.periodSec[0], idleConfig.headSway.periodSec[1]);
   idleHeadPhase = randRange(0, Math.PI * 2);
   cacheIdleBones();
@@ -976,7 +1054,10 @@ function updateIdleState() {
     }
     return;
   }
-  const noFrames = now - lastFrameUpdate > IDLE_START_MS;
+  // Idle fires when NO fresh frames have arrived from the worker for IDLE_START_MS.
+  // lastWorkerFrameAt is updated as soon as a frame arrives from the server.
+  // This avoids falsely triggering idle during audio buffering when frame rendering is paused.
+  const noFrames = lastWorkerFrameAt === null || now - lastWorkerFrameAt > IDLE_START_MS;
   const disconnected =
     !workerReady || statusEl.textContent === "Disconnected" || pipelineModeEl.textContent === "Error";
   const shouldIdle = !manualPaused && (noFrames || disconnected);
@@ -991,6 +1072,11 @@ function updateIdleState() {
     idleSaccadePitch = 0;
     idleSaccadeTargetYaw = 0;
     idleSaccadeTargetPitch = 0;
+    idleNeckLookNextAt = null;
+    idleNeckLookTargetYaw = 0;
+    idleNeckLookTargetPitch = 0;
+    idleNeckLookCurrentYaw = 0;
+    idleNeckLookCurrentPitch = 0;
     idleHeadPeriodSec = randRange(
       idleConfig.headSway.periodSec[0],
       idleConfig.headSway.periodSec[1]
@@ -1366,6 +1452,8 @@ let frameDirty = false;
 let heldFrameData = null;
 let lagIdleBlend = 0;
 let lagIdleStarted = false;
+// Tracks when workerInFps last dropped to 0 (server stopped sending new frames)
+let serverSilentSinceMs = null;
 let workerReady = false;
 let workerFallbackTimer = null;
 let workerRestartTimer = null;
@@ -2010,17 +2098,13 @@ function animate() {
   animationFrameId = requestAnimationFrame(animate);
 
   if (!debugManualMode) {
-    /* TEMPORARY DEBUG BLOCK: Start - Disabling idle breathing/sway */
-    /* 
-    // 1. Update idle state (breathing, etc.)
+    // Track idle state based on whether server is actively sending new frames.
+    // applyIdlePose is called INSIDE updatePlaybackFrameWorker so it can never
+    // override server stream data — it only applies after server data is written.
     updateIdleState();
-    if (idleActive) {
-      applyIdlePose(performance.now() / 1000);
-    }
-    */
-    /* TEMPORARY DEBUG BLOCK: End */
 
-    // 2. Apply streaming animation on top (authoritative)
+    // Server animation is authoritative — idle is applied only inside this
+    // function, after server frames have been written (or skipped).
     updatePlaybackFrameWorker();
   }
 
@@ -2794,6 +2878,8 @@ function updatePlaybackFrameWorker() {
 
   // Keep rendering alive during lag by replaying last frame and blending idle additively.
   if (workerFrame && frameDirty) {
+    // ── LIVE STREAM PATH ── server is actively sending new frames.
+    // NO idle is ever applied here — server data is the only authority.
     resetAllMorphsToBase();
     applyAnimFrame(workerFrame, { advanceRootSmoothing: true });
     applySpeechBodyOverlay(nowSec, Math.min(1, speechEnergySmoothed / 0.35));
@@ -2808,6 +2894,8 @@ function updatePlaybackFrameWorker() {
     lastFrameUpdate = nowMs;
     stallSinceMs = null;
   } else if (heldFrameData) {
+    // ── HELD FRAME PATH ── server stopped; showing last received frame.
+    // Apply held frame first, then blend idle on top as time passes.
     resetAllMorphsToBase();
     applyAnimFrame(heldFrameData, { advanceRootSmoothing: false });
     const stalledForMs = Math.max(0, nowMs - lastFrameUpdate);
@@ -2826,6 +2914,8 @@ function updatePlaybackFrameWorker() {
         lagIdleStarted = true;
       }
       lagIdleBlend = Math.min(1, (stalledForMs - IDLE_START_MS) / STALL_IDLE_BLEND_MS);
+      // Additive idle on top of held server frame — does NOT override collar/shoulder
+      // that server last set; those will only be overridden when we reach the no-frame path.
       applyIdlePoseAdditive(nowSec, lagIdleBlend);
       playStateEl.textContent = "stalled_idle";
     }
@@ -2842,9 +2932,14 @@ function updatePlaybackFrameWorker() {
       });
     }
   } else {
+    // ── NO FRAME PATH ── worker has no data yet.
+    // Full idle is safe here since there is no server frame to protect.
     if (stallSinceMs === null) stallSinceMs = nowMs;
     const stalledForMs = nowMs - stallSinceMs;
-    if (stalledForMs <= STALL_HOLD_MS) {
+    if (idleActive) {
+      applyIdlePose(nowSec);
+      playStateEl.textContent = "stalled_idle";
+    } else if (stalledForMs <= STALL_HOLD_MS) {
       playStateEl.textContent = "stalled_hold";
     } else {
       const easeT = Math.min(1, (stalledForMs - STALL_HOLD_MS) / STALL_EASE_MS);

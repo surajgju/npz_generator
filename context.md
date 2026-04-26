@@ -169,3 +169,14 @@ The backend is split into specialized modules for scalability and maintainabilit
   - Server restart (`server_boot_id` change): reset path, local state cleared.
   - Partial/expired historical state: server falls back to `live_only` or `reset_required`.
   - Deprecated session buffers: evicted by TTL/LRU GC to avoid memory growth.
+
+## 10. Architectural Constraints & Known Limitations
+- **Streaming Inference vs. Full-Turn Accumulation**:
+  - The pipeline **MUST** remain purely streaming (ingesting audio chunks into the inference queue the moment they arrive). 
+  - **DO NOT** attempt a "two-phase" or "full-turn" accumulation strategy (waiting for the LLM to finish speaking before running inference). Doing so structurally breaks the `server_time_ms` sync, causing massive animation lag relative to audio playback and destroying the real-time nature of Gemini Live.
+- **Queue Limits (`AUDIO_IN_QUEUE_MAX_CHUNKS`)**:
+  - Gemini Live streams audio bursts much faster than real-time (~2.2x speed). If inference runs slower than real-time, the `audio_in_queue` will rapidly fill up. If you experience "Audio queue full; dropped oldest chunk" warnings, either the queue limit must be massively expanded (e.g., 512+) or inference must be accelerated.
+- **Apple Silicon (MPS) Limitations**:
+  - The `EmageAudioModel` relies on several PyTorch operations (like specific `torch.cat` or convolution paths) that are not natively supported by macOS Metal Performance Shaders (MPS). 
+  - Without explicit `PYTORCH_ENABLE_MPS_FALLBACK=1` environment variables, running this model on `mps` will result in crashes or severe CPU-fallback bottlenecks (e.g. taking 3000ms+ to process 500ms of audio). 
+  - Due to these $O(N^2)$ sequence bottlenecks, pure real-time 30FPS inference on M-series chips is highly constrained and may require smaller batch sizes (e.g. `4800` samples) or model quantization.

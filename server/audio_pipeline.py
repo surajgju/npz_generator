@@ -1275,6 +1275,15 @@ def _inference_process_main(
                 seen_first_batch[session_id] = True
                 if batch_audio.size < min_required_samples:
                     batch_audio_for_model = _bootstrap_batch_audio(batch_audio, min_required_samples)
+            elif batch_audio.size < min_required_samples:
+                logger.info(
+                    "Dropping short tail chunk session=%s chunk=%s (size %d < min %d)",
+                    session_id,
+                    batch_chunk_id,
+                    batch_audio.size,
+                    min_required_samples,
+                )
+                return False
 
             try:
                 generator_started_ns = time.perf_counter_ns()

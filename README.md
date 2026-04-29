@@ -12,7 +12,8 @@ An end-to-end pipeline for generating expressive SMPL-X motion from audio. This 
 
 - **🎭 Expressive Motion Generation**: Uses the **EMAGE** (Expressive Motion Generation) architecture for synchronized body, face, hand, and global translation from raw audio.
 - **⚡ Real-Time Streaming Pipeline**: A low-latency system that processes audio chunks via WebSockets and streams SMPL‑X animation directly to a Three.js viewer.
-- **🧭 Sessionized Streaming (Protocol v2)**: Per-session ring buffers and reconnect-aware handshake (`anim_subscribe`) with `session_id`, `server_boot_id`, and monotonic `server_time_ms`.
+- **🎙️ Voice Conversation (Native Gemini 3.1 Live)**: Uses the `google-genai` native WebSocket stream for ultra-low latency. Browser Push-to-Talk (`/ws/conversation`) streams user PCM directly to Gemini and routes assistant response audio into the real-time animation pipeline.
+- **🧭 Sessionized Streaming (Protocol v2)**: Per-reply stream sessions with reconnect-aware handshake (`anim_subscribe`) using `stream_session_id`, `server_boot_id`, `server_clock_id`, and monotonic `server_time_ms`.
 - **🔁 Snapshot Recovery**: Reconnecting clients receive a short snapshot window (2-3s), then jump to live edge without replay burst.
 - **🛡️ Drift/Freeze Protection**: Worker tail-lock alignment with timeout and resync request; viewer has explicit stall states (`stalled_hold`, `stalled_ease`, `resyncing`).
 - **🧹 Session Lifecycle GC**: Deprecated/idle sessions are evicted by TTL and LRU caps to prevent buffer leaks.
@@ -21,7 +22,7 @@ An end-to-end pipeline for generating expressive SMPL-X motion from audio. This 
 - **🌐 Dual Visualization Suite**:
     - **Offline (Streamlit)**: High-performance local NPZ viewer.
     - **Live (Vite/React)**: Modern Three.js viewer for real-time streaming and interactive debugging.
-- **🔗 Gemini Live Integration**: Pre-wired adapters to bridge Gemini PCM audio streams with the motion synthesis pipeline.
+- **🔗 Gemini 3.1 Live Native Integration**: Optimized engine that bypasses legacy ADK overhead, supporting the latest multi-modal Live API for seamless speech-to-motion updates.
 
 ---
 
@@ -33,16 +34,16 @@ Install the core Python dependencies (requires PyTorch and SMPL-X):
 python3 -m pip install -r requirements.txt
 ```
 
-### 2. Frontend Build (Optional for Live Streaming)
-The live viewer resides in the `/frontend` directory and needs a production build:
+### 2. Frontend Setup
+The live viewer resides in the `/frontend` directory. We recommend running it using the Vite development server:
 ```bash
 # Export SMPL-X faces (requires smplx weights in 'models/')
 python3 scripts/export_faces.py
 
-# Build frontend
-cd frontend && npm install && npm run build && cd ..
+# Start frontend
+cd frontend && npm install && npm run dev
 ```
-*Note: Exporting faces ensures that the Three.js viewer can render the avatar mesh correctly. The build command creates the `web/` directory that the FastAPI server uses for static hosting.*
+*Note: Exporting faces ensures that the Three.js viewer can render the avatar mesh correctly. The React frontend will run on port 5173 while communicating with the FastAPI backend on port 8000.*
 
 ### 3. Generate Motion (Offline)
 Generate high-fidelity motion from your audio files in the `./input` folder:
@@ -67,18 +68,23 @@ Our streaming architecture allows you to live-stream audio to a server and get b
 STREAM_FPS=20 python3 -m uvicorn server.app:app --reload --port 8000
 ```
 
+For browser Push-to-Talk conversation, set:
+- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) for ADK/Gemini Live audio
+export GEMINI_API_KEY=""
+
 ### 2. Open the Live Viewer
-The Three.js viewer will be live at: `http://localhost:8000/`.
+The Three.js viewer will be live at: `http://localhost:5173/`. Ensure the FastAPI server is running concurrently.
 
 ### 3. Stream Audio (Example Simulator)
 Use our utility script to simulate a live audio stream from a file:
 ```bash
-python3 scripts/stream_audio_to_ws.py --audio ./input/your_audio.wav --chunk 0.5
+python3 scripts/stream_audio_to_ws.py --audio ./input/romantic_narration.mp3 --chunk 0.5
+python3 scripts/stream_audio_to_ws.py --audio ./input/swara_2.mp3 --chunk 0.5
 ```
 
 ### 4. Protocol v2 Reconnect Flow (Implemented)
 - Client connects `/ws/anim`, sends:
-  - `anim_subscribe { protocol_version: 2, known_boot_id, known_session_id, last_applied_frame }`
+  - `anim_subscribe { protocol_version: 2, known_boot_id, known_server_clock_id, known_stream_session_id, last_applied_frame }`
 - Server responds:
   - `anim_subscribe_ack` with `mode: resume|live_only|reset_required`
 - If `resume`, server sends:
@@ -94,11 +100,24 @@ python3 scripts/stream_audio_to_ws.py --audio ./input/your_audio.wav --chunk 0.5
 
 ### 5. Audio Channel Metadata
 `/ws/audio_out` now includes:
-- `session_id`
+- `stream_session_id` (plus `session_id` fallback during rollout)
 - `chunk_id`
 - `audio_sample_cursor` (absolute samples in session)
 - `server_time_ms`
 - `server_boot_id`
+- `server_clock_id`
+
+### 6. Conversation Channel (`/ws/conversation`)
+- Handshake:
+  - `hello` -> `hello_ack { conversation_id, protocol_version, server_boot_id, server_clock_id, server_time_ms }`
+- Lifecycle:
+  - `listening`
+  - `assistant_thinking_start` / `assistant_thinking_end`
+  - `assistant_speaking_start { reply_id, stream_session_id }`
+  - `assistant_speaking_end { reply_id, stream_session_id }`
+  - `interrupted { reply_id, stream_session_id }`
+- User control:
+  - `ptt_start`, repeated `user_audio { seq, sr, dtype, pcm_b64 }`, `ptt_end`, `interrupt`
 
 ---
 
@@ -111,17 +130,16 @@ flowchart TD
         B[Simulated WAV Streamer]
     end
 
-    subgraph Backend ["Python Backend (FastAPI)"]
-        C["/ws/audio Receiver (Session Producer)"]
-        D["EMAGE Inference (GPU)"]
-        E["SmplxRetargeter (Signal Processing)"]
-        F["Session Ring Buffer + Broadcast /ws/anim"]
-        J["Session GC (TTL + LRU)"]
+    subgraph Backend ["Modular Backend (FastAPI)"]
+        C["/ws/audio Receiver"]
+        D["audio_pipeline.py (Inference)"]
+        E["session.py (State & GC)"]
+        F["conversation.py (PTT/Gemini)"]
         
         C --> D
         D --> E
-        E --> F
-        F --> J
+        F --> D
+        E -->|/ws/anim| G
     end
 
     subgraph Frontend ["WebGL Frontend (Three.js)"]
@@ -144,9 +162,9 @@ flowchart TD
 
 | Directory/File | Description |
 | :--- | :--- |
-| `frontend/` | React + Three.js application source code. Worker source is `frontend/src/viewer/anim_worker.js`. |
-| `web/` | Target for frontend build. Served by FastAPI. |
-| `server/` | FastAPI server, sessionized WebSocket handlers, inference/broadcast loops, and Gemini adapters. |
+| `frontend/` | React + Three.js application source code. |
+| `frontend/dist/` | Frontend build output. |
+| `server/` | **Modularized Backend**: `app.py` (coordinator), `session.py` (state), `audio_pipeline.py` (ML/Audio), `conversation.py` (PTT). |
 | `emage_utils/` | Core EMAGE model implementation and VQ-VAE utils. |
 | `scripts/` | Export utilities and audio streaming simulators. |
 | `models/` | SMPL-X and EMAGE model weight storage path. |
@@ -155,25 +173,35 @@ flowchart TD
 
 ## 🛠️ Advanced Configuration
 
-Fine-tune your animation quality via CLI or config files:
+The entire pipeline is highly configurable via **`server/.env.local`**. All essential parameters for performance, logic, and visual stability are centralized here.
 
-- **Signal Processing**:
-  - `expression_target`: Scales facial PCA coefficients for quiet audio.
-  - `expression_smooth_alpha`: Alpha value for EMA smoothing (default: `1.0`).
-- **Pipeline Performance**:
-  - `overlap_sec`: Controls chunk overlap for seamless motion blending (default: `0.25s`).
-  - `STREAM_FPS`: Sets the target animation rate for real-time vertex streaming (default: `20`).
-- **Session/Recovery**:
-  - `SNAPSHOT_SECONDS` (default: `3.0`)
-  - `MAX_SESSIONS` (default: `8`)
-  - `SESSION_IDLE_TTL_MS` (default: `45000`)
-  - `DEPRECATED_TTL_MS` (default: `15000`)
-  - `SESSION_GC_INTERVAL_MS` (default: `5000`)
+### 1. Performance & Inference Tuning
+- **`STREAM_FPS`**: Sets the target animation rate for real-time vertex streaming (default: `30`).
+- **`INFERENCE_BATCH_SAMPLES`**: Controls how many audio samples are processed per inference step (default: `3200`). Lower values reduce latency; higher values increase CPU throughput.
+- **`AUDIO_IN_QUEUE_MAX_CHUNKS`**: Bounds the maximum backlog of audio waiting for inference (default: `16`). This prevents massive animation lag by dropping stale chunks.
+- **`DEFAULT_OVERLAP_SEC`**: Controls chunk overlap for seamless motion blending (default: `0.25s`).
+
+### 2. Signal & Retargeting Defaults
+- **`EXPRESSION_MAX_ABS`, `MOUTH_MAX_ABS`, `EYE_BROW_MAX_ABS`**: Safety ceilings for facial morph targets.
+- **`EXPRESSION_TARGET`, `EXPRESSION_GAIN_MAX`**: Control the intensity and automatic gain scaling for facial expressions.
+
+### 3. Session & GC Management
+- **`SNAPSHOT_SECONDS`**: (default: `3.0`)
+- **`MAX_SESSIONS`**: (default: `8`)
+- **`SESSION_IDLE_TTL_MS`**: (default: `45000`)
+- **`SESSION_GC_INTERVAL_MS`**: (default: `5000`)
+
+### 4. Frontend Playback (Vite Environment)
+- **`VITE_SESSION_MISMATCH_GRACE_MS`**: (default: `1200`)
+- **`VITE_AUDIO_START_BUFFER_SEC`**: (default: `0.4`)
+- **`VITE_STALL_IDLE_BLEND_MS`**: (default: `2200`)
+
+To apply changes, simply edit `server/.env.local` and restart the server.
 
 ### Reconnect & Stall Defaults (Implemented)
 - `STREAM_FPS=20`
 - Worker:
-  - `MAX_TAIL_LOCK_MS=350` (bounded wait for first live frame after snapshot tail alignment)
+  - `MAX_TAIL_LOCK_MS=3000` (bounded wait for first live frame after snapshot tail alignment)
 - Viewer:
   - `STARTUP_SUPPRESS_MS=4000` (suppresses expected startup watchdog noise)
   - `STALL_HOLD_MS=300` then `STALL_EASE_MS=700` (freeze-then-ease behavior)
@@ -187,27 +215,14 @@ Fine-tune your animation quality via CLI or config files:
 
 ---
 
-## 🌩️ Gemini Live Integration (Stub)
-Integration for high-fidelity audio/motion bridges is pre-wired:
-```python
-from server.gemini_adapter import GeminiAudioBridge
-
-bridge = GeminiAudioBridge(sample_rate=16000)
-payload = bridge.build_audio_payload(pcm_bytes, chunk_id="42")
-# Send the payload to the /ws/audio endpoint
-```
-
----
-
 ## 🧪 Testing Checklist
 1. [ ] Run `python3 generate_npz.py` and verify `output/intro_output.npz`.
 2. [ ] Run `python3 render.py` and check `output.mp4`.
-3. [ ] Run `npm run build` in the frontend directory.
-4. [ ] Start the uvicorn server and open the live viewer at `localhost:8000`.
-5. [ ] Run `stream_audio_to_ws.py` and observe smooth 3D motion in the browser.
-6. [ ] Reload browser mid-stream and verify reconnect does not burst/replay old frames.
-7. [ ] Simulate network stall (2-3s) and verify `stalled_hold -> stalled_ease -> smooth resume`.
-8. [ ] Verify session turnover (new `/ws/audio` producer) does not leak stale sessions.
+3. [ ] Export faces: `python3 scripts/export_faces.py`.
+4. [ ] Start the backend server: `STREAM_FPS=20 python3 -m uvicorn server.app:app --reload --port 8000`.
+5. [ ] Start the frontend: `cd frontend && npm run dev`.
+6. [ ] Open the live viewer at `http://localhost:5173`.
+7. [ ] Connect Microphone and verify Gemini 3.1 Live PTT conversation starts high-fidelity motion.
 
 ---
 

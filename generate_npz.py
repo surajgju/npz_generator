@@ -7,6 +7,7 @@ import librosa
 import time
 import numpy as np
 from tqdm import tqdm
+from streamsettings import BASE_MOTION_FPS
 
 # Standard imports for the standalone project
 from emage_utils.motion_io import beat_format_save
@@ -51,7 +52,7 @@ def inference(model, motion_vq, audio_path, device, save_folder, sr, pose_fps,):
     # Standardize filename so render.py and visualize_web.py find it automatically
     output_filename = os.path.join(save_folder, "intro_output.npz")
     beat_format_save(output_filename,
-                     motion_pred, upsample=30//pose_fps, expressions=face_pred, trans=trans_pred)
+                     motion_pred, upsample=BASE_MOTION_FPS//pose_fps, expressions=face_pred, trans=trans_pred)
     return t
 
 def visualize_one(save_folder, audio_path, nopytorch3d=False, model_folder="./emage_evaltools/smplx_models/"):  
@@ -61,10 +62,10 @@ def visualize_one(save_folder, audio_path, nopytorch3d=False, model_folder="./em
         try:
             from emage_utils.npz2pose import render2d
             v2d_face = render2d(motion_dict, (512, 512), face_only=True, remove_global=True)
-            write_video(npz_path.replace(".npz", "_2dface.mp4"), v2d_face.permute(0, 2, 3, 1), fps=30)
+            write_video(npz_path.replace(".npz", "_2dface.mp4"), v2d_face.permute(0, 2, 3, 1), fps=BASE_MOTION_FPS)
             fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dface.mp4"), audio_path, npz_path.replace(".npz", "_2dface_audio.mp4"))
             v2d_body = render2d(motion_dict, (720, 480), face_only=False, remove_global=True)
-            write_video(npz_path.replace(".npz", "_2dbody.mp4"), v2d_body.permute(0, 2, 3, 1), fps=30)
+            write_video(npz_path.replace(".npz", "_2dbody.mp4"), v2d_body.permute(0, 2, 3, 1), fps=BASE_MOTION_FPS)
             fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dbody.mp4"), audio_path, npz_path.replace(".npz", "_2dbody_audio.mp4"))
         except ImportError as e:
             logger.warning("Skipping 2D rendering as pytorch3d is not installed: %s", e)

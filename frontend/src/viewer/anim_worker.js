@@ -1,6 +1,7 @@
 let ws = null;
 let wsHost = null;
-let streamFps = 20;
+let streamFps = null;
+let streamFpsReady = false;
 let bones = [];
 let morphs = [];
 let nbones = 0;
@@ -12,6 +13,7 @@ const PROTOCOL_VERSION = 2;
 let buildId = "dev";
 let knownBootId = null;
 let knownSessionId = null;
+let knownServerClockId = null;
 let knownLastAppliedFrame = -1;
 let currentSessionId = null;
 let serverBootId = null;
@@ -49,16 +51,67 @@ let effectiveFps = 0;
 let interpBuffer = null;
 let tickCount = 0;
 let lastAppliedFrame = -1;
+let neutralFrame = null;
+let latestTimingSnapshot = null;
 
 let serverOffsetMs = 0;
 let hasServerOffset = false;
+let lastDriftWarnMs = 0;
 
 let playbackState = "live_playing"; // snapshot_loading | tail_lock_align | live_playing | resyncing
 let targetLiveFrame = null;
 let tailLockStartMs = 0;
 let seenLiveAtOrBeyondTarget = false;
 let lastResyncRequestMs = 0;
-const MAX_TAIL_LOCK_MS = 350;
+const MAX_TAIL_LOCK_MS = 10000;
+const FAST_TRACK_DRIFT_MS = 250;
+const SNAP_DRIFT_MS = 5000;
+const DRIFT_WARN_COOLDOWN_MS = 1000;
+
+function hasReadyStreamFps() {
+  return Number.isFinite(streamFps) && streamFps > 0;
+}
+
+function updateStreamFps(nextFps) {
+  if (Number.isFinite(nextFps) && nextFps > 0) {
+    streamFps = nextFps;
+    streamFpsReady = true;
+  }
+}
+
+function sanitizeTimingValue(value, digits = 3) {
+  if (!Number.isFinite(value)) return null;
+  return Number(value.toFixed(digits));
+}
+
+function buildTimingSnapshot(timing, serverTimeMs) {
+  const snapshot = {};
+  if (timing && typeof timing === "object") {
+    for (const key of [
+      "inputqueuewait_ms",
+      "infer_ms",
+      "resample_ms",
+      "retarget_ms",
+      "outputqueuewait_ms",
+      "batch_samples",
+      "frames_count",
+      "flush_reason",
+    ]) {
+      const value = timing[key];
+      if (typeof value === "string" && value) {
+        snapshot[key] = value;
+      } else if (Number.isFinite(value)) {
+        snapshot[key] = sanitizeTimingValue(value);
+      }
+    }
+  }
+  if (Number.isFinite(serverTimeMs)) {
+    snapshot.transportagems = sanitizeTimingValue(
+      Math.max(0, serverNowEstimateMs() - serverTimeMs)
+    );
+  }
+  return Object.keys(snapshot).length > 0 ? snapshot : null;
+}
 
 function resetTimelineState() {
   targetLiveFrame = null;
@@ -73,6 +126,7 @@ function switchSession(nextSessionId, mode = "live_playing", reason = "session_s
   if (!nextSessionId || nextSessionId === currentSessionId) return false;
   currentSessionId = nextSessionId;
   knownSessionId = nextSessionId;
+  latestTimingSnapshot = null;
   resetTimelineState();
   playbackState = mode;
   postMessage({
@@ -105,18 +159,49 @@ function resetBuffer() {
 }
 
 function ensureCapacity() {
-  capacity = Math.max(1, Math.ceil(streamFps * bufferSeconds));
+  capacity = Math.max(1, Math.ceil((hasReadyStreamFps() ? streamFps : 1) * bufferSeconds));
   resetBuffer();
+}
+
+function buildNeutralFrame() {
+  const len = 3 + nbones * 4 + nmorphs;
+  if (!Number.isFinite(len) || len <= 0) return null;
+  if (!neutralFrame || neutralFrame.length !== len) {
+    neutralFrame = new Float32Array(len);
+    neutralFrame.fill(0);
+    // Identity rotation for each bone quaternion.
+    for (let i = 0; i < nbones; i++) {
+      neutralFrame[3 + i * 4 + 3] = 1;
+    }
+  }
+  return neutralFrame;
 }
 
 function observeServerTime(serverTimeMs) {
   if (!Number.isFinite(serverTimeMs)) return;
-  const raw = serverTimeMs - performance.now();
+  const now = performance.now();
+  const raw = serverTimeMs - now;
   if (!hasServerOffset) {
     serverOffsetMs = raw;
     hasServerOffset = true;
   } else {
-    serverOffsetMs = serverOffsetMs * 0.9 + raw * 0.1;
+    // Compare against previous offset first; post-EMA comparisons create false positives.
+    const delta = raw - serverOffsetMs;
+    const absDelta = Math.abs(delta);
+
+    // True discontinuity (clock jump / long stall): hard snap.
+    if (absDelta > SNAP_DRIFT_MS) {
+      if (now - lastDriftWarnMs > DRIFT_WARN_COOLDOWN_MS) {
+        console.warn(`[Worker] Large drift detected: ${absDelta.toFixed(2)}ms, snapping.`);
+        lastDriftWarnMs = now;
+      }
+      serverOffsetMs = raw;
+      return;
+    }
+
+    // Normal case: EMA smooth. For moderate drift, converge faster without snapping.
+    const alpha = absDelta > FAST_TRACK_DRIFT_MS ? 0.35 : 0.1;
+    serverOffsetMs += delta * alpha;
   }
 }
 
@@ -303,11 +388,13 @@ function emitFrame(frameIndex, data) {
       type: "frame",
       buffer: out.buffer,
       frameIndex,
-      streamFps,
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
       queueLen: storedCount,
       snapshotDropCount,
       liveDropCount,
       resyncSkipped,
+      timing: latestTimingSnapshot,
       nbones,
       nmorphs,
       sessionId: currentSessionId,
@@ -317,7 +404,7 @@ function emitFrame(frameIndex, data) {
     },
     [out.buffer]
   );
-  lastAppliedFrame = frameIndex;
+  lastAppliedFrame = Math.max(lastAppliedFrame, frameIndex);
 }
 
 function updateEffectiveFps() {
@@ -345,11 +432,13 @@ function maybeSendStats() {
     liveDropCount,
     resyncSkipped,
     inFps,
-    streamFps,
+    streamFps: hasReadyStreamFps() ? streamFps : null,
+    streamFpsReady,
     maxIndex,
     minIndexEstimate,
     playbackState,
     targetLiveFrame,
+    timing: latestTimingSnapshot,
     sessionId: currentSessionId,
   });
   recvCount = 0;
@@ -365,6 +454,7 @@ function sendResyncRequest(reason) {
   ws.send(
     JSON.stringify({
       type: "resync_request",
+      stream_session_id: currentSessionId,
       session_id: currentSessionId,
       reason,
     })
@@ -377,6 +467,10 @@ function onTick(elapsed) {
     maybeSendStats();
     return;
   }
+  if (!hasReadyStreamFps()) {
+    maybeSendStats();
+    return;
+  }
   if (playbackState === "tail_lock_align") {
     const target = Number.isFinite(targetLiveFrame) ? targetLiveFrame : maxIndex;
     const best = getNearestFrameAtOrBefore(target) || getLatestFrame();
@@ -385,7 +479,31 @@ function onTick(elapsed) {
       out.set(best.data);
       applyExtras(out, elapsed);
       applyMorphSmoothing(out);
-      emitFrame(best.frame, out);
+      // During tail lock we always emit the hold frame so viewer frameDirty
+      // stays true even when frame index does not advance.
+      const holdOut = new Float32Array(out.length);
+      holdOut.set(out);
+      postMessage(
+        {
+          type: "frame",
+          buffer: holdOut.buffer,
+          frameIndex: best.frame,
+          streamFps,
+          streamFpsReady,
+          queueLen: storedCount,
+          snapshotDropCount,
+          liveDropCount,
+          resyncSkipped,
+          timing: latestTimingSnapshot,
+          nbones,
+          nmorphs,
+          sessionId: currentSessionId,
+          serverBootId,
+          serverClockId,
+          protocolVersion: PROTOCOL_VERSION,
+        },
+        [holdOut.buffer]
+      );
     }
     if (seenLiveAtOrBeyondTarget) {
       playbackState = "live_playing";
@@ -401,6 +519,10 @@ function onTick(elapsed) {
     return;
   }
   if (maxIndex < 0) {
+    const neutral = buildNeutralFrame();
+    if (neutral) {
+      emitFrame(Math.max(lastAppliedFrame, 0), neutral);
+    }
     maybeSendStats();
     return;
   }
@@ -467,6 +589,21 @@ function onTick(elapsed) {
     applyExtras(out, elapsed);
     applyMorphSmoothing(out);
     emitFrame(i0, out);
+  } else {
+    // No exact interpolation frames available; keep stream alive with fallback pose.
+    const fallback = getLatestFrame();
+    if (fallback) {
+      const out = new Float32Array(fallback.data.length);
+      out.set(fallback.data);
+      applyExtras(out, elapsed);
+      applyMorphSmoothing(out);
+      emitFrame(fallback.frame, out);
+    } else {
+      const neutral = buildNeutralFrame();
+      if (neutral) {
+        emitFrame(Math.max(lastAppliedFrame, 0), neutral);
+      }
+    }
   }
   maybeSendStats();
 }
@@ -477,19 +614,41 @@ function connectAnim() {
   ws.binaryType = "arraybuffer";
   let header = null;
   ws.onopen = () => {
-    postMessage({ type: "status", status: "connected" });
+    postMessage({
+      type: "status",
+      status: "connected",
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
+      timing: latestTimingSnapshot,
+    });
     ws.send(
       JSON.stringify({
         type: "anim_subscribe",
         protocol_version: PROTOCOL_VERSION,
         known_boot_id: knownBootId,
+        known_server_clock_id: knownServerClockId,
+        known_stream_session_id: knownSessionId,
         known_session_id: knownSessionId,
         last_applied_frame: Number.isFinite(knownLastAppliedFrame) ? knownLastAppliedFrame : -1,
       })
     );
   };
-  ws.onclose = () => postMessage({ type: "status", status: "closed" });
-  ws.onerror = () => postMessage({ type: "status", status: "error" });
+  ws.onclose = () =>
+    postMessage({
+      type: "status",
+      status: "closed",
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
+      timing: latestTimingSnapshot,
+    });
+  ws.onerror = () =>
+    postMessage({
+      type: "status",
+      status: "error",
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
+      timing: latestTimingSnapshot,
+    });
   ws.onmessage = (event) => {
     if (typeof event.data === "string") {
       let msg = null;
@@ -500,13 +659,34 @@ function connectAnim() {
       }
       header = msg;
       if (!msg) return;
+      if (msg.type === "anim_session_switch") {
+        const sid = msg.stream_session_id || msg.session_id || currentSessionId;
+        switchSession(sid, "live_playing", "server_session_switch");
+        currentSessionId = sid;
+        if (Number.isFinite(msg.server_time_ms)) observeServerTime(msg.server_time_ms);
+        return;
+      }
       if (msg.type === "anim_subscribe_ack") {
         serverBootId = msg.server_boot_id || serverBootId;
         serverClockId = msg.server_clock_id || serverClockId;
+        if (knownServerClockId && serverClockId && knownServerClockId !== serverClockId) {
+          postMessage({
+            type: "status",
+            status: "reset_required",
+            reason: "server_clock_mismatch",
+            serverBootId,
+            serverClockId,
+            sessionId: currentSessionId,
+            protocolVersion: PROTOCOL_VERSION,
+          });
+          ws.close();
+          return;
+        }
+        const ackSessionId = msg.stream_session_id || msg.session_id || currentSessionId;
         const modeFromAck = msg.mode === "resume" ? "snapshot_loading" : "live_playing";
-        switchSession(msg.session_id || currentSessionId, modeFromAck, "subscribe_ack");
-        currentSessionId = msg.session_id || currentSessionId;
-        streamFps = msg.stream_fps || streamFps;
+        switchSession(ackSessionId, modeFromAck, "subscribe_ack");
+        currentSessionId = ackSessionId;
+        updateStreamFps(msg.stream_fps);
         observeServerTime(msg.server_time_ms);
         if (msg.mode === "reset_required") {
           postMessage({
@@ -528,20 +708,29 @@ function connectAnim() {
           serverBootId,
           serverClockId,
           sessionId: currentSessionId,
+          streamFps: hasReadyStreamFps() ? streamFps : null,
+          streamFpsReady,
           buildId,
         });
         return;
       }
       if (msg.type === "anim_snapshot_start") {
-        switchSession(msg.session_id || currentSessionId, "snapshot_loading", "snapshot_start");
+        const sid = msg.stream_session_id || msg.session_id || currentSessionId;
+        switchSession(sid, "snapshot_loading", "snapshot_start");
         playbackState = "snapshot_loading";
         targetLiveFrame = null;
         seenLiveAtOrBeyondTarget = false;
         return;
       }
       if (msg.type === "anim_snapshot_end") {
-        switchSession(msg.session_id || currentSessionId, "snapshot_loading", "snapshot_end");
-        currentSessionId = msg.session_id || currentSessionId;
+        const sid = msg.stream_session_id || msg.session_id || currentSessionId;
+        if (msg.server_clock_id && serverClockId && msg.server_clock_id !== serverClockId) {
+          playbackState = "resyncing";
+          sendResyncRequest("clock_mismatch");
+          return;
+        }
+        switchSession(sid, "snapshot_loading", "snapshot_end");
+        currentSessionId = sid;
         observeServerTime(msg.live_head_server_time_ms);
         const liveHeadFrame = Number.isFinite(msg.live_head_frame) ? msg.live_head_frame : -1;
         const liveHeadServerTimeMs = Number.isFinite(msg.live_head_server_time_ms)
@@ -549,7 +738,7 @@ function connectAnim() {
           : serverNowEstimateMs();
         const audioLiveEdgeFrame = Number.isFinite(msg.audio_live_edge_frame) ? msg.audio_live_edge_frame : -1;
         const expectedFrame =
-          liveHeadFrame >= 0
+          liveHeadFrame >= 0 && hasReadyStreamFps()
             ? liveHeadFrame + Math.round(((serverNowEstimateMs() - liveHeadServerTimeMs) * streamFps) / 1000)
             : -1;
         targetLiveFrame = Math.max(expectedFrame, audioLiveEdgeFrame, liveHeadFrame);
@@ -566,7 +755,7 @@ function connectAnim() {
         return;
       }
       if (msg.type === "anim_init") {
-        streamFps = msg.fps || streamFps;
+        updateStreamFps(msg.fps);
         bones = msg.bones || [];
         morphs = msg.morphs || [];
         if (Number.isFinite(msg.bufferSeconds)) bufferSeconds = msg.bufferSeconds;
@@ -589,6 +778,7 @@ function connectAnim() {
         if (msg.saccade) saccadeConfig = msg.saccade;
         nbones = bones.length;
         nmorphs = morphs.length;
+        neutralFrame = null;
         eyeBoneIndices = [];
         for (let i = 0; i < bones.length; i++) {
           const name = (bones[i] || "").toLowerCase();
@@ -597,7 +787,8 @@ function connectAnim() {
         ensureCapacity();
         postMessage({
           type: "init",
-          streamFps,
+          streamFps: hasReadyStreamFps() ? streamFps : null,
+          streamFpsReady,
           bones,
           morphs,
           bufferSeconds,
@@ -611,12 +802,14 @@ function connectAnim() {
         return;
       }
       if (msg.type === "anim") {
-        if (msg.session_id && msg.session_id !== currentSessionId) {
+        const sid = msg.stream_session_id || msg.session_id || null;
+        if (sid && sid !== currentSessionId) {
           const nextMode = msg.phase === "snapshot" ? "snapshot_loading" : "live_playing";
-          switchSession(msg.session_id, nextMode, "anim_header");
+          switchSession(sid, nextMode, "anim_header");
         }
         if (Number.isFinite(msg.server_time_ms)) observeServerTime(msg.server_time_ms);
-        if (msg.session_id) currentSessionId = msg.session_id;
+        latestTimingSnapshot = buildTimingSnapshot(msg.timing, msg.server_time_ms) || latestTimingSnapshot;
+        if (sid) currentSessionId = sid;
       }
       return;
     }
@@ -624,7 +817,7 @@ function connectAnim() {
     if (!header || header.type !== "anim") return;
     const frame = Number.isFinite(header.frame) ? header.frame : 0;
     const phaseName = header.phase || "live";
-    currentSessionId = header.session_id || currentSessionId;
+    currentSessionId = header.stream_session_id || header.session_id || currentSessionId;
     if (!Number.isFinite(nbones) || nbones <= 0) nbones = header.nbones || nbones;
     if (!Number.isFinite(nmorphs) || nmorphs <= 0) nmorphs = header.nmorphs || nmorphs;
     if (!frameMarks) ensureCapacity();
@@ -646,6 +839,7 @@ self.onmessage = (event) => {
     wsHost = msg.host || wsHost;
     knownBootId = msg.knownBootId || null;
     knownSessionId = msg.knownSessionId || null;
+    knownServerClockId = msg.knownServerClockId || null;
     knownLastAppliedFrame = Number.isFinite(msg.lastAppliedFrame) ? msg.lastAppliedFrame : -1;
     buildId = msg.buildId || buildId;
     connectAnim();
@@ -655,6 +849,7 @@ self.onmessage = (event) => {
     onTick(msg.elapsed);
     tickCount += 1;
   } else if (msg.type === "reset") {
+    latestTimingSnapshot = null;
     resetTimelineState();
     playbackState = "live_playing";
   }

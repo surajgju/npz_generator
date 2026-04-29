@@ -1,7 +1,10 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { ConversationClient } from "./ConversationClient.js";
+import { ensureMicCapture, teardownMicCapture } from "./AudioCapture.js";
 
 let statusEl = null;
 let bufferSecEl = null;
@@ -13,9 +16,19 @@ let streamFpsEl = null;
 let pipelineModeEl = null;
 let audioStatusEl = null;
 let audioBufferEl = null;
+let conversationStatusEl = null;
+let conversationStateEl = null;
+let conversationSessionEl = null;
 let playStateEl = null;
 let lodLevelEl = null;
 let bufferFillEl = null;
+let transportAgeEl = null;
+let inputWaitEl = null;
+let inferMsEl = null;
+let resampleMsEl = null;
+let retargetMsEl = null;
+let outputWaitEl = null;
+let flushReasonEl = null;
 let fitViewBtn = null;
 let viewFaceBtn = null;
 let viewFrontBtn = null;
@@ -32,6 +45,10 @@ let toggleWireframeEl = null;
 let toggleAutoRotateEl = null;
 let toggleTranslateEl = null;
 let enableAudioBtn = null;
+let connectConversationBtn = null;
+let pttButton = null;
+let disconnectMicButton = null;
+let interruptReplyBtn = null;
 let togglePlayBtn = null;
 let clearBufferBtn = null;
 let resetCamBtn = null;
@@ -47,15 +64,18 @@ const warn = (...args) => console.warn("[Viewer]", ...args);
 const error = (...args) => console.error("[Viewer]", ...args);
 const DEBUG = false;
 const BUILD_ID = import.meta.env.VITE_BUILD_ID || import.meta.env.MODE || "dev";
+const ENABLE_MORPH_DEBUGGER = import.meta.env.VITE_ENABLE_MORPH_DEBUGGER === "1";
 const IDLE_START_MS = 2000;
 let lastDebugSummary = 0;
 let lastHudLog = null;
 let lastStatsLog = null;
 
 const idleConfig = {
-  blink: { intervalSec: [3.0, 6.0], durationSec: 0.12, strength: 0.6 },
+  blink: { intervalSec: [2.5, 5.0], durationSec: 0.15, strength: 0.6 },
   saccade: { intervalSec: [1.0, 3.0], yawDeg: 2.0, pitchDeg: 1.0 },
-  headSway: { yawDeg: 2.0, pitchDeg: 1.0, rollDeg: 0.5, periodSec: [5.0, 7.0] },
+  headSway: { yawDeg: 3.0, pitchDeg: 1.5, rollDeg: 0.5, periodSec: [5.0, 7.0] },
+  // Discrete neck look-around: random glance target every 2-3s, very slow blend
+  neckLook: { intervalSec: [2.0, 3.5], yawDeg: 60.0, pitchDeg: 8.0, blendSpeed: 0.008 },
   neckScale: 0.5,
 };
 let idleActive = false;
@@ -73,6 +93,12 @@ let idleBlinkPreferredNames = [];
 let idleBlinkAutoNames = [];
 let idleBlinkTargets = [];
 let idleBlinkStrengthScale = 1.0;
+// Neck look-around state (discrete glance, separate from sinusoidal sway)
+let idleNeckLookNextAt = null;
+let idleNeckLookTargetYaw = 0;
+let idleNeckLookTargetPitch = 0;
+let idleNeckLookCurrentYaw = 0;
+let idleNeckLookCurrentPitch = 0;
 let lastBlinkNames = "";
 let lastBlinkAutoNames = "";
 let debugMorphNames = {
@@ -117,6 +143,8 @@ let idleBones = {
   leftEye: null,
   rightEye: null,
   jaw: null,
+  leftCollar: null,
+  rightCollar: null,
   leftShoulder: null,
   rightShoulder: null,
   leftElbow: null,
@@ -131,6 +159,8 @@ let idleRestQuats = {
   leftEye: null,
   rightEye: null,
   jaw: null,
+  leftCollar: null,
+  rightCollar: null,
   leftShoulder: null,
   rightShoulder: null,
   leftElbow: null,
@@ -139,6 +169,7 @@ let idleRestQuats = {
   spine2: null,
   spine3: null,
 };
+let mismatchStartMs = null;
 
 function logDelta(label, curr, prev) {
   const changes = [];
@@ -186,6 +217,10 @@ function cacheIdleBones() {
   idleBones.rightEye =
     findBoneByName("right_eye_smplhf") || findBoneByIncludes(["right_eye", "reye"]);
   idleBones.jaw = findBoneByName("jaw") || findBoneByIncludes(["jaw"]);
+  idleBones.leftCollar =
+    findBoneByName("left_collar") || findBoneByIncludes(["left_collar", "l_collar"]);
+  idleBones.rightCollar =
+    findBoneByName("right_collar") || findBoneByIncludes(["right_collar", "r_collar"]);
   idleBones.leftShoulder =
     findBoneByName("left_shoulder") || findBoneByIncludes(["left_shoulder", "l_shoulder"]);
   idleBones.rightShoulder =
@@ -202,6 +237,12 @@ function cacheIdleBones() {
   idleRestQuats.leftEye = idleBones.leftEye ? idleBones.leftEye.quaternion.clone() : null;
   idleRestQuats.rightEye = idleBones.rightEye ? idleBones.rightEye.quaternion.clone() : null;
   idleRestQuats.jaw = idleBones.jaw ? idleBones.jaw.quaternion.clone() : null;
+  idleRestQuats.leftCollar = idleBones.leftCollar
+    ? idleBones.leftCollar.quaternion.clone()
+    : null;
+  idleRestQuats.rightCollar = idleBones.rightCollar
+    ? idleBones.rightCollar.quaternion.clone()
+    : null;
   idleRestQuats.leftShoulder = idleBones.leftShoulder
     ? idleBones.leftShoulder.quaternion.clone()
     : null;
@@ -287,6 +328,59 @@ function resetAllMorphsToBase() {
   }
 }
 
+function refreshSpeechMorphIndices() {
+  mouthMorphIndices = debugMouthPreferredNames
+    .map((name) => morphNames.indexOf(name))
+    .filter((idx) => idx >= 0);
+  mouthMorphIndexSet = new Set(mouthMorphIndices);
+}
+
+function resetLivePlaybackFilters() {
+  stabilizedRootOffset.set(0, 0, 0);
+  rootStabilizerReady = false;
+  speechEnergySmoothed = 0;
+  speechBodyBlend = 0;
+  speechOverlayLastSec = 0;
+  idleTailArmed = false;
+  idleTailStartMs = null;
+  serverSilentSinceMs = null;
+}
+
+function syncControlsTargetToAvatarOffset() {
+  if (!controls) return;
+  controls.target.set(
+    userOffset.x,
+    userOffset.y + viewTargetOffsetY,
+    userOffset.z
+  );
+}
+
+function stabilizeRootTranslation(rootX, rootY, rootZ, advanceRootSmoothing) {
+  if (!rootStabilizerReady) {
+    stabilizedRootOffset.set(rootX, rootY, rootZ);
+    rootStabilizerReady = true;
+    return stabilizedRootOffset;
+  }
+  if (advanceRootSmoothing) {
+    for (const axis of ["x", "z"]) {
+      const raw = axis === "x" ? rootX : rootZ;
+      const prev = stabilizedRootOffset[axis];
+      const delta = raw - prev;
+      if (Math.abs(delta) <= ROOT_XZ_DEADBAND_M) {
+        continue;
+      }
+      stabilizedRootOffset[axis] =
+        prev +
+        Math.max(
+          -ROOT_XZ_MAX_STEP_M,
+          Math.min(ROOT_XZ_MAX_STEP_M, delta * ROOT_XZ_EMA_ALPHA)
+        );
+    }
+  }
+  stabilizedRootOffset.y = rootY;
+  return stabilizedRootOffset;
+}
+
 function resetIdlePose() {
   if (idleRestQuats.head && idleBones.head) idleBones.head.quaternion.copy(idleRestQuats.head);
   if (idleRestQuats.neck && idleBones.neck) idleBones.neck.quaternion.copy(idleRestQuats.neck);
@@ -295,6 +389,10 @@ function resetIdlePose() {
   if (idleRestQuats.rightEye && idleBones.rightEye)
     idleBones.rightEye.quaternion.copy(idleRestQuats.rightEye);
   if (idleRestQuats.jaw && idleBones.jaw) idleBones.jaw.quaternion.copy(idleRestQuats.jaw);
+  if (idleRestQuats.leftCollar && idleBones.leftCollar)
+    idleBones.leftCollar.quaternion.copy(idleRestQuats.leftCollar);
+  if (idleRestQuats.rightCollar && idleBones.rightCollar)
+    idleBones.rightCollar.quaternion.copy(idleRestQuats.rightCollar);
   if (idleRestQuats.leftShoulder && idleBones.leftShoulder)
     idleBones.leftShoulder.quaternion.copy(idleRestQuats.leftShoulder);
   if (idleRestQuats.rightShoulder && idleBones.rightShoulder)
@@ -517,11 +615,11 @@ function autoDetectBlinkMorphs() {
     const total = eye + v[2] + v[3];
     return [...v, total > 0 ? eye / total : 0]; // v[4] = ratio
   });
-  const leftRatios  = addRatio(leftScores).sort((a, b) => b[4] - a[4]);
+  const leftRatios = addRatio(leftScores).sort((a, b) => b[4] - a[4]);
   const rightRatios = addRatio(rightScores).sort((a, b) => b[4] - a[4]);
 
   // Pick top 2 by ratio; no hard rejection threshold needed
-  const leftTop  = leftRatios.slice(0, 2).map((v) => v[0]);
+  const leftTop = leftRatios.slice(0, 2).map((v) => v[0]);
   const rightTop = rightRatios.slice(0, 2).map((v) => v[0]);
   idleBlinkAutoNames = Array.from(new Set([...leftTop, ...rightTop]));
 
@@ -536,7 +634,7 @@ function autoDetectBlinkMorphs() {
     const key = idleBlinkAutoNames.join(",");
     if (key !== lastBlinkAutoNames) {
       lastBlinkAutoNames = key;
-      const bestLeft  = leftRatios[0]  ? `${leftRatios[0][0]}(ratio=${leftRatios[0][4].toFixed(2)})`  : "none";
+      const bestLeft = leftRatios[0] ? `${leftRatios[0][0]}(ratio=${leftRatios[0][4].toFixed(2)})` : "none";
       const bestRight = rightRatios[0] ? `${rightRatios[0][0]}(ratio=${rightRatios[0][4].toFixed(2)})` : "none";
       log("Auto blink morphs:", { leftTop, rightTop, bestLeft, bestRight, selected: idleBlinkAutoNames });
     }
@@ -741,37 +839,61 @@ function autoDetectFaceRegions() {
 }
 
 
+function updateIdleNeckLook(elapsed) {
+  const cfg = idleConfig.neckLook;
+  const interval = cfg.intervalSec || [2.0, 3.5];
+  if (idleNeckLookNextAt === null) {
+    idleNeckLookNextAt = elapsed + randRange(interval[0], interval[1]);
+  }
+  if (elapsed >= idleNeckLookNextAt) {
+    const yawRad = (cfg.yawDeg || 12.0) * (Math.PI / 180);
+    const pitchRad = (cfg.pitchDeg || 5.0) * (Math.PI / 180);
+    idleNeckLookTargetYaw = randRange(-yawRad, yawRad);
+    idleNeckLookTargetPitch = randRange(-pitchRad, pitchRad);
+    idleNeckLookNextAt = elapsed + randRange(interval[0], interval[1]);
+  }
+  const speed = cfg.blendSpeed || 0.06;
+  idleNeckLookCurrentYaw += (idleNeckLookTargetYaw - idleNeckLookCurrentYaw) * speed;
+  idleNeckLookCurrentPitch += (idleNeckLookTargetPitch - idleNeckLookCurrentPitch) * speed;
+  return { yaw: idleNeckLookCurrentYaw, pitch: idleNeckLookCurrentPitch };
+}
+
 function applyIdlePose(nowSec) {
   if (!idleActive || !avatarLoaded) return;
   if (!idleRestQuats.head && idleBones.head) {
     cacheIdleBones();
   }
   const elapsed = nowSec - idleStartSec;
-  // Blend blinks atop existing morphs instead of resetting everything.
   const headCfg = idleConfig.headSway;
   const basePeriod = idleHeadPeriodSec || 6.0;
-  const yawAmp = (headCfg.yawDeg || 2.0) * (Math.PI / 180);
-  const pitchAmp = (headCfg.pitchDeg || 1.0) * (Math.PI / 180);
+  const swayYawAmp = (headCfg.yawDeg || 3.0) * (Math.PI / 180);
+  const swayPitchAmp = (headCfg.pitchDeg || 1.5) * (Math.PI / 180);
   const rollAmp = (headCfg.rollDeg || 0.5) * (Math.PI / 180);
-  const yaw = Math.sin((elapsed / basePeriod) * Math.PI * 2 + idleHeadPhase) * yawAmp;
-  const pitch =
-    Math.sin((elapsed / (basePeriod * 1.3)) * Math.PI * 2 + idleHeadPhase * 0.7) * pitchAmp;
+  const swayYaw = Math.sin((elapsed / basePeriod) * Math.PI * 2 + idleHeadPhase) * swayYawAmp;
+  const swayPitch =
+    Math.sin((elapsed / (basePeriod * 1.3)) * Math.PI * 2 + idleHeadPhase * 0.7) * swayPitchAmp;
   const roll =
     Math.sin((elapsed / (basePeriod * 1.7)) * Math.PI * 2 + idleHeadPhase * 1.3) * rollAmp;
+
+  // Discrete look-around: head glances every 2-3s at human-like speed
+  const { yaw: lookYaw, pitch: lookPitch } = updateIdleNeckLook(elapsed);
+  const totalYaw = swayYaw + lookYaw;
+  const totalPitch = swayPitch + lookPitch;
+
   if (idleBones.head && idleRestQuats.head) {
-    tempEuler.set(pitch, yaw, roll, "YXZ");
+    tempEuler.set(totalPitch, totalYaw, roll, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.head.quaternion.copy(idleRestQuats.head).multiply(tempQuat2);
   }
   if (idleBones.neck && idleRestQuats.neck) {
     const scale = idleConfig.neckScale ?? 0.5;
-    tempEuler.set(pitch * scale, yaw * scale, roll * scale, "YXZ");
+    tempEuler.set(totalPitch * scale, totalYaw * scale, roll * scale, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.neck.quaternion.copy(idleRestQuats.neck).multiply(tempQuat2);
   }
-  // Subtle spine sway.
-  const spineYaw = yaw * 0.5;
-  const spinePitch = pitch * 0.4;
+  // Subtle spine sway following the head.
+  const spineYaw = swayYaw * 0.5;
+  const spinePitch = swayPitch * 0.4;
   const spineBones = [
     [idleBones.spine1, idleRestQuats.spine1, 0.4],
     [idleBones.spine2, idleRestQuats.spine2, 0.35],
@@ -783,19 +905,39 @@ function applyIdlePose(nowSec) {
     tempQuat2.setFromEuler(tempEuler);
     bone.quaternion.copy(rest).multiply(tempQuat2);
   }
-  // Relax arms from T-pose.
-  const shoulderPitch = (-8 * Math.PI) / 180;
-  const elbowBend = (-5 * Math.PI) / 180;
+  // ── Arm rest pose ──
+  // In SMPL-X GLB the collar (clavicle) bone's LOCAL space:
+  //   Z-axis = elevation (negative Z = depress/lower the shoulder girdle)
+  // The shoulder (upper arm) LOCAL space:
+  //   Z-axis = abduction/adduction (negative Z = adduct = arm toward body)
+  //   X-axis = flexion/extension (negative X = forward lean)
+  // Drive collars to depress the shoulder girdle, then adduct via shoulder Z.
+  const collarDepress = (-20 * Math.PI) / 180; // depress clavicle slightly
+  if (idleBones.leftCollar && idleRestQuats.leftCollar) {
+    tempEuler.set(0, 0, collarDepress, "YXZ");
+    tempQuat2.setFromEuler(tempEuler);
+    idleBones.leftCollar.quaternion.copy(idleRestQuats.leftCollar).multiply(tempQuat2);
+  }
+  if (idleBones.rightCollar && idleRestQuats.rightCollar) {
+    tempEuler.set(0, 0, collarDepress, "YXZ");
+    tempQuat2.setFromEuler(tempEuler);
+    idleBones.rightCollar.quaternion.copy(idleRestQuats.rightCollar).multiply(tempQuat2);
+  }
+  // Shoulder: adduct (bring arm in from T-pose) via Z, plus slight forward X lean.
+  const shoulderAdductLeft  = ( 55 * Math.PI) / 180; // left shoulder adduct
+  const shoulderAdductRight = (-55 * Math.PI) / 180; // right shoulder adduct
+  const shoulderForward     = (-10 * Math.PI) / 180; // slight forward lean
   if (idleBones.leftShoulder && idleRestQuats.leftShoulder) {
-    tempEuler.set(shoulderPitch, 0, 0, "YXZ");
+    tempEuler.set(shoulderForward, 0, shoulderAdductLeft, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.leftShoulder.quaternion.copy(idleRestQuats.leftShoulder).multiply(tempQuat2);
   }
   if (idleBones.rightShoulder && idleRestQuats.rightShoulder) {
-    tempEuler.set(shoulderPitch, 0, 0, "YXZ");
+    tempEuler.set(shoulderForward, 0, shoulderAdductRight, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.rightShoulder.quaternion.copy(idleRestQuats.rightShoulder).multiply(tempQuat2);
   }
+  const elbowBend = (-10 * Math.PI) / 180;
   if (idleBones.leftElbow && idleRestQuats.leftElbow) {
     tempEuler.set(elbowBend, 0, 0, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
@@ -806,20 +948,109 @@ function applyIdlePose(nowSec) {
     tempQuat2.setFromEuler(tempEuler);
     idleBones.rightElbow.quaternion.copy(idleRestQuats.rightElbow).multiply(tempQuat2);
   }
+  // ── Eye saccade + bone-driven blink ──
+  // Blink: rotate the eye bones downward on X (local "look down" closes
+  // the upper eyelid in SMPL-X). This avoids touching Exp morphs which
+  // are face-global and affect the nasolabial fold.
+  const blinkVal = updateIdleBlink(elapsed) * (idleConfig.blink.strength || 0.6);
+  // Max downward rotation for a full blink: ~30°
+  const blinkMaxRad = (30 * Math.PI) / 180;
+  const blinkRot = blinkVal * blinkMaxRad;
   if (idleBones.leftEye && idleBones.rightEye && idleRestQuats.leftEye && idleRestQuats.rightEye) {
     const { yaw: eyeYaw, pitch: eyePitch } = updateIdleSaccade(elapsed);
-    tempEuler.set(eyePitch, eyeYaw, 0, "YXZ");
+    // Combine saccade + blink on X axis (blink = additional downward pitch)
+    tempEuler.set(eyePitch + blinkRot, eyeYaw, 0, "YXZ");
     tempQuat2.setFromEuler(tempEuler);
     idleBones.leftEye.quaternion.copy(idleRestQuats.leftEye).multiply(tempQuat2);
     idleBones.rightEye.quaternion.copy(idleRestQuats.rightEye).multiply(tempQuat2);
+  } else {
+    // Fallback: eyes not found, skip
   }
+}
+
+function beginLagIdleOverlay(nowSec) {
+  idleStartSec = nowSec;
+  idleBlinkNextAt = null;
+  idleBlinkStartAt = null;
+  idleSaccadeNextAt = null;
+  idleSaccadeYaw = 0;
+  idleSaccadePitch = 0;
+  idleSaccadeTargetYaw = 0;
+  idleSaccadeTargetPitch = 0;
+  idleNeckLookNextAt = null;
+  idleNeckLookTargetYaw = 0;
+  idleNeckLookTargetPitch = 0;
+  idleNeckLookCurrentYaw = 0;
+  idleNeckLookCurrentPitch = 0;
+  idleHeadPeriodSec = randRange(idleConfig.headSway.periodSec[0], idleConfig.headSway.periodSec[1]);
+  idleHeadPhase = randRange(0, Math.PI * 2);
+  cacheIdleBones();
+  autoDetectFaceRegions();
+  autoDetectBlinkMorphs();
+  refreshIdleBlinkTargets();
+}
+
+function slerpBoneTowardIdle(bone, restQuat, pitch, yaw, roll, blend) {
+  if (!bone || !restQuat) return;
+  tempEuler.set(pitch, yaw, roll, "YXZ");
+  tempQuat2.setFromEuler(tempEuler);
+  tempQuat.copy(restQuat).multiply(tempQuat2);
+  bone.quaternion.slerp(tempQuat, blend);
+}
+
+function applyIdlePoseAdditive(nowSec, blend) {
+  if (!avatarLoaded || blend <= 0) return;
+  if (!idleRestQuats.head && idleBones.head) {
+    cacheIdleBones();
+  }
+  const elapsed = nowSec - idleStartSec;
+  const headCfg = idleConfig.headSway;
+  const basePeriod = idleHeadPeriodSec || 6.0;
+  const yawAmp = (headCfg.yawDeg || 2.0) * (Math.PI / 180);
+  const pitchAmp = (headCfg.pitchDeg || 1.0) * (Math.PI / 180);
+  const rollAmp = (headCfg.rollDeg || 0.5) * (Math.PI / 180);
+  const yaw = Math.sin((elapsed / basePeriod) * Math.PI * 2 + idleHeadPhase) * yawAmp;
+  const pitch =
+    Math.sin((elapsed / (basePeriod * 1.3)) * Math.PI * 2 + idleHeadPhase * 0.7) * pitchAmp;
+  const roll =
+    Math.sin((elapsed / (basePeriod * 1.7)) * Math.PI * 2 + idleHeadPhase * 1.3) * rollAmp;
+
+  slerpBoneTowardIdle(idleBones.head, idleRestQuats.head, pitch, yaw, roll, blend);
+
+  const neckScale = idleConfig.neckScale ?? 0.5;
+  slerpBoneTowardIdle(
+    idleBones.neck,
+    idleRestQuats.neck,
+    pitch * neckScale,
+    yaw * neckScale,
+    roll * neckScale,
+    blend
+  );
+
+  const spineYaw = yaw * 0.5;
+  const spinePitch = pitch * 0.4;
+  slerpBoneTowardIdle(idleBones.spine1, idleRestQuats.spine1, spinePitch * 0.4, spineYaw * 0.4, 0, blend);
+  slerpBoneTowardIdle(idleBones.spine2, idleRestQuats.spine2, spinePitch * 0.35, spineYaw * 0.35, 0, blend);
+  slerpBoneTowardIdle(idleBones.spine3, idleRestQuats.spine3, spinePitch * 0.25, spineYaw * 0.25, 0, blend);
+
+  // NOTE: shoulders excluded — server drives them during live playback.
+  const elbowBend = (-5 * Math.PI) / 180;
+  slerpBoneTowardIdle(idleBones.leftElbow, idleRestQuats.leftElbow, elbowBend, 0, 0, blend);
+  slerpBoneTowardIdle(idleBones.rightElbow, idleRestQuats.rightElbow, elbowBend, 0, 0, blend);
+
+  if (idleBones.leftEye && idleBones.rightEye && idleRestQuats.leftEye && idleRestQuats.rightEye) {
+    const { yaw: eyeYaw, pitch: eyePitch } = updateIdleSaccade(elapsed);
+    slerpBoneTowardIdle(idleBones.leftEye, idleRestQuats.leftEye, eyePitch, eyeYaw, 0, blend);
+    slerpBoneTowardIdle(idleBones.rightEye, idleRestQuats.rightEye, eyePitch, eyeYaw, 0, blend);
+  }
+
   if (idleBlinkTargets.length) {
-    const blinkVal =
-      updateIdleBlink(elapsed) * (idleConfig.blink.strength || 0.6) * idleBlinkStrengthScale;
+    const blinkVal = updateIdleBlink(elapsed) * (idleConfig.blink.strength || 0.6) * idleBlinkStrengthScale;
     for (const t of idleBlinkTargets) {
       const base = t.base ?? 0;
-      const v = Math.max(-1, Math.min(1, base + blinkVal));
-      t.mesh.morphTargetInfluences[t.index] += blinkVal;
+      const current = t.mesh.morphTargetInfluences[t.index] ?? base;
+      const target = Math.max(-1, Math.min(1, base + blinkVal));
+      t.mesh.morphTargetInfluences[t.index] = current + (target - current) * blend;
     }
   }
 }
@@ -833,7 +1064,10 @@ function updateIdleState() {
     }
     return;
   }
-  const noFrames = now - lastFrameUpdate > IDLE_START_MS;
+  // Idle fires when NO fresh frames have arrived from the worker for IDLE_START_MS.
+  // lastWorkerFrameAt is updated as soon as a frame arrives from the server.
+  // This avoids falsely triggering idle during audio buffering when frame rendering is paused.
+  const noFrames = lastWorkerFrameAt === null || now - lastWorkerFrameAt > IDLE_START_MS;
   const disconnected =
     !workerReady || statusEl.textContent === "Disconnected" || pipelineModeEl.textContent === "Error";
   const shouldIdle = !manualPaused && (noFrames || disconnected);
@@ -848,6 +1082,11 @@ function updateIdleState() {
     idleSaccadePitch = 0;
     idleSaccadeTargetYaw = 0;
     idleSaccadeTargetPitch = 0;
+    idleNeckLookNextAt = null;
+    idleNeckLookTargetYaw = 0;
+    idleNeckLookTargetPitch = 0;
+    idleNeckLookCurrentYaw = 0;
+    idleNeckLookCurrentPitch = 0;
     idleHeadPeriodSec = randRange(
       idleConfig.headSway.periodSec[0],
       idleConfig.headSway.periodSec[1]
@@ -865,6 +1104,84 @@ function updateIdleState() {
 
 function easeInOut(t) {
   return 0.5 - 0.5 * Math.cos(Math.PI * Math.max(0, Math.min(1, t)));
+}
+
+function updateSpeechBodyBlend(nowSec, targetBlend) {
+  const target = Math.max(0, Math.min(1, targetBlend));
+  if (!speechOverlayLastSec) {
+    speechOverlayLastSec = nowSec;
+    speechBodyBlend = target;
+    return speechBodyBlend;
+  }
+  const dt = Math.max(0, Math.min(0.1, nowSec - speechOverlayLastSec));
+  speechOverlayLastSec = nowSec;
+  const duration = target > speechBodyBlend ? SPEECH_BODY_FADE_IN_SEC : SPEECH_BODY_FADE_OUT_SEC;
+  const step = duration > 0 ? Math.min(1, dt / duration) : 1;
+  speechBodyBlend += (target - speechBodyBlend) * step;
+  return speechBodyBlend;
+}
+
+function applySpeechBodyOverlay(nowSec, targetEnergy, energyScale = 1) {
+  if (!avatarLoaded) return;
+  cacheIdleBones();
+  const blend = updateSpeechBodyBlend(nowSec, targetEnergy) * Math.max(0, energyScale);
+  if (blend <= 0.001) return;
+  const phase = (nowSec / SPEECH_BODY_SWAY_PERIOD_SEC) * Math.PI * 2;
+  const pulse = 0.88 + 0.12 * Math.sin(phase);
+  const sway = Math.sin(phase * 0.6) * 0.5;
+
+  slerpBoneTowardIdle(
+    idleBones.spine1,
+    idleRestQuats.spine1,
+    SPEECH_SPINE_MAX_PITCH,
+    0,
+    0,
+    blend * pulse
+  );
+  slerpBoneTowardIdle(
+    idleBones.spine2,
+    idleRestQuats.spine2,
+    SPEECH_SPINE_MAX_PITCH * 0.8,
+    0,
+    0,
+    blend * pulse
+  );
+  slerpBoneTowardIdle(
+    idleBones.spine3,
+    idleRestQuats.spine3,
+    SPEECH_SPINE_MAX_PITCH * 0.6,
+    0,
+    0,
+    blend * pulse
+  );
+  slerpBoneTowardIdle(
+    idleBones.neck,
+    idleRestQuats.neck,
+    SPEECH_NECK_MAX_PITCH * pulse,
+    SPEECH_NECK_MAX_YAW * sway,
+    0,
+    blend
+  );
+  // NOTE: shoulders are intentionally excluded here — their animation
+  // comes from the server (SMPL-X body_pose joints 13/14 = left/right collar,
+  // 16/17 = left/right shoulder). Overriding them during live playback
+  // would jam the server-driven shoulder gestures.
+}
+
+function applyUtteranceTail(nowMs) {
+  if (!idleTailArmed) return 1;
+  if (idleTailStartMs === null) {
+    idleTailStartMs = nowMs;
+  }
+  const progress = Math.max(0, Math.min(1, (nowMs - idleTailStartMs) / SPEECH_BODY_TAIL_MS));
+  applyStallEase(progress);
+  cacheIdleBones();
+  slerpBoneTowardIdle(idleBones.jaw, idleRestQuats.jaw, 0, 0, 0, progress);
+  if (progress >= 1) {
+    idleTailArmed = false;
+    idleTailStartMs = null;
+  }
+  return 1 - progress;
 }
 
 function applyMorphTargets(targets, value) {
@@ -924,7 +1241,7 @@ function applyManualOverride(nowSec, overlayOnly = false) {
 
   if (manualOverride.type === "emotion") {
     const payload = manualOverride.payload || {};
-    
+
     // Legacy fallback parameters (if payload uses generic groups)
     const mouthUp = debugMorphTargets.mouthUp || [];
     const mouthDown = debugMorphTargets.mouthDown || [];
@@ -939,7 +1256,7 @@ function applyManualOverride(nowSec, overlayOnly = false) {
     if (mDown && mouthDown.length) { applyMorphTargets(mouthDown, mDown); appliedAny = true; }
     if (bUp && browUp.length) { applyMorphTargets(browUp, bUp); appliedAny = true; }
     if (bDown && browDown.length) { applyMorphTargets(browDown, bDown); appliedAny = true; }
-    
+
     // Explicit FLAME / Blendshape explicit target names
     for (const [key, val] of Object.entries(payload)) {
       if (key.startsWith("Exp") || key.startsWith("Shape") || key.startsWith("Mouth")) {
@@ -1005,10 +1322,14 @@ let boneRestQuats = [];
 let boneRestPos = [];
 let rootBone = null;
 let rootRestPos = new THREE.Vector3();
+let stabilizedRootOffset = new THREE.Vector3();
+let rootStabilizerReady = false;
 let morphTargetMap = new Map();
 let morphAliasCount = 0;
 let loggedAliasSummary = false;
 let morphNames = [];
+let mouthMorphIndices = [];
+let mouthMorphIndexSet = new Set();
 let expMeshCount = 0;
 let avatarLoaded = false;
 let frameCount = 0;
@@ -1070,7 +1391,8 @@ function exposeViewerDebug() {
 }
 
 const NORMAL_EVERY = 15;
-let streamFps = 20;
+let streamFps = null;
+let streamFpsReady = false;
 let maxBufferSeconds = 10;
 
 let currentFrameIndex = 0;
@@ -1083,29 +1405,42 @@ let lastBounds = null;
 let faceOffset = 0.0;
 let userOffset = new THREE.Vector3();
 let basePos = new THREE.Vector3();
+let viewTargetOffsetY = 1.0;
 let transformControls = null;
 let gizmoAnchor = null;
 let isDragging = false;
 let lastRateTime = performance.now();
-let currentPlayFps = streamFps;
+let currentPlayFps = 0;
 
 let audioCtx = null;
-let audioWs = null;
 let audioEnabled = false;
 let audioStarted = false;
 let audioStartTime = null;
 let audioScheduledTime = 0;
 let audioQueue = [];
 let audioQueuedSec = 0;
+let conversationClient = null;
+let conversationConnected = false;
+let conversationId = null;
+let conversationStreamSessionId = null;
+let assistantLifecycleState = "idle";
+let pttActive = false;
+let pttPressed = false;
+let pttStarting = false;
+let pttSeq = 0;
 let silentStartTime = null;
 let animOffsetSec = 0;
 let animOffsetSet = false;
 const AUDIO_JITTER_SEC = 0.08;
-const AUDIO_START_BUFFER_SEC = 0.6;
-const AUDIO_LOW_BUFFER_SEC = 0.3;
+const AUDIO_START_LEAD_SEC = Number(import.meta.env.VITE_AUDIO_START_LEAD_SEC || 0.03);
+const AUDIO_START_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_START_BUFFER_SEC || 0.4);
+const MESH_START_BUFFER_SEC = Number(import.meta.env.VITE_MESH_START_BUFFER_SEC || 0.25);
+const AUDIO_LOW_BUFFER_SEC = Number(import.meta.env.VITE_AUDIO_LOW_BUFFER_SEC || 0.25);
+const SESSION_MISMATCH_GRACE_MS = Number(import.meta.env.VITE_SESSION_MISMATCH_GRACE_MS || 3000);
 const STARTUP_SUPPRESS_MS = 4000;
 const STALL_HOLD_MS = 300;
 const STALL_EASE_MS = 700;
+const STALL_IDLE_BLEND_MS = Number(import.meta.env.VITE_STALL_IDLE_BLEND_MS || 2200);
 const workerEnabled = typeof Worker !== "undefined";
 const WS_HOST =
   (import.meta && import.meta.env && import.meta.env.VITE_WS_HOST) ||
@@ -1123,9 +1458,19 @@ let workerLiveDropped = 0;
 let workerResyncSkipped = 0;
 let workerInFps = 0;
 let workerPlaybackFps = 0;
+let workerTiming = null;
 let frameDirty = false;
+let heldFrameData = null;
+let lagIdleBlend = 0;
+let lagIdleStarted = false;
+// Tracks when workerInFps last dropped to 0 (server stopped sending new frames)
+let serverSilentSinceMs = null;
 let workerReady = false;
 let workerFallbackTimer = null;
+let workerRestartTimer = null;
+let workerRestartPending = false;
+let fallbackTickElapsedSec = 0;
+let fallbackTickLastMs = 0;
 let lastFrameUpdate = 0;
 let workerMaxIndex = -1;
 let workerMinIndex = -1;
@@ -1146,11 +1491,31 @@ let resyncing = false;
 let buildLogged = false;
 let sessionMismatchWarned = false;
 let lastSessionResetAt = 0;
+let speechEnergySmoothed = 0;
+let speechBodyBlend = 0;
+let speechOverlayLastSec = 0;
+let idleTailArmed = false;
+let idleTailStartMs = null;
 
 const MORPH_EMA_ALPHA = 0.35;
-const MORPH_CLAMP = 2.5;
+const MORPH_CLAMP = Number(import.meta.env.VITE_EXPRESSION_MAX_ABS || 0.85);
+const ROOT_XZ_DEADBAND_M = Number(import.meta.env.VITE_ROOT_XZ_DEADBAND_M || 0.005);
+const ROOT_XZ_EMA_ALPHA = Number(import.meta.env.VITE_ROOT_XZ_EMA_ALPHA || 0.15);
+const ROOT_XZ_MAX_STEP_M = Number(import.meta.env.VITE_ROOT_XZ_MAX_STEP_M || 0.015);
+const SPEECH_BODY_FADE_IN_SEC = 0.12;
+const SPEECH_BODY_FADE_OUT_SEC = 0.18;
+const SPEECH_BODY_TAIL_MS = 180;
+const SPEECH_SPINE_MAX_PITCH = (1.5 * Math.PI) / 180;
+const SPEECH_NECK_MAX_PITCH = (0.8 * Math.PI) / 180;
+const SPEECH_NECK_MAX_YAW = (0.8 * Math.PI) / 180;
+const SPEECH_SHOULDER_MAX_PITCH = (-1.0 * Math.PI) / 180;
+const SPEECH_BODY_SWAY_PERIOD_SEC = 2.4;
 
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath("/draco/gltf/");
+dracoLoader.preload();
 const gltfLoader = new GLTFLoader();
+gltfLoader.setDRACOLoader(dracoLoader);
 const tempQuat = new THREE.Quaternion();
 const tempQuat2 = new THREE.Quaternion();
 const tempEuler = new THREE.Euler();
@@ -1265,12 +1630,15 @@ async function loadAvatar() {
     }
     const box = new THREE.Box3().setFromObject(avatarRoot);
     const center = box.getCenter(new THREE.Vector3());
-    basePos.copy(center).multiplyScalar(-1);
+    const height = Math.max(1e-6, box.max.y - box.min.y);
+    // Ground anchor: feet/base sits on Y=0 while keeping X/Z centered.
+    basePos.set(-center.x, -box.min.y, -center.z);
+    viewTargetOffsetY = height * 0.5;
     avatarRoot.position.copy(basePos).add(userOffset);
-    controls.target.copy(userOffset);
+    syncControlsTargetToAvatarOffset();
     lastBounds = { min: [box.min.x, box.min.y, box.min.z], max: [box.max.x, box.max.y, box.max.z] };
     lodLevelEl.textContent = "Rig";
-  avatarLoaded = true;
+    avatarLoaded = true;
     cacheIdleBones();
     if (toggleTranslateEl && toggleTranslateEl.checked) {
       setTranslateEnabled(true);
@@ -1290,9 +1658,13 @@ async function loadAvatar() {
       morphs: morphTargetMap.size,
       morphMeshes: meshMorphCount,
       morphTargetsMax: meshMorphTargets,
+      anchor: {
+        basePos: [basePos.x, basePos.y, basePos.z],
+        targetOffsetY: viewTargetOffsetY,
+      },
     });
     exposeViewerDebug();
-    initMorphDebugPanel();
+    if (ENABLE_MORPH_DEBUGGER) initMorphDebugPanel();
   } catch (err) {
     error("Failed to load head.glb", err);
   }
@@ -1306,7 +1678,7 @@ function fitCameraToAvatar() {
   const dz = box.max.z - box.min.z;
   const size = Math.max(dx, dy, dz);
   const dist = Math.max(1.0, size * 2.2);
-  camera.position.set(0, 0, dist);
+  camera.position.set(0, controls.target.y, dist);
   camera.near = Math.max(0.01, dist / 100);
   camera.far = dist * 10;
   camera.updateProjectionMatrix();
@@ -1474,7 +1846,7 @@ function initMorphDebugPanel() {
     const type = typeSelect.value;
     const currentSelection = targetSelect.value;
     targetSelect.innerHTML = '';
-    
+
     const names = Array.from(morphTargetMap.keys())
       .filter(name => name.startsWith(type))
       .sort((a, b) => {
@@ -1482,7 +1854,7 @@ function initMorphDebugPanel() {
         const numB = parseInt(b.replace(/\D/g, '')) || 0;
         return numA - numB;
       });
-    
+
     if (names.length === 0) {
       const opt = document.createElement('option');
       opt.textContent = 'None found';
@@ -1502,7 +1874,7 @@ function initMorphDebugPanel() {
   }
 
   typeSelect.addEventListener('change', populateDropdown);
-  
+
   slider.addEventListener('input', (e) => {
     const val = parseFloat(e.target.value);
     valLabel.textContent = val.toFixed(2);
@@ -1512,16 +1884,16 @@ function initMorphDebugPanel() {
   applyBtn.addEventListener('click', () => {
     const name = targetSelect.value;
     if (!name || targetSelect.disabled) return;
-    
+
     const value = parseFloat(slider.value);
     const targets = morphTargetMap.get(name);
-    
+
     if (targets) {
       targets.forEach(t => {
         t.mesh.morphTargetInfluences[t.index] = value;
       });
       log(`[Debug] ${name} set to ${value}`);
-      
+
       // Feedback animation
       applyBtn.style.transform = 'scale(0.95)';
       setTimeout(() => applyBtn.style.transform = '', 100);
@@ -1535,14 +1907,14 @@ function initMorphDebugPanel() {
     slider.value = 0;
     valLabel.textContent = "0.00";
     valLabel.style.color = '#888';
-    
+
     const targets = morphTargetMap.get(name);
     if (targets) {
       targets.forEach(t => {
         t.mesh.morphTargetInfluences[t.index] = 0;
       });
       log(`[Debug] ${name} reset`);
-      
+
       // Feedback animation
       resetBtn.style.transform = 'scale(0.95)';
       setTimeout(() => resetBtn.style.transform = '', 100);
@@ -1554,11 +1926,11 @@ function initMorphDebugPanel() {
 }
 
 function applyAnimInit(msg) {
-  streamFps = msg.streamFps || streamFps;
+  updateStreamFpsState(msg.streamFps);
   if (Number.isFinite(msg.bufferSeconds)) {
     maxBufferSeconds = msg.bufferSeconds;
   }
-  streamFpsEl.textContent = `${streamFps}`;
+  streamFpsEl.textContent = hasReadyStreamFps() ? `${streamFps}` : "-";
   if (msg.blink) {
     if (Array.isArray(msg.blink.intervalSec)) {
       idleConfig.blink.intervalSec = msg.blink.intervalSec.map((v) => Number(v));
@@ -1586,6 +1958,8 @@ function applyAnimInit(msg) {
   }
   if (msg.mouth && Array.isArray(msg.mouth.morphs)) {
     debugMouthPreferredNames = msg.mouth.morphs.slice();
+  } else {
+    debugMouthPreferredNames = [];
   }
   morphNames = msg.morphs || [];
   smoothedMorphs = new Float32Array(morphNames.length);
@@ -1632,9 +2006,11 @@ function applyAnimInit(msg) {
   autoDetectBlinkMorphs();
   refreshIdleBlinkTargets();
   refreshDebugMorphTargets();
+  refreshSpeechMorphIndices();
+  resetLivePlaybackFilters();
 }
 
-function applyAnimFrame(frame) {
+function applyAnimFrame(frame, { advanceRootSmoothing = true } = {}) {
   if (!avatarLoaded || !boneOrder.length) return;
   const nb = boneOrder.length;
   const nm = morphNames.length;
@@ -1653,24 +2029,26 @@ function applyAnimFrame(frame) {
     offset += 4;
   }
   if (rootBone) {
-    tempVec.set(rootX, rootY, rootZ);
+    const rootOffset = stabilizeRootTranslation(rootX, rootY, rootZ, advanceRootSmoothing);
+    tempVec.copy(rootOffset);
     rootBone.position.copy(rootRestPos).add(tempVec);
   }
   // Offset already advanced inside the loop above.
   if (DEBUG) {
-    log("applyAnimFrame execute", { 
-      playCount, 
-      firstMorph: frame[3 + nb * 4], 
-      nmorphs: nm 
+    log("applyAnimFrame execute", {
+      playCount,
+      firstMorph: frame[3 + nb * 4],
+      nmorphs: nm
     });
   }
   let maxAbs = 0;
+  let mouthEnergy = 0;
+  let mouthCount = 0;
   if (!smoothedMorphs || smoothedMorphs.length !== nm) {
     smoothedMorphs = new Float32Array(nm);
   }
   for (let i = 0; i < nm; i++) {
-    const name = morphNames[i];
-    const targets = morphTargetMap.get(name);
+    const targets = morphTargetMap.get(morphNames[i]);
     let v = frame[offset + i];
     if (v > MORPH_CLAMP) v = MORPH_CLAMP;
     else if (v < -MORPH_CLAMP) v = -MORPH_CLAMP;
@@ -1680,12 +2058,18 @@ function applyAnimFrame(frame) {
     if (targets) {
       for (const t of targets) {
         const base = t.base ?? 0;
-        t.mesh.morphTargetInfluences[t.index] += smoothed;
+        t.mesh.morphTargetInfluences[t.index] = base + smoothed;
       }
     }
     const av = Math.abs(v);
     if (av > maxAbs) maxAbs = av;
+    if (mouthMorphIndexSet.has(i)) {
+      mouthEnergy += Math.abs(smoothed);
+      mouthCount += 1;
+    }
   }
+  const nextSpeechEnergy = mouthCount > 0 ? mouthEnergy / mouthCount : maxAbs;
+  speechEnergySmoothed = speechEnergySmoothed * 0.7 + nextSpeechEnergy * 0.3;
   lastAppliedAt = performance.now();
   const sample = {};
   for (const name of ["Exp000", "Exp010", "Exp020"]) {
@@ -1736,17 +2120,13 @@ function animate() {
   animationFrameId = requestAnimationFrame(animate);
 
   if (!debugManualMode) {
-    /* TEMPORARY DEBUG BLOCK: Start - Disabling idle breathing/sway */
-    /* 
-    // 1. Update idle state (breathing, etc.)
+    // Track idle state based on whether server is actively sending new frames.
+    // applyIdlePose is called INSIDE updatePlaybackFrameWorker so it can never
+    // override server stream data — it only applies after server data is written.
     updateIdleState();
-    if (idleActive) {
-      applyIdlePose(performance.now() / 1000);
-    }
-    */
-    /* TEMPORARY DEBUG BLOCK: End */
 
-    // 2. Apply streaming animation on top (authoritative)
+    // Server animation is authoritative — idle is applied only inside this
+    // function, after server frames have been written (or skipped).
     updatePlaybackFrameWorker();
   }
 
@@ -1766,27 +2146,43 @@ function startManualOverride(type, durationSec, payload) {
   refreshDebugMorphTargets();
 }
 
-window.testMorph = function(name, value) {
+window.testMorph = function (name, value) {
   const targets = morphTargetMap.get(name);
   if (!targets) {
-    console.error(`Morph target ${name} not found in map.`);
+    error(`Morph target ${name} not found in map.`);
     return;
   }
   targets.forEach(t => {
     t.mesh.morphTargetInfluences[t.index] = value;
-    console.log(`Applied manual morph: ${name} = ${value} on ${t.mesh.name}`);
+    log(`Applied manual morph: ${name} = ${value} on ${t.mesh.name}`);
   });
 };
 
 function initWorker() {
   if (!workerEnabled) return;
+  if (worker) {
+    try {
+      worker.terminate();
+    } catch {
+      // Ignore terminate errors.
+    }
+    worker = null;
+  }
   pipelineModeEl.textContent = "Worker";
+  streamFps = null;
+  streamFpsReady = false;
+  workerTiming = null;
+  currentPlayFps = 0;
+  resetLivePlaybackFilters();
   worker = new Worker(new URL("./anim_worker.js", import.meta.url), { type: "module" });
   startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
   const known = loadKnownSessionState();
   worker.onmessage = (event) => {
     const msg = event.data;
     if (msg.type === "init") {
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
+      workerReady = true;
       if (avatarLoaded) {
         applyAnimInit(msg);
       } else {
@@ -1798,27 +2194,41 @@ function initWorker() {
         if (DEBUG) warn("Dropping out-of-order frame", { incomingIndex, lastWorkerFrameIndexSeen });
         return;
       }
-      streamFps = msg.streamFps || streamFps;
-      streamFpsEl.textContent = `${streamFps}`;
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
+      streamFpsEl.textContent = hasReadyStreamFps() ? `${streamFps}` : "-";
+      updateWorkerTiming(msg.timing);
       workerQueueLen = msg.queueLen ?? workerQueueLen;
       workerSnapshotDropped = msg.snapshotDropCount ?? workerSnapshotDropped;
       workerLiveDropped = msg.liveDropCount ?? workerLiveDropped;
       workerResyncSkipped = msg.resyncSkipped ?? workerResyncSkipped;
       workerFrameIndex = msg.frameIndex ?? workerFrameIndex;
       workerFrame = new Float32Array(msg.buffer);
+      heldFrameData = workerFrame;
       frameDirty = true;
+      lagIdleBlend = 0;
+      lagIdleStarted = false;
       lastWorkerFrameIndexSeen = workerFrameIndex;
       lastWorkerFrameAt = performance.now();
       lastWorkerFrameBytes = msg.buffer ? msg.buffer.byteLength : null;
       if (msg.sessionId) workerSessionId = msg.sessionId;
+      clearMismatchIfAligned();
       if (msg.serverBootId) serverBootId = msg.serverBootId;
       if (msg.serverClockId) serverClockId = msg.serverClockId;
       if (Number.isFinite(msg.protocolVersion)) protocolVersion = msg.protocolVersion;
       persistKnownSessionState();
+      const wasResyncing = resyncing;
       resyncing = false;
       sessionMismatchWarned = false;
+      // If we just cleared resyncing, attempt to flush any audio queued during the resync window.
+      if (wasResyncing && audioEnabled && audioCtx && !audioStarted) {
+        tryStartPlayback();
+      }
     } else if (msg.type === "handshake") {
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
       if (msg.sessionId) workerSessionId = msg.sessionId;
+      clearMismatchIfAligned();
       if (msg.serverBootId) serverBootId = msg.serverBootId;
       if (msg.serverClockId) serverClockId = msg.serverClockId;
       if (Number.isFinite(msg.protocolVersion)) protocolVersion = msg.protocolVersion;
@@ -1837,21 +2247,31 @@ function initWorker() {
     } else if (msg.type === "snapshot_anchor") {
       startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
       resyncing = true;
+      resetLivePlaybackFilters();
     } else if (msg.type === "resync") {
       resyncing = true;
       startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+      resetLivePlaybackFilters();
       if (DEBUG) warn("Worker requested resync", msg);
     } else if (msg.type === "session_switch") {
       if (msg.sessionId) workerSessionId = msg.sessionId;
+      workerTiming = null;
+      heldFrameData = null;
+      lagIdleBlend = 0;
+      lagIdleStarted = false;
+      resetLivePlaybackFilters();
+      clearMismatchIfAligned();
       resyncing = false;
       sessionMismatchWarned = false;
       startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
       persistKnownSessionState();
     } else if (msg.type === "status") {
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
+      updateWorkerTiming(msg.timing);
       if (msg.status === "connected") {
         statusEl.textContent = "Connected";
         pipelineModeEl.textContent = "Worker";
-        workerReady = true;
         workerAlive = true;
         resyncing = false;
         if (workerFallbackTimer) {
@@ -1859,18 +2279,34 @@ function initWorker() {
           workerFallbackTimer = null;
         }
       } else if (msg.status === "reset_required") {
-        warn("Worker requested reset", msg);
+        warn("Worker requested reset - clearing stale session state", msg);
+        sessionStorage.removeItem("viewer_known_boot_id");
+        sessionStorage.removeItem("viewer_known_server_clock_id");
+        sessionStorage.removeItem("viewer_known_session_id");
+        sessionStorage.removeItem("viewer_last_applied_frame");
+        workerSessionId = null;
+        workerTiming = null;
         pipelineModeEl.textContent = "Resync";
         statusEl.textContent = "Resyncing";
         workerAlive = false;
         workerReady = false;
         resyncing = true;
         startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+        resetLivePlaybackFilters();
+        scheduleWorkerRestart("reset_required");
       } else if (msg.status === "error" || msg.status === "closed") {
+        if (workerRestartPending) {
+          pipelineModeEl.textContent = "Resync";
+          statusEl.textContent = "Reconnecting";
+          workerAlive = false;
+          workerReady = false;
+          return;
+        }
         warn("Worker status:", msg);
         pipelineModeEl.textContent = "Error";
         statusEl.textContent = "Disconnected";
         workerAlive = false;
+        workerTiming = null;
         if (audioCtx) {
           audioCtx.suspend();
         }
@@ -1881,7 +2317,9 @@ function initWorker() {
       workerSnapshotDropped = msg.snapshotDropCount ?? workerSnapshotDropped;
       workerLiveDropped = msg.liveDropCount ?? workerLiveDropped;
       workerResyncSkipped = msg.resyncSkipped ?? workerResyncSkipped;
-      streamFps = msg.streamFps || streamFps;
+      updateStreamFpsState(msg.streamFps);
+      streamFpsReady = Boolean(msg.streamFpsReady || hasReadyStreamFps());
+      updateWorkerTiming(msg.timing);
       workerMaxIndex = Number.isFinite(msg.maxIndex) ? msg.maxIndex : workerMaxIndex;
       workerMinIndex = Number.isFinite(msg.minIndexEstimate) ? msg.minIndexEstimate : workerMinIndex;
       if (msg.sessionId) workerSessionId = msg.sessionId;
@@ -1902,7 +2340,9 @@ function initWorker() {
             resyncSkipped: workerResyncSkipped,
             maxIndex: msg.maxIndex,
             minIndex: msg.minIndexEstimate,
-            streamFps,
+            streamFps: hasReadyStreamFps() ? streamFps : "-",
+            transportagems: workerTiming?.transportagems ?? "-",
+            infer_ms: workerTiming?.infer_ms ?? "-",
             state: msg.playbackState,
             sessionId: workerSessionId,
           },
@@ -1922,6 +2362,7 @@ function initWorker() {
     type: "init",
     host: WS_HOST,
     knownBootId: known.knownBootId,
+    knownServerClockId: known.knownServerClockId,
     knownSessionId: known.knownSessionId,
     lastAppliedFrame: known.knownLastAppliedFrame,
     buildId: BUILD_ID,
@@ -1934,77 +2375,208 @@ function initWorker() {
   }, 5000);
 }
 
-function connectAudioSocket() {
-  if (audioWs) return;
-  audioWs = new WebSocket(`ws://${WS_HOST}/ws/audio_out`);
-  audioWs.binaryType = "arraybuffer";
-  let audioHeader = null;
+function scheduleWorkerRestart(reason, delayMs = 120) {
+  if (!workerEnabled || !initialized) return;
+  if (workerRestartPending) return;
+  workerRestartPending = true;
+  if (workerRestartTimer) {
+    clearTimeout(workerRestartTimer);
+    workerRestartTimer = null;
+  }
+  workerRestartTimer = setTimeout(() => {
+    workerRestartTimer = null;
+    workerRestartPending = false;
+    if (!initialized) return;
+    if (DEBUG) {
+      warn("Restarting worker", { reason });
+    }
+    initWorker();
+  }, delayMs);
+}
 
-  audioWs.onopen = () => {
-    audioStatusEl.textContent = "connected";
-    log("Connected to /ws/audio_out");
-  };
-  audioWs.onclose = () => {
-    audioStatusEl.textContent = "disconnected";
-    warn("Audio WS disconnected");
-    audioWs = null;
-  };
-  audioWs.onerror = () => {
-    audioStatusEl.textContent = "error";
-    error("Audio WS error");
-  };
-  audioWs.onmessage = (event) => {
-    if (typeof event.data === "string") {
-      try {
-        audioHeader = JSON.parse(event.data);
-      } catch {
-        audioHeader = null;
-      }
-      if (audioHeader && audioHeader.type === "audio" && audioHeader.session_id) {
-        const nextAudioSessionId = audioHeader.session_id;
+function updateConversationHud() {
+  if (conversationStatusEl) {
+    conversationStatusEl.textContent = conversationConnected ? "connected" : "disconnected";
+  }
+  if (conversationStateEl) {
+    conversationStateEl.textContent = assistantLifecycleState;
+  }
+  if (conversationSessionEl) {
+    conversationSessionEl.textContent = conversationStreamSessionId || "-";
+  }
+}
+
+function sendConversationMessage(payload) {
+  if (conversationClient) conversationClient.send(payload);
+}
+
+function handleAssistantAudioChunk(chunkData, audioHeader) {
+  if (!audioCtx || !audioHeader) return;
+  const sr = audioHeader.sr || 16000;
+  const pcm = new Int16Array(chunkData);
+  const floats = new Float32Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) {
+    floats[i] = pcm[i] / 32768;
+  }
+  const buffer = audioCtx.createBuffer(1, floats.length, sr);
+  buffer.copyToChannel(floats, 0);
+  const duration = buffer.duration;
+  if (hasSessionMismatch()) {
+    if (!sessionMismatchWarned) {
+      sessionMismatchWarned = true;
+      warn("Session mismatch between anim/audio", { workerSessionId, audioSessionId });
+      beginSessionRecovery("anim_audio_mismatch");
+    }
+    queueAudioChunk(buffer, duration);
+    return;
+  }
+  if (resyncing) {
+    queueAudioChunk(buffer, duration);
+    return;
+  }
+  if (!audioStarted) {
+    queueAudioChunk(buffer, duration);
+  } else {
+    scheduleAudioBuffer(buffer, duration);
+  }
+}
+
+function connectConversationSocket() {
+  if (conversationClient) return;
+  conversationClient = new ConversationClient({
+    wsHost: WS_HOST,
+    buildId: BUILD_ID,
+    callbacks: {
+      onConnectionChange: (connected) => {
+        conversationConnected = connected;
+        updateConversationHud();
+      },
+      onLifecycleChange: (state) => {
+        if (state === "idle_from_thinking") {
+          assistantLifecycleState = "idle";
+        } else {
+          assistantLifecycleState = state;
+        }
+        updateConversationHud();
+      },
+      onStreamSessionChange: (sessionId) => {
+        if (sessionId && conversationStreamSessionId && sessionId !== conversationStreamSessionId) {
+          beginSessionRecovery("conversation_stream_switch");
+        }
+        conversationStreamSessionId = sessionId || conversationStreamSessionId;
+        updateConversationHud();
+      },
+      onError: (msg) => {
+        warn("Conversation error", msg);
+      },
+      onHelloAck: (meta) => {
+        conversationId = meta.conversationId || conversationId;
+        serverBootId = meta.serverBootId || serverBootId;
+        serverClockId = meta.serverClockId || serverClockId;
+        protocolVersion = meta.protocolVersion || protocolVersion;
+        updateConversationHud();
+        if (DEBUG) {
+          log("Conversation hello_ack", meta);
+        }
+      },
+      onAudioConnectionChange: (connected) => {
+        if (!audioStatusEl) return;
+        audioStatusEl.textContent = connected ? "connected" : "disconnected";
+      },
+      onAudioHeader: (audioHeader) => {
+        const nextAudioSessionId = audioHeader.stream_session_id || audioHeader.session_id || null;
+        if (nextAudioSessionId && conversationSessionEl) {
+          conversationSessionEl.textContent = nextAudioSessionId;
+        }
         if (audioSessionId && nextAudioSessionId !== audioSessionId) {
           beginSessionRecovery("audio_session_switch");
         }
-        audioSessionId = nextAudioSessionId;
+        if (nextAudioSessionId) audioSessionId = nextAudioSessionId;
+        clearMismatchIfAligned();
+      },
+      onAudioControl: (msg) => {
+        if (msg.action === "stop") {
+          beginSessionRecovery("audio_control_stop");
+        }
+      },
+      onAudioChunk: (chunkData, audioHeader) => {
+        handleAssistantAudioChunk(chunkData, audioHeader);
+      },
+    }
+  });
+  conversationClient.connectConversation();
+}
+
+async function ensureConversationConnected(timeoutMs = 4000) {
+  if (!conversationClient) connectConversationSocket();
+  await conversationClient.ensureConnected(timeoutMs);
+}
+
+async function startPushToTalk() {
+  if (pttActive || pttStarting) return;
+  pttStarting = true;
+  try {
+    if (!audioEnabled) await onEnableAudio();
+    await ensureConversationConnected();
+    await ensureMicCapture({
+      isPttActive: () => pttActive,
+      isConvConnected: () => conversationConnected,
+      sendMsg: sendConversationMessage,
+      getPttSeq: () => pttSeq++
+    });
+    if (!pttPressed) {
+      // Pointer was released while async setup was in-flight.
+      sendConversationMessage({ type: "ptt_end" });
+      return;
+    }
+    pttActive = true;
+    pttSeq = 0;
+    assistantLifecycleState = "listening";
+    updateConversationHud();
+    sendConversationMessage({ type: "ptt_start" });
+    if (!pttPressed) {
+      stopPushToTalk({ forceSend: true });
+      return;
+    }
+    if (pttButton) pttButton.classList.add("active");
+  } finally {
+    pttStarting = false;
+  }
+}
+
+function stopPushToTalk({ forceSend = false } = {}) {
+  if (!pttActive) {
+    if (forceSend && conversationConnected) {
+      sendConversationMessage({ type: "ptt_end" });
+      if (assistantLifecycleState === "listening") {
+        assistantLifecycleState = "thinking";
+        updateConversationHud();
       }
-      return;
     }
-    if (!audioHeader || !audioCtx) return;
-    if (audioHeader.type !== "audio") {
-      audioHeader = null;
-      return;
-    }
-    const sr = audioHeader.sr || 16000;
-    const pcm = new Int16Array(event.data);
-    const floats = new Float32Array(pcm.length);
-    for (let i = 0; i < pcm.length; i++) {
-      floats[i] = pcm[i] / 32768;
-    }
-    const buffer = audioCtx.createBuffer(1, floats.length, sr);
-    buffer.copyToChannel(floats, 0);
-    const duration = buffer.duration;
-    if (hasSessionMismatch()) {
-      if (!sessionMismatchWarned) {
-        sessionMismatchWarned = true;
-        warn("Session mismatch between anim/audio", { workerSessionId, audioSessionId });
-        beginSessionRecovery("anim_audio_mismatch");
-      }
-      queueAudioChunk(buffer, duration);
-      audioHeader = null;
-      return;
-    }
-    if (resyncing) {
-      queueAudioChunk(buffer, duration);
-      audioHeader = null;
-      return;
-    }
-    if (!audioStarted) {
-      queueAudioChunk(buffer, duration);
-    } else {
-      scheduleAudioBuffer(buffer, duration);
-    }
-    audioHeader = null;
-  };
+    if (pttButton) pttButton.classList.remove("active");
+    return;
+  }
+  pttActive = false;
+  sendConversationMessage({ type: "ptt_end" });
+  if (assistantLifecycleState === "listening") {
+    assistantLifecycleState = "thinking";
+    updateConversationHud();
+  }
+  if (pttButton) pttButton.classList.remove("active");
+}
+
+function onInterruptReply() {
+  sendConversationMessage({ type: "interrupt" });
+  beginSessionRecovery("manual_interrupt");
+}
+
+function onDisconnectMic() {
+  pttPressed = false;
+  stopPushToTalk({ forceSend: true });
+  sendConversationMessage({ type: "interrupt" });
+  teardownMicCapture();
+  assistantLifecycleState = "idle";
+  updateConversationHud();
 }
 
 function scheduleAudioBuffer(buffer, duration) {
@@ -2027,29 +2599,83 @@ function audioBufferedSeconds() {
   return Math.max(0, audioScheduledTime - audioCtx.currentTime);
 }
 
+function hasReadyStreamFps() {
+  return Number.isFinite(streamFps) && streamFps > 0;
+}
+
+function updateStreamFpsState(nextFps) {
+  if (Number.isFinite(nextFps) && nextFps > 0) {
+    streamFps = nextFps;
+    streamFpsReady = true;
+  }
+}
+
+function getDisplayFrameBudgetMs() {
+  return hasReadyStreamFps() ? 1000 / streamFps : 50;
+}
+
+function formatMetric(value, suffix = "", digits = 1) {
+  if (!Number.isFinite(value)) return "-";
+  return `${Number(value).toFixed(digits)}${suffix}`;
+}
+
+function updateWorkerTiming(timing) {
+  if (!timing || typeof timing !== "object") return;
+  const prevFlushReason = workerTiming?.flush_reason;
+  workerTiming = { ...(workerTiming || {}), ...timing };
+  if (timing.flush_reason === "idle_timeout" && prevFlushReason !== "idle_timeout") {
+    idleTailArmed = true;
+    idleTailStartMs = null;
+  } else if (timing.flush_reason === "batch_complete" && prevFlushReason !== "batch_complete") {
+    idleTailArmed = false;
+    idleTailStartMs = null;
+  }
+}
+
+function updateInferBudgetColor() {
+  if (!inferMsEl) return;
+  const inferMs = Number(workerTiming?.infer_ms);
+  if (!Number.isFinite(inferMs)) {
+    inferMsEl.style.color = "";
+    return;
+  }
+  const frameBudgetMs = getDisplayFrameBudgetMs();
+  if (inferMs <= 0.75 * frameBudgetMs) {
+    inferMsEl.style.color = "#4ade80";
+  } else if (inferMs <= frameBudgetMs) {
+    inferMsEl.style.color = "#facc15";
+  } else {
+    inferMsEl.style.color = "#f87171";
+  }
+}
+
 function meshBufferedSeconds() {
+  if (!hasReadyStreamFps()) return 0;
   return workerQueueLen / streamFps;
 }
 
 function loadKnownSessionState() {
   try {
     const knownBootId = sessionStorage.getItem("viewer_known_boot_id");
+    const knownServerClockId = sessionStorage.getItem("viewer_known_server_clock_id");
     const knownSessionId = sessionStorage.getItem("viewer_known_session_id");
     const rawFrame = sessionStorage.getItem("viewer_last_applied_frame");
     const knownLastAppliedFrame = rawFrame !== null ? Number(rawFrame) : -1;
     return {
       knownBootId: knownBootId || null,
+      knownServerClockId: knownServerClockId || null,
       knownSessionId: knownSessionId || null,
       knownLastAppliedFrame: Number.isFinite(knownLastAppliedFrame) ? knownLastAppliedFrame : -1,
     };
   } catch {
-    return { knownBootId: null, knownSessionId: null, knownLastAppliedFrame: -1 };
+    return { knownBootId: null, knownServerClockId: null, knownSessionId: null, knownLastAppliedFrame: -1 };
   }
 }
 
 function persistKnownSessionState() {
   try {
     if (serverBootId) sessionStorage.setItem("viewer_known_boot_id", serverBootId);
+    if (serverClockId) sessionStorage.setItem("viewer_known_server_clock_id", serverClockId);
     if (workerSessionId) sessionStorage.setItem("viewer_known_session_id", workerSessionId);
     if (Number.isFinite(lastWorkerFrameIndexSeen)) {
       sessionStorage.setItem("viewer_last_applied_frame", String(lastWorkerFrameIndexSeen));
@@ -2070,8 +2696,25 @@ function applyStallEase(progress) {
   }
 }
 
+
 function hasSessionMismatch() {
-  return !!(workerSessionId && audioSessionId && workerSessionId !== audioSessionId);
+  if (!workerSessionId || !audioSessionId) return false;
+  if (workerSessionId === audioSessionId) {
+    mismatchStartMs = null;
+    return false;
+  }
+  const now = performance.now();
+  if (mismatchStartMs === null) mismatchStartMs = now;
+  // Only treat as mismatch if it persists beyond grace.
+  return (now - mismatchStartMs) > SESSION_MISMATCH_GRACE_MS;
+}
+
+function clearMismatchIfAligned() {
+  if (!workerSessionId || !audioSessionId) return false;
+  if (workerSessionId !== audioSessionId) return false;
+  mismatchStartMs = null;
+  sessionMismatchWarned = false;
+  return true;
 }
 
 function queueAudioChunk(buffer, duration) {
@@ -2083,30 +2726,50 @@ function beginSessionRecovery(reason) {
   const now = performance.now();
   if (now - lastSessionResetAt < 250) return;
   lastSessionResetAt = now;
+  const hardReset =
+    reason === "clock_mismatch" ||
+    reason === "server_clock_mismatch" ||
+    reason === "reset_required";
+  mismatchStartMs = now;
   resyncing = true;
   startupSuppressUntilMs = now + STARTUP_SUPPRESS_MS;
   sessionMismatchWarned = false;
   animOffsetSec = 0;
   animOffsetSet = false;
-  audioStarted = false;
-  audioStartTime = null;
-  audioScheduledTime = audioCtx ? audioCtx.currentTime + AUDIO_JITTER_SEC : 0;
-  audioQueue = [];
-  audioQueuedSec = 0;
+  if (hardReset) {
+    audioStarted = false;
+    audioStartTime = null;
+    audioScheduledTime = audioCtx ? audioCtx.currentTime + AUDIO_JITTER_SEC : 0;
+    audioQueue = [];
+    audioQueuedSec = 0;
+    fallbackTickElapsedSec = 0;
+    fallbackTickLastMs = now;
+  }
   workerFrame = null;
+  heldFrameData = null;
   workerFrameIndex = -1;
   workerMaxIndex = -1;
   workerMinIndex = -1;
   workerQueueLen = 0;
+  workerTiming = null;
   frameDirty = false;
+  lagIdleBlend = 0;
+  lagIdleStarted = false;
   lastWorkerFrameIndexSeen = -1;
+  resetLivePlaybackFilters();
   if (worker) worker.postMessage({ type: "reset" });
   if (DEBUG) {
-    warn("Session recovery started", { reason, workerSessionId, audioSessionId });
+    warn("Session recovery started", {
+      reason,
+      hardReset,
+      workerSessionId,
+      audioSessionId,
+    });
   }
 }
 
 function computeAnimOffsetSec() {
+  if (!hasReadyStreamFps()) return 0;
   if (workerMinIndex >= 0) {
     return workerMinIndex / streamFps;
   }
@@ -2133,19 +2796,38 @@ function maybeSetAnimOffset() {
 }
 
 function computePlaybackFps(bufferSec) {
+  if (!hasReadyStreamFps()) return 0;
   const maxFps = streamFps;
   const minFps = Math.max(8, streamFps * 0.85);
   const t = Math.min(1, Math.max(0, (bufferSec - 0.5) / 3.5));
   return minFps + t * (maxFps - minFps);
 }
 
+function computeWorkerTickElapsed(nowMs, useMonotonicFallback = false) {
+  if (!useMonotonicFallback && audioStarted && audioCtx && audioStartTime !== null) {
+    maybeSetAnimOffset();
+    const synced = Math.max(0, audioCtx.currentTime - audioStartTime + animOffsetSec);
+    fallbackTickElapsedSec = Math.max(fallbackTickElapsedSec, synced);
+    fallbackTickLastMs = nowMs;
+    return synced;
+  }
+  if (!fallbackTickLastMs) {
+    fallbackTickLastMs = nowMs;
+  }
+  const dt = Math.max(0, Math.min(0.25, (nowMs - fallbackTickLastMs) / 1000));
+  fallbackTickElapsedSec += dt;
+  fallbackTickLastMs = nowMs;
+  return fallbackTickElapsedSec;
+}
+
 function tryStartPlayback() {
   if (audioStarted || !audioEnabled || !audioCtx) return;
+  if (!streamFpsReady || !workerReady) return;
   if (resyncing || hasSessionMismatch()) return;
   const meshBuf = Math.max(workerQueueLen / streamFps, (workerMaxIndex + 1) / streamFps);
   const audioBuf = audioQueuedSec;
-  if (meshBuf >= 0.6 && audioBuf >= AUDIO_START_BUFFER_SEC) {
-    audioStartTime = audioCtx.currentTime + 0.1;
+  if (meshBuf >= MESH_START_BUFFER_SEC && audioBuf >= AUDIO_START_BUFFER_SEC) {
+    audioStartTime = audioCtx.currentTime + AUDIO_START_LEAD_SEC;
     audioScheduledTime = audioStartTime;
     for (const item of audioQueue) {
       scheduleAudioBuffer(item.buffer, item.duration);
@@ -2180,60 +2862,111 @@ function updatePlaybackFrameWorker() {
     }
     return;
   }
+  if (!streamFpsReady) {
+    currentPlayFps = 0;
+    playStateEl.textContent = "awaiting_init";
+    return;
+  }
   if (manualPaused) {
     playStateEl.textContent = "paused";
     return;
   }
   if (resyncing || hasSessionMismatch()) {
     playStateEl.textContent = "resyncing";
-    return;
+    // return;
   }
   tryStartPlayback();
+  const audioBuf = audioBufferedSeconds();
+  const useMonotonicFallback = audioBuf < AUDIO_LOW_BUFFER_SEC;
+  const elapsed = computeWorkerTickElapsed(nowMs, useMonotonicFallback);
+  if (worker) {
+    worker.postMessage({ type: "tick", elapsed });
+  }
   if (!audioStarted || !audioCtx || audioStartTime === null) {
     playStateEl.textContent = "buffering";
     return;
   }
-  if (audioBufferedSeconds() < AUDIO_LOW_BUFFER_SEC) {
+  if (resyncing || hasSessionMismatch()) {
+    playStateEl.textContent = "resyncing";
+  } else if (audioBuf < AUDIO_LOW_BUFFER_SEC) {
     playStateEl.textContent = "holding";
-    return;
+  } else {
+    playStateEl.textContent = "playing";
   }
-  maybeSetAnimOffset();
-  const elapsed = audioCtx.currentTime - audioStartTime + animOffsetSec;
   if (elapsed < 0) {
     playStateEl.textContent = "buffering";
     return;
   }
-  if (worker) {
-    worker.postMessage({ type: "tick", elapsed });
-  }
 
-  // Apply streamed frame only when new data arrives.
+  // Keep rendering alive during lag by replaying last frame and blending idle additively.
   if (workerFrame && frameDirty) {
+    // ── LIVE STREAM PATH ── server is actively sending new frames.
+    // NO idle is ever applied here — server data is the only authority.
     resetAllMorphsToBase();
-    applyAnimFrame(workerFrame);
+    applyAnimFrame(workerFrame, { advanceRootSmoothing: true });
+    applySpeechBodyOverlay(nowSec, Math.min(1, speechEnergySmoothed / 0.35));
+    heldFrameData = workerFrame;
+    lagIdleBlend = 0;
+    lagIdleStarted = false;
     if (DEBUG && playCount % 30 === 0) {
       log("Applying audio-synced frame", { playCount, elapsed: elapsed.toFixed(3) });
     }
     frameDirty = false;
     playCount += 1;
-    playStateEl.textContent = "playing";
-    lastFrameUpdate = performance.now();
+    lastFrameUpdate = nowMs;
     stallSinceMs = null;
+  } else if (heldFrameData) {
+    // ── HELD FRAME PATH ── server stopped; showing last received frame.
+    // Apply held frame first, then blend idle on top as time passes.
+    resetAllMorphsToBase();
+    applyAnimFrame(heldFrameData, { advanceRootSmoothing: false });
+    const stalledForMs = Math.max(0, nowMs - lastFrameUpdate);
+    let speechOverlayScale = 1;
+    if (stalledForMs <= STALL_HOLD_MS) {
+      playStateEl.textContent = "stalled_hold";
+      lagIdleBlend = 0;
+      lagIdleStarted = false;
+    } else if (stalledForMs <= IDLE_START_MS) {
+      playStateEl.textContent = "stalled_hold";
+      lagIdleBlend = 0;
+      lagIdleStarted = false;
+    } else {
+      if (!lagIdleStarted) {
+        beginLagIdleOverlay(nowSec);
+        lagIdleStarted = true;
+      }
+      lagIdleBlend = Math.min(1, (stalledForMs - IDLE_START_MS) / STALL_IDLE_BLEND_MS);
+      // Additive idle on top of held server frame — does NOT override collar/shoulder
+      // that server last set; those will only be overridden when we reach the no-frame path.
+      applyIdlePoseAdditive(nowSec, lagIdleBlend);
+      playStateEl.textContent = "stalled_idle";
+    }
+    if (idleTailArmed) {
+      speechOverlayScale = applyUtteranceTail(nowMs);
+      playStateEl.textContent = "tail_decay";
+    }
+    applySpeechBodyOverlay(nowSec, Math.min(1, speechEnergySmoothed / 0.35), speechOverlayScale);
+    if (DEBUG && !frameDirty && playCount % 30 === 0) {
+      log("Audio holding - replaying last frame", {
+        elapsed: elapsed.toFixed(3),
+        stalledForMs: Math.round(stalledForMs),
+        lagIdleBlend: lagIdleBlend.toFixed(2),
+      });
+    }
   } else {
+    // ── NO FRAME PATH ── worker has no data yet.
+    // Full idle is safe here since there is no server frame to protect.
     if (stallSinceMs === null) stallSinceMs = nowMs;
     const stalledForMs = nowMs - stallSinceMs;
-    if (stalledForMs <= STALL_HOLD_MS) {
+    if (idleActive) {
+      applyIdlePose(nowSec);
+      playStateEl.textContent = "stalled_idle";
+    } else if (stalledForMs <= STALL_HOLD_MS) {
       playStateEl.textContent = "stalled_hold";
     } else {
       const easeT = Math.min(1, (stalledForMs - STALL_HOLD_MS) / STALL_EASE_MS);
       applyStallEase(easeT);
       playStateEl.textContent = "stalled_ease";
-    }
-    if (DEBUG && !frameDirty && playCount % 30 === 0) {
-      log("Audio holding - no new worker frame", {
-        elapsed: elapsed.toFixed(3),
-        stalledForMs: Math.round(stalledForMs),
-      });
     }
   }
 
@@ -2246,7 +2979,7 @@ function updatePlaybackFrameWorker() {
   }
   const bufferSec = meshBufferedSeconds();
   currentPlayFps = computePlaybackFps(bufferSec);
-  if (workerMaxIndex >= 0) {
+  if (streamFpsReady && workerMaxIndex >= 0) {
     const audioFrame = Math.floor(elapsed * streamFps);
     const drift = audioFrame - workerMaxIndex;
     const allowResync = bufferSec < 2.0;
@@ -2295,9 +3028,17 @@ function updateHud() {
   queueLenEl.textContent = `${workerQueueLen}`;
   const displayPlayFps = currentPlayFps;
   playFpsEl.textContent = `${Math.round(displayPlayFps)}`;
-  streamFpsEl.textContent = `${streamFps}`;
+  streamFpsEl.textContent = hasReadyStreamFps() ? `${streamFps}` : "-";
   audioBufferEl.textContent = `${audioBufferedSeconds().toFixed(1)}s`;
   bufferFillEl.style.width = `${Math.min(100, (bufferSec / maxBufferSeconds) * 100)}%`;
+  if (transportAgeEl) transportAgeEl.textContent = formatMetric(Number(workerTiming?.transportagems), "ms", 1);
+  if (inputWaitEl) inputWaitEl.textContent = formatMetric(Number(workerTiming?.inputqueuewait_ms), "ms", 1);
+  if (inferMsEl) inferMsEl.textContent = formatMetric(Number(workerTiming?.infer_ms), "ms", 1);
+  if (resampleMsEl) resampleMsEl.textContent = formatMetric(Number(workerTiming?.resample_ms), "ms", 1);
+  if (retargetMsEl) retargetMsEl.textContent = formatMetric(Number(workerTiming?.retarget_ms), "ms", 1);
+  if (outputWaitEl) outputWaitEl.textContent = formatMetric(Number(workerTiming?.outputqueuewait_ms), "ms", 1);
+  if (flushReasonEl) flushReasonEl.textContent = workerTiming?.flush_reason || "-";
+  updateInferBudgetColor();
   if (DEBUG) {
     const now = performance.now();
     if (now - lastDebugSummary > 1000) {
@@ -2309,9 +3050,16 @@ function updateHud() {
           pipeline: pipelineModeEl.textContent,
           bufferSec: bufferSec.toFixed(2),
           queueLen: workerQueueLen,
+          transportagems: workerTiming?.transportagems ?? "-",
           inFps: inFpsEl.textContent,
           outFps: outFpsEl.textContent,
-          streamFps,
+          streamFps: hasReadyStreamFps() ? streamFps : "-",
+          inputqueuewait_ms: workerTiming?.inputqueuewait_ms ?? "-",
+          infer_ms: workerTiming?.infer_ms ?? "-",
+          resample_ms: workerTiming?.resample_ms ?? "-",
+          retarget_ms: workerTiming?.retarget_ms ?? "-",
+          outputqueuewait_ms: workerTiming?.outputqueuewait_ms ?? "-",
+          flush_reason: workerTiming?.flush_reason ?? "-",
           audioBuf: audioBufferedSeconds().toFixed(2),
           audioStarted,
           workerReady,
@@ -2371,14 +3119,14 @@ function ensureTransformControls() {
       if (avatarRoot) {
         avatarRoot.position.copy(basePos).add(userOffset);
       }
-      controls.target.copy(userOffset);
+      syncControlsTargetToAvatarOffset();
     }
   });
   transformControls.addEventListener("objectChange", () => {
     if (!avatarRoot || !gizmoAnchor) return;
     userOffset.copy(gizmoAnchor.position);
     avatarRoot.position.copy(basePos).add(userOffset);
-    controls.target.copy(userOffset);
+    syncControlsTargetToAvatarOffset();
   });
 }
 
@@ -2458,7 +3206,12 @@ function onClearBuffer() {
   workerMinIndex = -1;
   workerFrameIndex = -1;
   workerFrame = null;
+  heldFrameData = null;
   frameDirty = false;
+  lagIdleBlend = 0;
+  lagIdleStarted = false;
+  fallbackTickElapsedSec = 0;
+  fallbackTickLastMs = performance.now();
   stallSinceMs = null;
   resyncing = false;
   sessionMismatchWarned = false;
@@ -2469,6 +3222,7 @@ function onClearBuffer() {
   if (avatarRoot) {
     avatarRoot.position.copy(basePos);
   }
+  syncControlsTargetToAvatarOffset();
   if (gizmoAnchor) {
     gizmoAnchor.position.copy(userOffset);
   }
@@ -2488,10 +3242,10 @@ function onResetCam() {
   if (avatarRoot) {
     avatarRoot.position.copy(basePos);
   }
+  syncControlsTargetToAvatarOffset();
   if (gizmoAnchor) {
     gizmoAnchor.position.copy(userOffset);
   }
-  controls.target.set(0, 1.0, 0);
   controls.update();
 }
 
@@ -2568,7 +3322,30 @@ async function onEnableAudio() {
   startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   await audioCtx.resume();
-  connectAudioSocket();
+  connectConversationSocket();
+  conversationClient.connectAudioOut();
+}
+
+function onConnectConversation() {
+  connectConversationSocket();
+  updateConversationHud();
+}
+
+function onPttPointerDown(event) {
+  event.preventDefault();
+  pttPressed = true;
+  startPushToTalk().catch((err) => {
+    warn("PTT start failed", err);
+    pttPressed = false;
+    pttActive = false;
+    if (pttButton) pttButton.classList.remove("active");
+  });
+}
+
+function onPttPointerUp(event) {
+  event.preventDefault();
+  pttPressed = false;
+  stopPushToTalk({ forceSend: true });
 }
 
 function onResize() {
@@ -2600,6 +3377,17 @@ function bindUi() {
   if (toggleAutoRotateEl) toggleAutoRotateEl.addEventListener("change", onToggleAutoRotate);
   if (toggleTranslateEl) toggleTranslateEl.addEventListener("change", onToggleTranslate);
   if (enableAudioBtn) enableAudioBtn.addEventListener("click", onEnableAudio);
+  if (connectConversationBtn) connectConversationBtn.addEventListener("click", onConnectConversation);
+  if (interruptReplyBtn) interruptReplyBtn.addEventListener("click", onInterruptReply);
+  if (disconnectMicButton) disconnectMicButton.addEventListener("click", onDisconnectMic);
+  if (pttButton) {
+    pttButton.addEventListener("mousedown", onPttPointerDown);
+    pttButton.addEventListener("mouseup", onPttPointerUp);
+    pttButton.addEventListener("mouseleave", onPttPointerUp);
+    pttButton.addEventListener("touchstart", onPttPointerDown, { passive: false });
+    pttButton.addEventListener("touchend", onPttPointerUp, { passive: false });
+    pttButton.addEventListener("touchcancel", onPttPointerUp, { passive: false });
+  }
   resizeHandler = onResize;
   window.addEventListener("resize", resizeHandler);
 }
@@ -2625,6 +3413,17 @@ function unbindUi() {
   if (toggleAutoRotateEl) toggleAutoRotateEl.removeEventListener("change", onToggleAutoRotate);
   if (toggleTranslateEl) toggleTranslateEl.removeEventListener("change", onToggleTranslate);
   if (enableAudioBtn) enableAudioBtn.removeEventListener("click", onEnableAudio);
+  if (connectConversationBtn) connectConversationBtn.removeEventListener("click", onConnectConversation);
+  if (interruptReplyBtn) interruptReplyBtn.removeEventListener("click", onInterruptReply);
+  if (disconnectMicButton) disconnectMicButton.removeEventListener("click", onDisconnectMic);
+  if (pttButton) {
+    pttButton.removeEventListener("mousedown", onPttPointerDown);
+    pttButton.removeEventListener("mouseup", onPttPointerUp);
+    pttButton.removeEventListener("mouseleave", onPttPointerUp);
+    pttButton.removeEventListener("touchstart", onPttPointerDown);
+    pttButton.removeEventListener("touchend", onPttPointerUp);
+    pttButton.removeEventListener("touchcancel", onPttPointerUp);
+  }
   if (resizeHandler) {
     window.removeEventListener("resize", resizeHandler);
     resizeHandler = null;
@@ -2642,9 +3441,19 @@ function collectDom() {
   pipelineModeEl = document.getElementById("pipelineMode");
   audioStatusEl = document.getElementById("audioStatus");
   audioBufferEl = document.getElementById("audioBuffer");
+  conversationStatusEl = document.getElementById("conversationStatus");
+  conversationStateEl = document.getElementById("conversationState");
+  conversationSessionEl = document.getElementById("conversationSession");
   playStateEl = document.getElementById("playState");
   lodLevelEl = document.getElementById("lodLevel");
   bufferFillEl = document.getElementById("bufferFill");
+  transportAgeEl = document.getElementById("transportAge");
+  inputWaitEl = document.getElementById("inputWait");
+  inferMsEl = document.getElementById("inferMs");
+  resampleMsEl = document.getElementById("resampleMs");
+  retargetMsEl = document.getElementById("retargetMs");
+  outputWaitEl = document.getElementById("outputWait");
+  flushReasonEl = document.getElementById("flushReason");
   fitViewBtn = document.getElementById("fitView");
   viewFaceBtn = document.getElementById("viewFace");
   viewFrontBtn = document.getElementById("viewFront");
@@ -2661,6 +3470,10 @@ function collectDom() {
   toggleAutoRotateEl = document.getElementById("toggleAutoRotate");
   toggleTranslateEl = document.getElementById("toggleTranslate");
   enableAudioBtn = document.getElementById("enableAudio");
+  connectConversationBtn = document.getElementById("connectConversation");
+  pttButton = document.getElementById("pttButton");
+  disconnectMicButton = document.getElementById("disconnectMic");
+  interruptReplyBtn = document.getElementById("interruptReply");
   togglePlayBtn = document.getElementById("togglePlay");
   clearBufferBtn = document.getElementById("clearBuffer");
   resetCamBtn = document.getElementById("resetCam");
@@ -2674,6 +3487,7 @@ export async function initViewer() {
   if (initialized) return;
   initialized = true;
   collectDom();
+  updateConversationHud();
   if (!canvas) {
     error("Canvas element not found (#canvas).");
     return;
@@ -2704,10 +3518,16 @@ export function destroyViewer() {
     worker.terminate();
     worker = null;
   }
-  if (audioWs) {
-    audioWs.close();
-    audioWs = null;
+  if (workerRestartTimer) {
+    clearTimeout(workerRestartTimer);
+    workerRestartTimer = null;
   }
+  workerRestartPending = false;
+  if (conversationClient) {
+    conversationClient.disconnect();
+    conversationClient = null;
+  }
+  teardownMicCapture();
   if (audioCtx) {
     audioCtx.close();
     audioCtx = null;

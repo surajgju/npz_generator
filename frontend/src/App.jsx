@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { destroyViewer, initViewer } from "./viewer/ViewerController.js";
+import { ConversationPanel } from "./ConversationPanel.jsx";
 
 function App() {
   const [view, setView] = useState("viewer");
@@ -7,31 +8,31 @@ function App() {
     () => [
       {
         label: "Install Dependencies",
-        cmd: "python3 -m pip install -r requirements.txt",
+        cmd: "./venv/bin/python -m pip install -r requirements.txt",
       },
       {
         label: "Generate Motion (Offline)",
-        cmd: "python3 generate_npz.py",
+        cmd: "./venv/bin/python generate_npz.py",
       },
       {
         label: "Streamlit Viewer",
-        cmd: "python3 -m streamlit run visualize_web.py",
+        cmd: "./venv/bin/python -m streamlit run visualize_web.py",
       },
       {
         label: "Render MP4",
-        cmd: "python3 render.py",
+        cmd: "./venv/bin/python render.py",
       },
       {
         label: "Start WebSocket Server",
-        cmd: "STREAM_FPS=15 python3 -m uvicorn server.app:app --reload --port 8000",
+        cmd: "./venv/bin/python -m uvicorn server.app:app --reload --port 8000",
       },
       {
         label: "Stream Audio (Simulator)",
-        cmd: "python3 scripts/stream_audio_to_ws.py --audio input/viseme.mp3 --chunk 0.5",
+        cmd: "./venv/bin/python scripts/stream_audio_to_ws.py --audio input/viseme.mp3 --chunk 0.5",
       },
       {
         label: "Export Faces (One-Time)",
-        cmd: "python3 scripts/export_faces.py",
+        cmd: "./venv/bin/python scripts/export_faces.py",
       },
     ],
     []
@@ -74,10 +75,15 @@ function App() {
         </div>
       </div>
 
+      {/* ── Existing HUD (stats, view controls) ── */}
       <div id="hud" className={view === "viewer" ? "" : "hidden"}>
         <div className="row">
           <span>Status</span>
           <span id="status">Connecting...</span>
+        </div>
+        <div className="row section-title">
+          <span>Pipeline</span>
+          <span></span>
         </div>
         <div className="row">
           <span>Buffer</span>
@@ -100,11 +106,11 @@ function App() {
         </div>
         <div className="row">
           <span>Play FPS</span>
-          <span id="playFps">30</span>
+          <span id="playFps">0</span>
         </div>
         <div className="row">
           <span>Stream FPS</span>
-          <span id="streamFps">20</span>
+          <span id="streamFps">-</span>
         </div>
         <div className="row">
           <span>Pipeline</span>
@@ -118,13 +124,55 @@ function App() {
           <span>Audio Buf</span>
           <span id="audioBuffer">0.0s</span>
         </div>
+
+        {/*
+          ── Ghost conversation status elements ──
+          ViewerController reads these by ID. We keep them in the DOM but
+          invisible — the ConversationPanel reads them via MutationObserver.
+        */}
+        <span id="conversationStatus" style={{ display: "none" }}>disconnected</span>
+        <span id="conversationState"  style={{ display: "none" }}>idle</span>
+        <span id="conversationSession" style={{ display: "none" }}>-</span>
+
         <div className="row">
           <span>Playback</span>
           <span id="playState">buffering</span>
         </div>
         <div className="row">
+          <span>Transport Age</span>
+          <span id="transportAge">-</span>
+        </div>
+        <div className="row">
           <span>LOD</span>
           <span id="lodLevel">LOD0</span>
+        </div>
+        <div className="row section-title">
+          <span>Backend</span>
+          <span></span>
+        </div>
+        <div className="row">
+          <span>Input Wait</span>
+          <span id="inputWait">-</span>
+        </div>
+        <div className="row">
+          <span>Infer</span>
+          <span id="inferMs">-</span>
+        </div>
+        <div className="row">
+          <span>Resample</span>
+          <span id="resampleMs">-</span>
+        </div>
+        <div className="row">
+          <span>Retarget</span>
+          <span id="retargetMs">-</span>
+        </div>
+        <div className="row">
+          <span>Output Wait</span>
+          <span id="outputWait">-</span>
+        </div>
+        <div className="row">
+          <span>Flush Reason</span>
+          <span id="flushReason">-</span>
         </div>
         <div className="row section-title">
           <span>Expressions</span>
@@ -202,12 +250,26 @@ function App() {
         </div>
         <div className="btns">
           <button id="enableAudio">Enable Audio</button>
+          {/*
+            ── Ghost conversation control buttons ──
+            These are visually hidden but remain in the DOM so ViewerController
+            can attach its click handlers. ConversationPanel.jsx calls .click()
+            on them programmatically.
+          */}
+          <button id="connectConversation" style={{ display: "none" }}>Connect Voice</button>
+          <button id="pttButton"           style={{ display: "none" }}>Push To Talk</button>
+          <button id="disconnectMic"       style={{ display: "none" }}>Disconnect Mic</button>
+          <button id="interruptReply"      style={{ display: "none" }}>Interrupt</button>
           <button id="togglePlay">Pause</button>
           <button id="clearBuffer">Clear Buffer</button>
           <button id="resetCam">Reset Cam</button>
         </div>
       </div>
+
       <canvas id="canvas" className={view === "viewer" ? "" : "hidden"}></canvas>
+
+      {/* ── Premium conversation panel overlay ── */}
+      {view === "viewer" && <ConversationPanel />}
 
       <div id="utilities" className={view === "utilities" ? "" : "hidden"}>
         <h2>Command Runner (Copy to Terminal)</h2>

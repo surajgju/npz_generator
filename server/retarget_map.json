@@ -225,6 +225,7 @@
     0.0,
     1.0
   ],
+  "zero_global_orient": true,
   "buffer_seconds": 3.0,
   "blink_morphs_left": [
     "Exp000"

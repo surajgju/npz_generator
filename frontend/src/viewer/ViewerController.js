@@ -346,6 +346,15 @@ function resetLivePlaybackFilters() {
   serverSilentSinceMs = null;
 }
 
+function syncControlsTargetToAvatarOffset() {
+  if (!controls) return;
+  controls.target.set(
+    userOffset.x,
+    userOffset.y + viewTargetOffsetY,
+    userOffset.z
+  );
+}
+
 function stabilizeRootTranslation(rootX, rootY, rootZ, advanceRootSmoothing) {
   if (!rootStabilizerReady) {
     stabilizedRootOffset.set(rootX, rootY, rootZ);
@@ -1396,6 +1405,7 @@ let lastBounds = null;
 let faceOffset = 0.0;
 let userOffset = new THREE.Vector3();
 let basePos = new THREE.Vector3();
+let viewTargetOffsetY = 1.0;
 let transformControls = null;
 let gizmoAnchor = null;
 let isDragging = false;
@@ -1620,9 +1630,12 @@ async function loadAvatar() {
     }
     const box = new THREE.Box3().setFromObject(avatarRoot);
     const center = box.getCenter(new THREE.Vector3());
-    basePos.copy(center).multiplyScalar(-1);
+    const height = Math.max(1e-6, box.max.y - box.min.y);
+    // Ground anchor: feet/base sits on Y=0 while keeping X/Z centered.
+    basePos.set(-center.x, -box.min.y, -center.z);
+    viewTargetOffsetY = height * 0.5;
     avatarRoot.position.copy(basePos).add(userOffset);
-    controls.target.copy(userOffset);
+    syncControlsTargetToAvatarOffset();
     lastBounds = { min: [box.min.x, box.min.y, box.min.z], max: [box.max.x, box.max.y, box.max.z] };
     lodLevelEl.textContent = "Rig";
     avatarLoaded = true;
@@ -1645,6 +1658,10 @@ async function loadAvatar() {
       morphs: morphTargetMap.size,
       morphMeshes: meshMorphCount,
       morphTargetsMax: meshMorphTargets,
+      anchor: {
+        basePos: [basePos.x, basePos.y, basePos.z],
+        targetOffsetY: viewTargetOffsetY,
+      },
     });
     exposeViewerDebug();
     if (ENABLE_MORPH_DEBUGGER) initMorphDebugPanel();
@@ -1661,7 +1678,7 @@ function fitCameraToAvatar() {
   const dz = box.max.z - box.min.z;
   const size = Math.max(dx, dy, dz);
   const dist = Math.max(1.0, size * 2.2);
-  camera.position.set(0, 0, dist);
+  camera.position.set(0, controls.target.y, dist);
   camera.near = Math.max(0.01, dist / 100);
   camera.far = dist * 10;
   camera.updateProjectionMatrix();
@@ -3102,14 +3119,14 @@ function ensureTransformControls() {
       if (avatarRoot) {
         avatarRoot.position.copy(basePos).add(userOffset);
       }
-      controls.target.copy(userOffset);
+      syncControlsTargetToAvatarOffset();
     }
   });
   transformControls.addEventListener("objectChange", () => {
     if (!avatarRoot || !gizmoAnchor) return;
     userOffset.copy(gizmoAnchor.position);
     avatarRoot.position.copy(basePos).add(userOffset);
-    controls.target.copy(userOffset);
+    syncControlsTargetToAvatarOffset();
   });
 }
 
@@ -3205,6 +3222,7 @@ function onClearBuffer() {
   if (avatarRoot) {
     avatarRoot.position.copy(basePos);
   }
+  syncControlsTargetToAvatarOffset();
   if (gizmoAnchor) {
     gizmoAnchor.position.copy(userOffset);
   }
@@ -3224,10 +3242,10 @@ function onResetCam() {
   if (avatarRoot) {
     avatarRoot.position.copy(basePos);
   }
+  syncControlsTargetToAvatarOffset();
   if (gizmoAnchor) {
     gizmoAnchor.position.copy(userOffset);
   }
-  controls.target.set(0, 1.0, 0);
   controls.update();
 }
 

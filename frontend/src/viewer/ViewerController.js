@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { ConversationClient } from "./ConversationClient.js";
 import { ensureMicCapture, teardownMicCapture } from "./AudioCapture.js";
@@ -1500,7 +1501,11 @@ const SPEECH_NECK_MAX_YAW = (0.8 * Math.PI) / 180;
 const SPEECH_SHOULDER_MAX_PITCH = (-1.0 * Math.PI) / 180;
 const SPEECH_BODY_SWAY_PERIOD_SEC = 2.4;
 
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath("/draco/gltf/");
+dracoLoader.preload();
 const gltfLoader = new GLTFLoader();
+gltfLoader.setDRACOLoader(dracoLoader);
 const tempQuat = new THREE.Quaternion();
 const tempQuat2 = new THREE.Quaternion();
 const tempEuler = new THREE.Euler();

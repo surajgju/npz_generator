@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { ConversationClient } from "./ConversationClient.js";
 import { ensureMicCapture, teardownMicCapture } from "./AudioCapture.js";
 
@@ -1501,6 +1502,7 @@ const SPEECH_SHOULDER_MAX_PITCH = (-1.0 * Math.PI) / 180;
 const SPEECH_BODY_SWAY_PERIOD_SEC = 2.4;
 
 const gltfLoader = new GLTFLoader();
+gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 const tempQuat = new THREE.Quaternion();
 const tempQuat2 = new THREE.Quaternion();
 const tempEuler = new THREE.Euler();
@@ -1578,7 +1580,11 @@ function buildMorphTargetMap(meshes) {
 async function loadAvatar() {
   idleRestQuatsCached = false;
   try {
-    const gltf = await gltfLoader.loadAsync("./assets/head.glb");
+    const gltf = await gltfLoader.loadAsync("./assets/head.glb", (xhr) => {
+      if (xhr.loaded === xhr.total) {
+        console.log(`head.glb file size: ${xhr.total} bytes`);
+      }
+    });
     avatarRoot = gltf.scene;
     scene.add(avatarRoot);
     skinnedMeshes = [];

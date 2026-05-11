@@ -39,6 +39,29 @@ CONVERSATION_PTT_GUARD_SEC: float = float(
 
 
 # ---------------------------------------------------------------------------
+# RAG Tool Definition
+# ---------------------------------------------------------------------------
+
+RAG_TOOL_DEFINITION = {
+    "function_declarations": [
+        {
+            "name": "query_knowledge_base",
+            "description": "Search the internal knowledge base for facts, policies, and documentation to answer user questions accurately.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": {
+                        "type": "STRING",
+                        "description": "The specific topic or question to search for."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    ]
+}
+
+# ---------------------------------------------------------------------------
 # ConversationRuntime
 # ---------------------------------------------------------------------------
 
@@ -109,6 +132,15 @@ class ConversationRuntime:
             await self.handle_ptt_end()
         except asyncio.CancelledError:
             return
+
+    async def handle_tool_call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Executes tool calls requested by Gemini."""
+        if name == "query_knowledge_base":
+            query = args.get("query", "")
+            logger.info("RAG Tool triggered: sid=%s query='%s'", self.servingid, query)
+            context = await get_rag_context(self.servingid, query)
+            return {"result": context if context else "No specific information found in the knowledge base."}
+        return {"error": f"Unknown tool: {name}"}
 
     async def handle_ptt_start(self) -> None:
         if self._reply_task and not self._reply_task.done():
@@ -219,14 +251,15 @@ class ConversationRuntime:
             rag_context = await get_rag_context(self.servingid, "general info")
             
             final_prompt = base_prompt
-            if rag_context:
-                final_prompt += f"\n\nContext for this conversation:\n{rag_context}"
+            # We don't prepend RAG context anymore, we let Gemini call the tool!
 
             async for raw_chunk, chunk_sr in self.adk.stream_audio_events(
                 conversation_id=self.conversation_id,
                 input_pcm_bytes=pcm_bytes,
                 input_sr=input_sr,
-                system_instruction=final_prompt
+                system_instruction=final_prompt,
+                tools=[RAG_TOOL_DEFINITION],
+                tool_handler=self.handle_tool_call
             ):
                 audio_i16 = np.frombuffer(raw_chunk, dtype=np.int16)
                 if audio_i16.size == 0:

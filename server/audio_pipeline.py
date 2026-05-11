@@ -438,6 +438,27 @@ class GeminiLiveAudioEngine:
                                         if isinstance(data, (bytes, bytearray)) and data:
                                             yield bytes(data), self._parse_pcm_rate(mime)
 
+                            # ── Handle tool calls ──
+                            tool_call = getattr(response, "tool_call", None)
+                            if tool_call is not None:
+                                logger.info("Gemini Live tool call model=%s conversation=%s", model_name, conversation_id)
+                                if tool_handler:
+                                    for call in getattr(tool_call, "function_calls", []):
+                                        # Execute the tool
+                                        res_data = await tool_handler(call.name, call.args)
+                                        # Send response back to Gemini
+                                        await session.send_tool_response(
+                                            _genai_types.LiveClientToolResponse(
+                                                function_responses=[
+                                                    _genai_types.LiveClientFunctionResponse(
+                                                        name=call.name,
+                                                        id=call.id,
+                                                        response=res_data
+                                                    )
+                                                ]
+                                            )
+                                        )
+
                             if self._is_turn_complete_response(response):
                                 logger.debug(
                                     "Gemini Live turn complete model=%s conversation=%s",

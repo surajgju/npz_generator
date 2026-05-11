@@ -3298,15 +3298,30 @@ function onToggleTranslate() {
 }
 
 async function onEnableAudio() {
-  if (audioEnabled) return;
-  audioEnabled = true;
-  if (audioStatusEl) audioStatusEl.textContent = "enabled";
-  silentStartTime = null;
-  startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  await audioCtx.resume();
-  connectConversationSocket();
-  conversationClient.connectAudioOut();
+  if (audioEnabled && audioCtx?.state === "running") return;
+  
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  
+  try {
+    await audioCtx.resume();
+  } catch (e) {
+    warn("Failed to resume audio context", e);
+  }
+
+  if (audioCtx.state === "running") {
+    audioEnabled = true;
+    if (audioStatusEl) audioStatusEl.textContent = "enabled";
+    silentStartTime = null;
+    startupSuppressUntilMs = performance.now() + STARTUP_SUPPRESS_MS;
+    connectConversationSocket();
+    conversationClient.connectAudioOut();
+  }
+}
+
+export function isAudioReady() {
+  return audioEnabled && audioCtx?.state === "running";
 }
 
 function onConnectConversation() {
@@ -3373,6 +3388,14 @@ function bindUi() {
   }
   resizeHandler = onResize;
   window.addEventListener("resize", resizeHandler);
+
+  // Automatically enable audio on the first user interaction (browser requirement)
+  window.addEventListener("click", () => {
+    onEnableAudio().catch(err => warn("Auto-enable audio failed", err));
+  }, { once: true });
+  window.addEventListener("keydown", () => {
+    onEnableAudio().catch(err => warn("Auto-enable audio failed", err));
+  }, { once: true });
 }
 
 function unbindUi() {
@@ -3487,6 +3510,9 @@ export async function initViewer() {
   running = true;
   animate();
   updateHud();
+
+  // Attempt auto-enable (may be blocked by browser)
+  onEnableAudio().catch(() => {});
 }
 
 export function destroyViewer() {

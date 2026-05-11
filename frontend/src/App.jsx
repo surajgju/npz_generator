@@ -1,9 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
-import { destroyViewer, initViewer } from "./viewer/ViewerController.js";
+import { destroyViewer, initViewer, isAudioReady } from "./viewer/ViewerController.js";
 import { ConversationPanel } from "./ConversationPanel.jsx";
+
+function MicIcon({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+    </svg>
+  );
+}
 
 function App() {
   const [view, setView] = useState("viewer");
+  const [showPermissionModal, setShowPermissionModal] = useState(false);
   const commands = useMemo(
     () => [
       {
@@ -40,9 +49,17 @@ function App() {
 
   useEffect(() => {
     if (view === "viewer") {
-      initViewer();
+      initViewer().then(() => {
+        // Short delay to allow onEnableAudio to complete if it can
+        setTimeout(() => {
+          if (!isAudioReady()) {
+            setShowPermissionModal(true);
+          }
+        }, 500);
+      });
       return () => {
         destroyViewer();
+        setShowPermissionModal(false);
       };
     }
     destroyViewer();
@@ -56,8 +73,31 @@ function App() {
     }
   };
 
+  const startExperience = () => {
+    setShowPermissionModal(false);
+    // Trigger the global click handler in ViewerController to enable audio
+    document.getElementById("enableAudio")?.click();
+  };
+
   return (
     <div id="app">
+      {showPermissionModal && view === "viewer" && (
+        <div className="cv-modal-overlay">
+          <div className="cv-modal">
+            <div className="cv-modal-header">
+              <MicIcon size={24} />
+              <h3>Audio Permission</h3>
+            </div>
+            <p>
+              This experience uses high-fidelity spatial audio and voice 
+              interaction. Please allow audio and microphone access to proceed.
+            </p>
+            <button className="cv-modal-btn" onClick={startExperience}>
+              Enable Audio & Mic
+            </button>
+          </div>
+        </div>
+      )}
       <div id="topbar">
         <div className="tabs">
           <button

@@ -151,7 +151,7 @@ class GeminiLiveAudioEngine:
         return genai.Client(api_key=api_key)
 
     @staticmethod
-    def _build_live_config(system_instruction: str, *, enable_speech: bool = True):
+    def _build_live_config(system_instruction: str, *, enable_speech: bool = True, tools: Optional[List[Any]] = None):
         types = _genai_types
         if types is None:
             raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
@@ -176,6 +176,8 @@ class GeminiLiveAudioEngine:
             kwargs["system_instruction"] = system_instruction
         if speech_cfg is not None:
             kwargs["speech_config"] = speech_cfg
+        if tools:
+            kwargs["tools"] = tools
 
         return types.LiveConnectConfig(**kwargs)
 
@@ -292,6 +294,9 @@ class GeminiLiveAudioEngine:
         conversation_id: str,
         input_pcm_bytes: bytes,
         input_sr: int,
+        system_instruction: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
+        tool_handler: Optional[Any] = None,
     ):
         """Connect to Gemini Live, stream audio via send_realtime_input, yield (pcm_bytes, sample_rate) tuples.
 
@@ -300,11 +305,12 @@ class GeminiLiveAudioEngine:
         Falls back to send_client_content for older/limited session objects.
         """
         client = self._make_genai_client()
+        instr = system_instruction or self.system_instruction
         live_config_with_speech = self._build_live_config(
-            self.system_instruction, enable_speech=True
+            instr, enable_speech=True, tools=tools
         )
         live_config_without_speech = self._build_live_config(
-            self.system_instruction, enable_speech=False
+            instr, enable_speech=False, tools=tools
         )
         live_config_variants = [("speech:on", live_config_with_speech)]
         if (

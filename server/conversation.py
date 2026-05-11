@@ -17,6 +17,7 @@ from fastapi import WebSocket
 
 from .audio_pipeline import GeminiLiveAudioEngine, ingest_audio_chunk
 from .session import sessions, sessions_lock
+from .tenant_service import resolve_tenant_config, get_rag_context
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +54,11 @@ class ConversationRuntime:
         server_time_fn,
         conversation_protocol_version: int,
         create_audio_session_fn,
+        servingid: str = "dev"
     ) -> None:
         self.websocket = websocket
         self.conversation_id = conversation_id
+        self.servingid = servingid
         self._server_boot_id = server_boot_id
         self._server_clock_id = server_clock_id
         self._server_time_fn = server_time_fn
@@ -204,10 +207,26 @@ class ConversationRuntime:
             await self._send({"type": "assistant_thinking_start"})
             reply_id = str(uuid.uuid4())
 
+            # Resolve tenant-scoped prompt and RAG context
+            tenant_config = resolve_tenant_config(self.servingid)
+            base_prompt = tenant_config.get("system_prompt") if tenant_config else "You are a concise helpful voice assistant."
+            
+            # Simple RAG: query is the last PTT (could be expanded with STT later)
+            # For now, we use a generic query or could just use the base prompt.
+            # Ideally we'd have the STT of what the user just said.
+            # But the Live API handles STT internally.
+            # As a workaround, we can provide general context or skip RAG if no query.
+            rag_context = await get_rag_context(self.servingid, "general info")
+            
+            final_prompt = base_prompt
+            if rag_context:
+                final_prompt += f"\n\nContext for this conversation:\n{rag_context}"
+
             async for raw_chunk, chunk_sr in self.adk.stream_audio_events(
                 conversation_id=self.conversation_id,
                 input_pcm_bytes=pcm_bytes,
                 input_sr=input_sr,
+                system_instruction=final_prompt
             ):
                 audio_i16 = np.frombuffer(raw_chunk, dtype=np.int16)
                 if audio_i16.size == 0:

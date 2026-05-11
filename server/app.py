@@ -358,6 +358,8 @@ async def ws_audio_out(websocket: WebSocket):
 
 @app.websocket("/ws/conversation")
 async def ws_conversation(websocket: WebSocket):
+    # Extract sid from query params (e.g., /ws/conversation?sid=dev)
+    servingid = websocket.query_params.get("sid", "dev")
     await websocket.accept()
     conversation_id = str(uuid.uuid4())
     runtime = ConversationRuntime(
@@ -368,8 +370,9 @@ async def ws_conversation(websocket: WebSocket):
         server_time_fn=_server_time_ms,
         conversation_protocol_version=CONVERSATION_PROTOCOL_VERSION,
         create_audio_session_fn=_create_audio_session,
+        servingid=servingid
     )
-    logger.info("Conversation WS connected: %s conversation=%s", websocket.client, conversation_id)
+    logger.info("Conversation WS connected: %s conversation=%s sid=%s", websocket.client, conversation_id, servingid)
     # await runtime.send_hello_ack() # Removed redundant call: loop handles "hello" message.
     try:
         while True:

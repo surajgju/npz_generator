@@ -151,7 +151,7 @@ class GeminiLiveAudioEngine:
         return genai.Client(api_key=api_key)
 
     @staticmethod
-    def _build_live_config(system_instruction: str, *, enable_speech: bool = True, tools: Optional[List[Any]] = None):
+    def _build_live_config(system_instruction: str, *, enable_speech: bool = True):
         types = _genai_types
         if types is None:
             raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
@@ -176,8 +176,6 @@ class GeminiLiveAudioEngine:
             kwargs["system_instruction"] = system_instruction
         if speech_cfg is not None:
             kwargs["speech_config"] = speech_cfg
-        if tools:
-            kwargs["tools"] = tools
 
         return types.LiveConnectConfig(**kwargs)
 
@@ -295,8 +293,6 @@ class GeminiLiveAudioEngine:
         input_pcm_bytes: bytes,
         input_sr: int,
         system_instruction: Optional[str] = None,
-        tools: Optional[List[Any]] = None,
-        tool_handler: Optional[Any] = None,
     ):
         """Connect to Gemini Live, stream audio via send_realtime_input, yield (pcm_bytes, sample_rate) tuples.
 
@@ -307,10 +303,10 @@ class GeminiLiveAudioEngine:
         client = self._make_genai_client()
         instr = system_instruction or self.system_instruction
         live_config_with_speech = self._build_live_config(
-            instr, enable_speech=True, tools=tools
+            instr, enable_speech=True
         )
         live_config_without_speech = self._build_live_config(
-            instr, enable_speech=False, tools=tools
+            instr, enable_speech=False
         )
         live_config_variants = [("speech:on", live_config_with_speech)]
         if (
@@ -437,27 +433,6 @@ class GeminiLiveAudioEngine:
                                         data = getattr(inline_data, "data", None)
                                         if isinstance(data, (bytes, bytearray)) and data:
                                             yield bytes(data), self._parse_pcm_rate(mime)
-
-                            # ── Handle tool calls ──
-                            tool_call = getattr(response, "tool_call", None)
-                            if tool_call is not None:
-                                logger.info("Gemini Live tool call model=%s conversation=%s", model_name, conversation_id)
-                                if tool_handler:
-                                    for call in getattr(tool_call, "function_calls", []):
-                                        # Execute the tool
-                                        res_data = await tool_handler(call.name, call.args)
-                                        # Send response back to Gemini
-                                        await session.send_tool_response(
-                                            _genai_types.LiveClientToolResponse(
-                                                function_responses=[
-                                                    _genai_types.LiveClientFunctionResponse(
-                                                        name=call.name,
-                                                        id=call.id,
-                                                        response=res_data
-                                                    )
-                                                ]
-                                            )
-                                        )
 
                             if self._is_turn_complete_response(response):
                                 logger.debug(

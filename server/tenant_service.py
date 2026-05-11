@@ -3,10 +3,6 @@ import logging
 import numpy as np
 from typing import Optional, List
 from sqlalchemy import create_engine, select
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
 from sqlalchemy.orm import sessionmaker
 from admin_server.db_models import ServingConfig, KnowledgeChunk
 from google.genai import Client

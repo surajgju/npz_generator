@@ -1,13 +1,8 @@
 import os
 import uuid
-import asyncio
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from sqlalchemy import create_engine
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from .db_models import Base, Tenant, Site, ServingConfig, CrawlJob, KnowledgeSource

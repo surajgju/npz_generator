@@ -151,7 +151,7 @@ class GeminiLiveAudioEngine:
         return genai.Client(api_key=api_key)
 
     @staticmethod
-    def _build_live_config(system_instruction: str, *, enable_speech: bool = True):
+    def _build_live_config(system_instruction: str, *, tools: List[Any] = None, enable_speech: bool = True):
         types = _genai_types
         if types is None:
             raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
@@ -174,6 +174,8 @@ class GeminiLiveAudioEngine:
         kwargs = dict(response_modalities=["AUDIO"])
         if system_instruction:
             kwargs["system_instruction"] = system_instruction
+        if tools:
+            kwargs["tools"] = tools
         if speech_cfg is not None:
             kwargs["speech_config"] = speech_cfg
 
@@ -293,6 +295,8 @@ class GeminiLiveAudioEngine:
         input_pcm_bytes: bytes,
         input_sr: int,
         system_instruction: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
+        servingid: str = "dev",
     ):
         """Connect to Gemini Live, stream audio via send_realtime_input, yield (pcm_bytes, sample_rate) tuples.
 
@@ -303,10 +307,10 @@ class GeminiLiveAudioEngine:
         client = self._make_genai_client()
         instr = system_instruction or self.system_instruction
         live_config_with_speech = self._build_live_config(
-            instr, enable_speech=True
+            instr, tools=tools, enable_speech=True
         )
         live_config_without_speech = self._build_live_config(
-            instr, enable_speech=False
+            instr, tools=tools, enable_speech=False
         )
         live_config_variants = [("speech:on", live_config_with_speech)]
         if (
@@ -409,6 +413,27 @@ class GeminiLiveAudioEngine:
                                     timeout,
                                 )
                                 break
+
+                            # ── Handle Tool Calls ──
+                            tool_call = getattr(response, "tool_call", None)
+                            if tool_call is not None:
+                                from .tenant_service import search_knowledge_base
+                                for call in getattr(tool_call, "function_calls", []):
+                                    if call.name == "search_knowledge_base":
+                                        args = call.args or {}
+                                        res = await search_knowledge_base(servingid, args.get("query", ""))
+                                        await session.send_tool_response(
+                                            _genai_types.LiveClientToolResponse(
+                                                function_responses=[
+                                                    _genai_types.LiveClientFunctionResponse(
+                                                        name=call.name,
+                                                        id=call.id,
+                                                        response=res
+                                                    )
+                                                ]
+                                            )
+                                        )
+                                continue
 
                             # ── Handle interrupted flag (mirrors useLiveAPI reference) ──
                             server_content = getattr(response, "server_content", None)

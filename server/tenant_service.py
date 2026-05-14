@@ -69,3 +69,33 @@ async def get_rag_context(servingid: str, query: str, top_k: int = 3):
         return "\n---\n".join(top_chunks)
     finally:
         db.close()
+
+# --- Tool Definitions ---
+
+async def search_knowledge_base(servingid: str, query: str):
+    """Searches the client's knowledge base for relevant information."""
+    context = await get_rag_context(servingid, query)
+    return {"results": context if context else "No relevant information found."}
+
+def get_tenant_tools():
+    """Returns the tool definitions for Gemini."""
+    return [
+        {
+            "function_declarations": [
+                {
+                    "name": "search_knowledge_base",
+                    "description": "Searches the client's knowledge base for relevant information about the website, services, or documentation.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "query": {
+                                "type": "STRING",
+                                "description": "The search query to look up in the knowledge base."
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            ]
+        }
+    ]

@@ -17,7 +17,7 @@ from fastapi import WebSocket
 
 from .audio_pipeline import GeminiLiveAudioEngine, ingest_audio_chunk
 from .session import sessions, sessions_lock
-from .tenant_service import resolve_tenant_config, get_rag_context
+from .tenant_service import resolve_tenant_config, get_rag_context, get_tenant_tools
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +226,9 @@ class ConversationRuntime:
                 conversation_id=self.conversation_id,
                 input_pcm_bytes=pcm_bytes,
                 input_sr=input_sr,
-                system_instruction=final_prompt
+                system_instruction=final_prompt,
+                tools=get_tenant_tools(),
+                servingid=self.servingid
             ):
                 audio_i16 = np.frombuffer(raw_chunk, dtype=np.int16)
                 if audio_i16.size == 0:

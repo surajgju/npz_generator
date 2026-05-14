@@ -36,6 +36,10 @@ function App() {
         cmd: "./venv/bin/python -m uvicorn server.app:app --reload --port 8000",
       },
       {
+        label: "Start Admin Server",
+        cmd: "./venv/bin/python -m uvicorn admin_server.main:app --reload --port 8001",
+      },
+      {
         label: "Stream Audio (Simulator)",
         cmd: "./venv/bin/python scripts/stream_audio_to_ws.py --audio input/viseme.mp3 --chunk 0.5",
       },

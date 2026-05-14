@@ -168,6 +168,26 @@ flowchart TD
 | `emage_utils/` | Core EMAGE model implementation and VQ-VAE utils. |
 | `scripts/` | Export utilities and audio streaming simulators. |
 | `models/` | SMPL-X and EMAGE model weight storage path. |
+| `admin_server/` | **Admin & RAG Backend**: Multi-tenant config, web crawling, and RAG pipeline. |
+
+---
+
+## 🛠️ Command Runner (Quick Reference)
+
+Use these commands to manage the various components of the pipeline. Most commands assume you are using the provided virtual environment (`./venv`).
+
+| Action | Command |
+| :--- | :--- |
+| **Install Dependencies** | `./venv/bin/python -m pip install -r requirements.txt` |
+| **Start WebSocket Server** | `./venv/bin/python -m uvicorn server.app:app --reload --port 8000` |
+| **Start Admin & RAG Server** | `./venv/bin/python -m uvicorn admin_server.main:app --reload --port 8001` |
+| **Generate Motion (Offline)** | `./venv/bin/python generate_npz.py` |
+| **Streamlit Viewer** | `./venv/bin/python -m streamlit run visualize_web.py` |
+| **Render MP4** | `./venv/bin/python render.py` |
+| **Stream Audio (Simulator)** | `./venv/bin/python scripts/stream_audio_to_ws.py --audio input/viseme.mp3 --chunk 0.5` |
+| **Export Faces (One-Time)** | `./venv/bin/python scripts/export_faces.py` |
+
+---
 
 ---
 

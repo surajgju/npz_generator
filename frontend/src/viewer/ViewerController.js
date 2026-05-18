@@ -1466,7 +1466,7 @@ let workerMaxIndex = -1;
 let workerMinIndex = -1;
 let driftStart = null;
 const DRIFT_THRESHOLD_FRAMES = 20;
-const RESYNC_GRACE_MS = 1500;
+const RESYNC_GRACE_MS = 3000;
 let pendingInit = null;
 let loggedFirstFrame = false;
 let smoothedMorphs = null;
@@ -2967,7 +2967,9 @@ function updatePlaybackFrameWorker() {
     const audioFrame = Math.floor(elapsed * streamFps);
     const drift = audioFrame - workerMaxIndex;
     const allowResync = bufferSec < 2.0;
-    if (allowResync && drift > DRIFT_THRESHOLD_FRAMES) {
+    // Don't count drift if audio hasn't fully started — offset may not be calibrated yet.
+    const audioLive = audioStarted && audioStartTime !== null;
+    if (allowResync && audioLive && drift > DRIFT_THRESHOLD_FRAMES) {
       if (driftStart === null) {
         driftStart = performance.now();
       } else if (performance.now() - driftStart > RESYNC_GRACE_MS) {

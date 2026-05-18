@@ -667,6 +667,7 @@ function connectAnim() {
         return;
       }
       if (msg.type === "anim_subscribe_ack") {
+        const prevBootId = serverBootId;
         serverBootId = msg.server_boot_id || serverBootId;
         serverClockId = msg.server_clock_id || serverClockId;
         if (knownServerClockId && serverClockId && knownServerClockId !== serverClockId) {
@@ -687,6 +688,13 @@ function connectAnim() {
         switchSession(ackSessionId, modeFromAck, "subscribe_ack");
         currentSessionId = ackSessionId;
         updateStreamFps(msg.stream_fps);
+        // If the server restarted (new boot_id), reset the clock offset so the
+        // first sample from the new server establishes a clean baseline rather
+        // than triggering cascading large-drift snaps from the stale offset.
+        if (prevBootId && msg.server_boot_id && msg.server_boot_id !== prevBootId) {
+          hasServerOffset = false;
+          console.warn("[Worker] Server restart detected (new boot_id), resetting clock sync.");
+        }
         observeServerTime(msg.server_time_ms);
         if (msg.mode === "reset_required") {
           postMessage({

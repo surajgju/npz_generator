@@ -1,22 +1,29 @@
 let ws = null;
 let wsHost = null;
-let streamFps = 20;
+let streamFps = null;
+let streamFpsReady = false;
 let bones = [];
 let morphs = [];
 let nbones = 0;
 let nmorphs = 0;
 let bufferSeconds = 10;
-let tickCount = 0;
-const DEBUG = true;
+const DEBUG = false;
+const PROTOCOL_VERSION = 2;
+
+let buildId = "dev";
+let knownBootId = null;
+let knownSessionId = null;
+let knownServerClockId = null;
+let knownLastAppliedFrame = -1;
+let currentSessionId = null;
+let serverBootId = null;
+let serverClockId = null;
 
 let blinkConfig = null;
 let blinkLeftIndices = [];
 let blinkRightIndices = [];
 let blinkNextAt = null;
 let blinkStartAt = null;
-let mouthConfig = null;
-let mouthMorphIndices = [];
-let jawBoneIndex = -1;
 
 let saccadeConfig = { intervalSec: [1.0, 3.0], yawDeg: 2.0, pitchDeg: 1.0 };
 let saccadeNextAt = null;
@@ -28,26 +35,123 @@ let eyeBoneIndices = [];
 let morphSmoothAlpha = null;
 let prevMorphs = null;
 
-let baseFrame = null;
 let capacity = 1;
 let frameSlots = [];
 let frameMarks = null;
+let framePhase = null;
 let storedCount = 0;
-let dropped = 0;
+let snapshotDropCount = 0;
+let liveDropCount = 0;
+let resyncSkipped = 0;
 let recvCount = 0;
 let lastStatsTime = performance.now();
 let maxIndex = -1;
 let lastRecvTime = null;
 let effectiveFps = 0;
-
 let interpBuffer = null;
+let tickCount = 0;
+let lastAppliedFrame = -1;
+let neutralFrame = null;
+let latestTimingSnapshot = null;
+
+let serverOffsetMs = 0;
+let hasServerOffset = false;
+let lastDriftWarnMs = 0;
+
+let playbackState = "live_playing"; // snapshot_loading | tail_lock_align | live_playing | resyncing
+let targetLiveFrame = null;
+let tailLockStartMs = 0;
+let seenLiveAtOrBeyondTarget = false;
+let lastResyncRequestMs = 0;
+const MAX_TAIL_LOCK_MS = 10000;
+const FAST_TRACK_DRIFT_MS = 250;
+const SNAP_DRIFT_MS = 5000;
+const DRIFT_WARN_COOLDOWN_MS = 1000;
+
+function hasReadyStreamFps() {
+  return Number.isFinite(streamFps) && streamFps > 0;
+}
+
+function updateStreamFps(nextFps) {
+  if (Number.isFinite(nextFps) && nextFps > 0) {
+    streamFps = nextFps;
+    streamFpsReady = true;
+  }
+}
+
+function sanitizeTimingValue(value, digits = 3) {
+  if (!Number.isFinite(value)) return null;
+  return Number(value.toFixed(digits));
+}
+
+function buildTimingSnapshot(timing, serverTimeMs) {
+  const snapshot = {};
+  if (timing && typeof timing === "object") {
+    for (const key of [
+      "inputqueuewait_ms",
+      "infer_ms",
+      "resample_ms",
+      "retarget_ms",
+      "outputqueuewait_ms",
+      "batch_samples",
+      "frames_count",
+      "flush_reason",
+    ]) {
+      const value = timing[key];
+      if (typeof value === "string" && value) {
+        snapshot[key] = value;
+      } else if (Number.isFinite(value)) {
+        snapshot[key] = sanitizeTimingValue(value);
+      }
+    }
+  }
+  if (Number.isFinite(serverTimeMs)) {
+    snapshot.transportagems = sanitizeTimingValue(
+      Math.max(0, serverNowEstimateMs() - serverTimeMs)
+    );
+  }
+  return Object.keys(snapshot).length > 0 ? snapshot : null;
+}
+
+function resetTimelineState() {
+  targetLiveFrame = null;
+  tailLockStartMs = 0;
+  seenLiveAtOrBeyondTarget = false;
+  lastAppliedFrame = -1;
+  if (!frameMarks) ensureCapacity();
+  else resetBuffer();
+}
+
+function switchSession(nextSessionId, mode = "live_playing", reason = "session_switch") {
+  if (!nextSessionId || nextSessionId === currentSessionId) return false;
+  currentSessionId = nextSessionId;
+  knownSessionId = nextSessionId;
+  latestTimingSnapshot = null;
+  resetTimelineState();
+  playbackState = mode;
+  postMessage({
+    type: "session_switch",
+    sessionId: currentSessionId,
+    playbackState,
+    reason,
+  });
+  return true;
+}
+
+function debugLog(...args) {
+  if (DEBUG) console.log("[Worker]", ...args);
+}
 
 function resetBuffer() {
   frameSlots = new Array(capacity);
   frameMarks = new Int32Array(capacity);
+  framePhase = new Uint8Array(capacity);
   frameMarks.fill(-1);
+  framePhase.fill(0);
   storedCount = 0;
-  dropped = 0;
+  snapshotDropCount = 0;
+  liveDropCount = 0;
+  resyncSkipped = 0;
   maxIndex = -1;
   lastRecvTime = null;
   effectiveFps = 0;
@@ -55,36 +159,103 @@ function resetBuffer() {
 }
 
 function ensureCapacity() {
-  capacity = Math.max(1, Math.ceil(streamFps * bufferSeconds));
+  capacity = Math.max(1, Math.ceil((hasReadyStreamFps() ? streamFps : 1) * bufferSeconds));
   resetBuffer();
 }
 
-function storeFrame(idx, data) {
-  if (!frameMarks) {
-    ensureCapacity();
+function buildNeutralFrame() {
+  const len = 3 + nbones * 4 + nmorphs;
+  if (!Number.isFinite(len) || len <= 0) return null;
+  if (!neutralFrame || neutralFrame.length !== len) {
+    neutralFrame = new Float32Array(len);
+    neutralFrame.fill(0);
+    // Identity rotation for each bone quaternion.
+    for (let i = 0; i < nbones; i++) {
+      neutralFrame[3 + i * 4 + 3] = 1;
+    }
   }
+  return neutralFrame;
+}
+
+function observeServerTime(serverTimeMs) {
+  if (!Number.isFinite(serverTimeMs)) return;
+  const now = performance.now();
+  const raw = serverTimeMs - now;
+  if (!hasServerOffset) {
+    serverOffsetMs = raw;
+    hasServerOffset = true;
+  } else {
+    // Compare against previous offset first; post-EMA comparisons create false positives.
+    const delta = raw - serverOffsetMs;
+    const absDelta = Math.abs(delta);
+
+    // True discontinuity (clock jump / long stall): hard snap.
+    if (absDelta > SNAP_DRIFT_MS) {
+      if (now - lastDriftWarnMs > DRIFT_WARN_COOLDOWN_MS) {
+        console.warn(`[Worker] Large drift detected: ${absDelta.toFixed(2)}ms, snapping.`);
+        lastDriftWarnMs = now;
+      }
+      serverOffsetMs = raw;
+      return;
+    }
+
+    // Normal case: EMA smooth. For moderate drift, converge faster without snapping.
+    const alpha = absDelta > FAST_TRACK_DRIFT_MS ? 0.35 : 0.1;
+    serverOffsetMs += delta * alpha;
+  }
+}
+
+function serverNowEstimateMs() {
+  if (!hasServerOffset) return performance.now();
+  return performance.now() + serverOffsetMs;
+}
+
+function storeFrame(idx, data, phaseName) {
+  if (!frameMarks) ensureCapacity();
   const slot = idx % capacity;
+  const phase = phaseName === "snapshot" ? 1 : 2;
   if (frameMarks[slot] !== -1 && frameMarks[slot] !== idx) {
-    dropped += 1;
+    if (phase === 1) snapshotDropCount += 1;
+    else liveDropCount += 1;
   } else if (frameMarks[slot] === -1) {
     storedCount += 1;
   }
   frameSlots[slot] = data;
   frameMarks[slot] = idx;
+  framePhase[slot] = phase;
   if (idx > maxIndex) maxIndex = idx;
 }
 
 function getFrame(idx) {
+  if (!frameMarks) return null;
   const slot = idx % capacity;
   if (frameMarks[slot] === idx) return frameSlots[slot];
   return null;
+}
+
+function getNearestFrameAtOrBefore(idx) {
+  for (let back = 0; back < capacity; back++) {
+    const k = idx - back;
+    if (k < 0) break;
+    const fr = getFrame(k);
+    if (fr) return { frame: k, data: fr };
+  }
+  return null;
+}
+
+function getLatestFrame() {
+  if (maxIndex < 0) return null;
+  return getNearestFrameAtOrBefore(maxIndex);
 }
 
 function slerpQuat(ax, ay, az, aw, bx, by, bz, bw, t) {
   let cos = ax * bx + ay * by + az * bz + aw * bw;
   if (cos < 0) {
     cos = -cos;
-    bx = -bx; by = -by; bz = -bz; bw = -bw;
+    bx = -bx;
+    by = -by;
+    bz = -bz;
+    bw = -bw;
   }
   if (1.0 - cos < 1e-6) {
     const k0 = 1 - t;
@@ -118,17 +289,14 @@ function quatFromYawPitch(yaw, pitch) {
   const sx = Math.sin(pitch * 0.5);
   const qy = [0, sy, 0, cy];
   const qx = [sx, 0, 0, cx];
-  const q = quatMul(qy[0], qy[1], qy[2], qy[3], qx[0], qx[1], qx[2], qx[3]);
-  return q;
+  return quatMul(qy[0], qy[1], qy[2], qy[3], qx[0], qx[1], qx[2], qx[3]);
 }
 
 function updateBlink(elapsed) {
   if (!blinkConfig) return 0;
   const interval = blinkConfig.intervalSec || [3.0, 6.0];
   const duration = blinkConfig.durationSec || 0.12;
-  if (blinkNextAt === null) {
-    blinkNextAt = elapsed + randRange(interval[0], interval[1]);
-  }
+  if (blinkNextAt === null) blinkNextAt = elapsed + randRange(interval[0], interval[1]);
   if (blinkStartAt === null && elapsed >= blinkNextAt) {
     blinkStartAt = elapsed;
     blinkNextAt = elapsed + randRange(interval[0], interval[1]);
@@ -147,9 +315,7 @@ function updateBlink(elapsed) {
 
 function updateSaccade(elapsed) {
   const interval = saccadeConfig.intervalSec || [1.0, 3.0];
-  if (saccadeNextAt === null) {
-    saccadeNextAt = elapsed + randRange(interval[0], interval[1]);
-  }
+  if (saccadeNextAt === null) saccadeNextAt = elapsed + randRange(interval[0], interval[1]);
   if (elapsed >= saccadeNextAt) {
     const yaw = (saccadeConfig.yawDeg || 2.0) * (Math.PI / 180);
     const pitch = (saccadeConfig.pitchDeg || 1.0) * (Math.PI / 180);
@@ -196,17 +362,12 @@ function applyExtras(buffer, elapsed) {
   }
 }
 
-
 function applyMorphSmoothing(buffer) {
-  if (!buffer || !morphSmoothAlpha || morphSmoothAlpha >= 1 || nmorphs <= 0) {
-    return;
-  }
+  if (!buffer || !morphSmoothAlpha || morphSmoothAlpha >= 1 || nmorphs <= 0) return;
   const offset = 3 + nbones * 4;
   if (!prevMorphs || prevMorphs.length !== nmorphs) {
     prevMorphs = new Float32Array(nmorphs);
-    for (let i = 0; i < nmorphs; i++) {
-      prevMorphs[i] = buffer[offset + i];
-    }
+    for (let i = 0; i < nmorphs; i++) prevMorphs[i] = buffer[offset + i];
     return;
   }
   const alpha = morphSmoothAlpha;
@@ -218,41 +379,32 @@ function applyMorphSmoothing(buffer) {
   }
 }
 
-function debugMorphs(buffer) {
-  if (!buffer || nmorphs <= 0) return;
-  if (tickCount % 100 !== 0) return;
-  const offset = 3 + nbones * 4;
-  const end = offset + nmorphs;
-  let maxVal = -Infinity;
-  for (let i = offset; i < end; i++) {
-    const v = buffer[i];
-    if (v > maxVal) maxVal = v;
-  }
-  const first = [];
-  for (let i = 0; i < Math.min(10, nmorphs); i++) {
-    first.push(buffer[offset + i]);
-  }
-  console.log("[Debug] Morph Index:", offset, "Max Value in Frame:", maxVal.toFixed(4));
-  console.log("[Debug] First 10 Morphs:", first);
-}
-
 function emitFrame(frameIndex, data) {
+  if (frameIndex < lastAppliedFrame) return;
   const out = new Float32Array(data.length);
   out.set(data);
-  debugMorphs(out);
   postMessage(
     {
       type: "frame",
       buffer: out.buffer,
       frameIndex,
-      streamFps,
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
       queueLen: storedCount,
-      dropped,
+      snapshotDropCount,
+      liveDropCount,
+      resyncSkipped,
+      timing: latestTimingSnapshot,
       nbones,
       nmorphs,
+      sessionId: currentSessionId,
+      serverBootId,
+      serverClockId,
+      protocolVersion: PROTOCOL_VERSION,
     },
     [out.buffer]
   );
+  lastAppliedFrame = Math.max(lastAppliedFrame, frameIndex);
 }
 
 function updateEffectiveFps() {
@@ -261,9 +413,7 @@ function updateEffectiveFps() {
     const dt = (now - lastRecvTime) / 1000;
     if (dt > 0) {
       const inst = 1 / dt;
-      if (Number.isFinite(inst)) {
-        effectiveFps = effectiveFps ? (effectiveFps * 0.9 + inst * 0.1) : inst;
-      }
+      if (Number.isFinite(inst)) effectiveFps = effectiveFps ? effectiveFps * 0.9 + inst * 0.1 : inst;
     }
   }
   lastRecvTime = now;
@@ -274,43 +424,129 @@ function maybeSendStats() {
   const dt = (now - lastStatsTime) / 1000;
   if (dt < 0.4) return;
   const inFps = Math.round(recvCount / dt);
-  const minIndexEstimate = maxIndex - capacity + 1;
+  const minIndexEstimate = maxIndex >= 0 ? Math.max(0, maxIndex - capacity + 1) : -1;
   postMessage({
     type: "stats",
     queueLen: storedCount,
-    dropped,
+    snapshotDropCount,
+    liveDropCount,
+    resyncSkipped,
     inFps,
-    streamFps,
-    baseFrame,
+    streamFps: hasReadyStreamFps() ? streamFps : null,
+    streamFpsReady,
     maxIndex,
     minIndexEstimate,
+    playbackState,
+    targetLiveFrame,
+    timing: latestTimingSnapshot,
+    sessionId: currentSessionId,
   });
   recvCount = 0;
   lastStatsTime = now;
 }
 
+function sendResyncRequest(reason) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !currentSessionId) return;
+  const now = performance.now();
+  if (now - lastResyncRequestMs < 500) return;
+  lastResyncRequestMs = now;
+  resyncSkipped += 1;
+  ws.send(
+    JSON.stringify({
+      type: "resync_request",
+      stream_session_id: currentSessionId,
+      session_id: currentSessionId,
+      reason,
+    })
+  );
+  postMessage({ type: "resync", reason, sessionId: currentSessionId });
+}
+
 function onTick(elapsed) {
-  if (baseFrame === null) return;
+  if (playbackState === "snapshot_loading") {
+    maybeSendStats();
+    return;
+  }
+  if (!hasReadyStreamFps()) {
+    maybeSendStats();
+    return;
+  }
+  if (playbackState === "tail_lock_align") {
+    const target = Number.isFinite(targetLiveFrame) ? targetLiveFrame : maxIndex;
+    const best = getNearestFrameAtOrBefore(target) || getLatestFrame();
+    if (best) {
+      const out = new Float32Array(best.data.length);
+      out.set(best.data);
+      applyExtras(out, elapsed);
+      applyMorphSmoothing(out);
+      // During tail lock we always emit the hold frame so viewer frameDirty
+      // stays true even when frame index does not advance.
+      const holdOut = new Float32Array(out.length);
+      holdOut.set(out);
+      postMessage(
+        {
+          type: "frame",
+          buffer: holdOut.buffer,
+          frameIndex: best.frame,
+          streamFps,
+          streamFpsReady,
+          queueLen: storedCount,
+          snapshotDropCount,
+          liveDropCount,
+          resyncSkipped,
+          timing: latestTimingSnapshot,
+          nbones,
+          nmorphs,
+          sessionId: currentSessionId,
+          serverBootId,
+          serverClockId,
+          protocolVersion: PROTOCOL_VERSION,
+        },
+        [holdOut.buffer]
+      );
+    }
+    if (seenLiveAtOrBeyondTarget) {
+      playbackState = "live_playing";
+    } else if (performance.now() - tailLockStartMs > MAX_TAIL_LOCK_MS) {
+      playbackState = "resyncing";
+      sendResyncRequest("tail_lock_timeout");
+    }
+    maybeSendStats();
+    return;
+  }
+  if (playbackState === "resyncing") {
+    maybeSendStats();
+    return;
+  }
+  if (maxIndex < 0) {
+    const neutral = buildNeutralFrame();
+    if (neutral) {
+      emitFrame(Math.max(lastAppliedFrame, 0), neutral);
+    }
+    maybeSendStats();
+    return;
+  }
   const frameFloat = elapsed * streamFps;
   let i0 = Math.floor(frameFloat);
   let i1 = i0 + 1;
   const alpha = Math.max(0, Math.min(1, frameFloat - i0));
-  if (maxIndex >= 0 && i0 > maxIndex) {
+  if (i0 > maxIndex) {
     i0 = maxIndex;
     i1 = i0;
   }
   let a = getFrame(i0);
   let b = getFrame(i1);
-  if (!a && maxIndex >= 0) {
+  if (!a) {
     for (let j = 1; j <= 3; j++) {
       const cand = getFrame(i0 - j);
       if (cand) {
         a = cand;
+        i0 = i0 - j;
         break;
       }
     }
   }
-  if (!b && maxIndex >= 0) {
+  if (!b) {
     for (let j = 1; j <= 3; j++) {
       const cand = getFrame(i1 - j);
       if (cand) {
@@ -320,44 +556,54 @@ function onTick(elapsed) {
     }
   }
   if (a && b) {
-    if (!interpBuffer || interpBuffer.length !== a.length) {
-      interpBuffer = new Float32Array(a.length);
-    }
-    // root
+    if (!interpBuffer || interpBuffer.length !== a.length) interpBuffer = new Float32Array(a.length);
     interpBuffer[0] = a[0] * (1 - alpha) + b[0] * alpha;
     interpBuffer[1] = a[1] * (1 - alpha) + b[1] * alpha;
     interpBuffer[2] = a[2] * (1 - alpha) + b[2] * alpha;
     let offset = 3;
     for (let i = 0; i < nbones; i++) {
-      const ax = a[offset];
-      const ay = a[offset + 1];
-      const az = a[offset + 2];
-      const aw = a[offset + 3];
-      const bx = b[offset];
-      const by = b[offset + 1];
-      const bz = b[offset + 2];
-      const bw = b[offset + 3];
-      const q = slerpQuat(ax, ay, az, aw, bx, by, bz, bw, alpha);
+      const q = slerpQuat(
+        a[offset],
+        a[offset + 1],
+        a[offset + 2],
+        a[offset + 3],
+        b[offset],
+        b[offset + 1],
+        b[offset + 2],
+        b[offset + 3],
+        alpha
+      );
       interpBuffer[offset] = q[0];
       interpBuffer[offset + 1] = q[1];
       interpBuffer[offset + 2] = q[2];
       interpBuffer[offset + 3] = q[3];
       offset += 4;
     }
-    for (let i = 0; i < nmorphs; i++) {
-      interpBuffer[offset + i] = a[offset + i] * (1 - alpha) + b[offset + i] * alpha;
-    }
+    for (let i = 0; i < nmorphs; i++) interpBuffer[offset + i] = a[offset + i] * (1 - alpha) + b[offset + i] * alpha;
     applyExtras(interpBuffer, elapsed);
     applyMorphSmoothing(interpBuffer);
-    if (tickCount % 60 === 0) console.log("[Worker] Emitting interpolated frame", { i0, alpha: alpha.toFixed(2), queueLen: storedCount });
     emitFrame(i0, interpBuffer);
   } else if (a) {
     const out = new Float32Array(a.length);
     out.set(a);
     applyExtras(out, elapsed);
     applyMorphSmoothing(out);
-    if (tickCount % 60 === 0) console.log("[Worker] Emitting direct frame", { i0, queueLen: storedCount });
     emitFrame(i0, out);
+  } else {
+    // No exact interpolation frames available; keep stream alive with fallback pose.
+    const fallback = getLatestFrame();
+    if (fallback) {
+      const out = new Float32Array(fallback.data.length);
+      out.set(fallback.data);
+      applyExtras(out, elapsed);
+      applyMorphSmoothing(out);
+      emitFrame(fallback.frame, out);
+    } else {
+      const neutral = buildNeutralFrame();
+      if (neutral) {
+        emitFrame(Math.max(lastAppliedFrame, 0), neutral);
+      }
+    }
   }
   maybeSendStats();
 }
@@ -368,29 +614,160 @@ function connectAnim() {
   ws.binaryType = "arraybuffer";
   let header = null;
   ws.onopen = () => {
-    postMessage({ type: "status", status: "connected" });
+    postMessage({
+      type: "status",
+      status: "connected",
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
+      timing: latestTimingSnapshot,
+    });
+    ws.send(
+      JSON.stringify({
+        type: "anim_subscribe",
+        protocol_version: PROTOCOL_VERSION,
+        known_boot_id: knownBootId,
+        known_server_clock_id: knownServerClockId,
+        known_stream_session_id: knownSessionId,
+        known_session_id: knownSessionId,
+        last_applied_frame: Number.isFinite(knownLastAppliedFrame) ? knownLastAppliedFrame : -1,
+      })
+    );
   };
-  ws.onclose = () => {
-    postMessage({ type: "status", status: "closed" });
-  };
-  ws.onerror = () => {
-    postMessage({ type: "status", status: "error" });
-  };
+  ws.onclose = () =>
+    postMessage({
+      type: "status",
+      status: "closed",
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
+      timing: latestTimingSnapshot,
+    });
+  ws.onerror = () =>
+    postMessage({
+      type: "status",
+      status: "error",
+      streamFps: hasReadyStreamFps() ? streamFps : null,
+      streamFpsReady,
+      timing: latestTimingSnapshot,
+    });
   ws.onmessage = (event) => {
     if (typeof event.data === "string") {
+      let msg = null;
       try {
-        header = JSON.parse(event.data);
+        msg = JSON.parse(event.data);
       } catch {
-        header = null;
+        msg = null;
       }
-      if (header && header.type === "anim_init") {
-        streamFps = header.fps || streamFps;
-        bones = header.bones || [];
-        morphs = header.morphs || [];
-        if (Number.isFinite(header.bufferSeconds)) {
-          bufferSeconds = header.bufferSeconds;
+      header = msg;
+      if (!msg) return;
+      if (msg.type === "anim_session_switch") {
+        const sid = msg.stream_session_id || msg.session_id || currentSessionId;
+        switchSession(sid, "live_playing", "server_session_switch");
+        currentSessionId = sid;
+        if (Number.isFinite(msg.server_time_ms)) observeServerTime(msg.server_time_ms);
+        return;
+      }
+      if (msg.type === "anim_subscribe_ack") {
+        const prevBootId = serverBootId;
+        serverBootId = msg.server_boot_id || serverBootId;
+        serverClockId = msg.server_clock_id || serverClockId;
+        if (knownServerClockId && serverClockId && knownServerClockId !== serverClockId) {
+          postMessage({
+            type: "status",
+            status: "reset_required",
+            reason: "server_clock_mismatch",
+            serverBootId,
+            serverClockId,
+            sessionId: currentSessionId,
+            protocolVersion: PROTOCOL_VERSION,
+          });
+          ws.close();
+          return;
         }
-        blinkConfig = header.blink || null;
+        const ackSessionId = msg.stream_session_id || msg.session_id || currentSessionId;
+        const modeFromAck = msg.mode === "resume" ? "snapshot_loading" : "live_playing";
+        switchSession(ackSessionId, modeFromAck, "subscribe_ack");
+        currentSessionId = ackSessionId;
+        updateStreamFps(msg.stream_fps);
+        // If the server restarted (new boot_id), reset the clock offset so the
+        // first sample from the new server establishes a clean baseline rather
+        // than triggering cascading large-drift snaps from the stale offset.
+        if (prevBootId && msg.server_boot_id && msg.server_boot_id !== prevBootId) {
+          hasServerOffset = false;
+          console.warn("[Worker] Server restart detected (new boot_id), resetting clock sync.");
+        }
+        observeServerTime(msg.server_time_ms);
+        if (msg.mode === "reset_required") {
+          postMessage({
+            type: "status",
+            status: "reset_required",
+            serverBootId,
+            serverClockId,
+            sessionId: currentSessionId,
+            protocolVersion: PROTOCOL_VERSION,
+          });
+          ws.close();
+          return;
+        }
+        playbackState = modeFromAck;
+        postMessage({
+          type: "handshake",
+          mode: msg.mode,
+          protocolVersion: PROTOCOL_VERSION,
+          serverBootId,
+          serverClockId,
+          sessionId: currentSessionId,
+          streamFps: hasReadyStreamFps() ? streamFps : null,
+          streamFpsReady,
+          buildId,
+        });
+        return;
+      }
+      if (msg.type === "anim_snapshot_start") {
+        const sid = msg.stream_session_id || msg.session_id || currentSessionId;
+        switchSession(sid, "snapshot_loading", "snapshot_start");
+        playbackState = "snapshot_loading";
+        targetLiveFrame = null;
+        seenLiveAtOrBeyondTarget = false;
+        return;
+      }
+      if (msg.type === "anim_snapshot_end") {
+        const sid = msg.stream_session_id || msg.session_id || currentSessionId;
+        if (msg.server_clock_id && serverClockId && msg.server_clock_id !== serverClockId) {
+          playbackState = "resyncing";
+          sendResyncRequest("clock_mismatch");
+          return;
+        }
+        switchSession(sid, "snapshot_loading", "snapshot_end");
+        currentSessionId = sid;
+        observeServerTime(msg.live_head_server_time_ms);
+        const liveHeadFrame = Number.isFinite(msg.live_head_frame) ? msg.live_head_frame : -1;
+        const liveHeadServerTimeMs = Number.isFinite(msg.live_head_server_time_ms)
+          ? msg.live_head_server_time_ms
+          : serverNowEstimateMs();
+        const audioLiveEdgeFrame = Number.isFinite(msg.audio_live_edge_frame) ? msg.audio_live_edge_frame : -1;
+        const expectedFrame =
+          liveHeadFrame >= 0 && hasReadyStreamFps()
+            ? liveHeadFrame + Math.round(((serverNowEstimateMs() - liveHeadServerTimeMs) * streamFps) / 1000)
+            : -1;
+        targetLiveFrame = Math.max(expectedFrame, audioLiveEdgeFrame, liveHeadFrame);
+        playbackState = "tail_lock_align";
+        tailLockStartMs = performance.now();
+        seenLiveAtOrBeyondTarget = false;
+        postMessage({
+          type: "snapshot_anchor",
+          sessionId: currentSessionId,
+          targetLiveFrame,
+          liveHeadFrame,
+          audioLiveEdgeFrame,
+        });
+        return;
+      }
+      if (msg.type === "anim_init") {
+        updateStreamFps(msg.fps);
+        bones = msg.bones || [];
+        morphs = msg.morphs || [];
+        if (Number.isFinite(msg.bufferSeconds)) bufferSeconds = msg.bufferSeconds;
+        blinkConfig = msg.blink || null;
         blinkLeftIndices = [];
         blinkRightIndices = [];
         if (blinkConfig) {
@@ -405,68 +782,62 @@ function connectAnim() {
             if (idx >= 0) blinkRightIndices.push(idx);
           }
         }
-        mouthConfig = header.mouth || null;
-        mouthMorphIndices = [];
-        if (mouthConfig && mouthConfig.morphs) {
-          for (const name of mouthConfig.morphs) {
-            const idx = morphs.indexOf(name);
-            if (idx >= 0) mouthMorphIndices.push(idx);
-          }
-        }
-        morphSmoothAlpha =
-          typeof header.morphSmoothAlpha === "number" ? header.morphSmoothAlpha : null;
-        if (header.saccade) {
-          saccadeConfig = header.saccade;
-        }
+        morphSmoothAlpha = typeof msg.morphSmoothAlpha === "number" ? msg.morphSmoothAlpha : null;
+        if (msg.saccade) saccadeConfig = msg.saccade;
         nbones = bones.length;
         nmorphs = morphs.length;
+        neutralFrame = null;
         eyeBoneIndices = [];
-        jawBoneIndex = -1;
         for (let i = 0; i < bones.length; i++) {
           const name = (bones[i] || "").toLowerCase();
-          if (name.includes("eye")) {
-            eyeBoneIndices.push(i);
-          }
-          if (jawBoneIndex < 0 && name.includes("jaw")) {
-            jawBoneIndex = i;
-          }
+          if (name.includes("eye")) eyeBoneIndices.push(i);
         }
-        baseFrame = null;
         ensureCapacity();
         postMessage({
           type: "init",
-          streamFps,
+          streamFps: hasReadyStreamFps() ? streamFps : null,
+          streamFpsReady,
           bones,
           morphs,
           bufferSeconds,
           blink: blinkConfig,
           saccade: saccadeConfig,
-          mouth: mouthConfig,
+          protocolVersion: PROTOCOL_VERSION,
+          serverBootId,
+          sessionId: currentSessionId,
+          buildId,
         });
+        return;
+      }
+      if (msg.type === "anim") {
+        const sid = msg.stream_session_id || msg.session_id || null;
+        if (sid && sid !== currentSessionId) {
+          const nextMode = msg.phase === "snapshot" ? "snapshot_loading" : "live_playing";
+          switchSession(sid, nextMode, "anim_header");
+        }
+        if (Number.isFinite(msg.server_time_ms)) observeServerTime(msg.server_time_ms);
+        latestTimingSnapshot = buildTimingSnapshot(msg.timing, msg.server_time_ms) || latestTimingSnapshot;
+        if (sid) currentSessionId = sid;
       }
       return;
     }
-    if (event.data instanceof ArrayBuffer) {
-      if (header && header.type === "anim") {
-        const frame = header.frame ?? 0;
-        const arr = new Float32Array(event.data);
-        if (!Number.isFinite(baseFrame) || frame < baseFrame) {
-          baseFrame = frame;
-          resetBuffer();
-        }
-        const rel = frame - baseFrame;
-        storeFrame(rel, arr);
-        recvCount += 1;
-        updateEffectiveFps();
-        maybeSendStats();
-        if (tickCount % 200 === 0) {
-          console.log("[Worker] Frame stored in buffer:", { frame, rel, queueLen: storedCount });
-        }
-        header = null; // Clear header after processing binary data
-      } else {
-        console.warn("[Worker] Received binary data without matching 'anim' header. Current header type:", header ? header.type : "null");
-      }
+    if (!(event.data instanceof ArrayBuffer)) return;
+    if (!header || header.type !== "anim") return;
+    const frame = Number.isFinite(header.frame) ? header.frame : 0;
+    const phaseName = header.phase || "live";
+    currentSessionId = header.stream_session_id || header.session_id || currentSessionId;
+    if (!Number.isFinite(nbones) || nbones <= 0) nbones = header.nbones || nbones;
+    if (!Number.isFinite(nmorphs) || nmorphs <= 0) nmorphs = header.nmorphs || nmorphs;
+    if (!frameMarks) ensureCapacity();
+    const arr = new Float32Array(event.data);
+    storeFrame(frame, arr, phaseName);
+    recvCount += 1;
+    updateEffectiveFps();
+    if (phaseName === "live" && Number.isFinite(targetLiveFrame) && frame >= targetLiveFrame) {
+      seenLiveAtOrBeyondTarget = true;
     }
+    maybeSendStats();
+    header = null;
   };
 }
 
@@ -474,14 +845,20 @@ self.onmessage = (event) => {
   const msg = event.data;
   if (msg.type === "init") {
     wsHost = msg.host || wsHost;
+    knownBootId = msg.knownBootId || null;
+    knownSessionId = msg.knownSessionId || null;
+    knownServerClockId = msg.knownServerClockId || null;
+    knownLastAppliedFrame = Number.isFinite(msg.lastAppliedFrame) ? msg.lastAppliedFrame : -1;
+    buildId = msg.buildId || buildId;
     connectAnim();
     onTick(msg.elapsed || 0);
-    tickCount++;
+    tickCount += 1;
   } else if (msg.type === "tick") {
     onTick(msg.elapsed);
-    tickCount++;
+    tickCount += 1;
   } else if (msg.type === "reset") {
-    baseFrame = null;
-    resetBuffer();
+    latestTimingSnapshot = null;
+    resetTimelineState();
+    playbackState = "live_playing";
   }
 };

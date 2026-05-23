@@ -1,15 +1,4 @@
-import { pipeline, env } from "@xenova/transformers";
 import { embeddingMemory } from "./embeddingMemory.js";
-
-// Force remote model loading in the browser
-env.allowLocalModels = false;
-env.allowRemoteModels = true;
-
-// Set the correct base URL and disable automatic path resolution
-env.remoteHost = 'https://huggingface.co/';
-
-// Add cache busting to avoid stale responses
-env.useBrowserCache = false;
 
 // Log all fetch requests for debugging
 const originalFetch = window.fetch;
@@ -29,61 +18,45 @@ window.fetch = async (...args) => {
   return response;
 };
 
-let extractor = null;
-const MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
+// Worker setup
+let worker = null;
+let messageIdCounter = 0;
+const pendingRequests = new Map();
 
-async function loadExtractor(retryCount = 0) {
-  if (embeddingMemory.isModelLoading()) {
-    await new Promise(resolve => setTimeout(resolve, 500));
-    return extractor;
-  }
-
-  if (extractor) {
-    return extractor;
-  }
-
-  embeddingMemory.setModelLoading(true);
-
-  try {
-    console.log(`Attempting to load model: ${MODEL_NAME} (attempt ${retryCount + 1})`);
+function getWorker() {
+  if (!worker) {
+    worker = new Worker(new URL('./embeddingWorker.js', import.meta.url), {
+      type: 'module'
+    });
     
-    // Explicitly specify the model configuration
-    const instance = await pipeline(
-      "feature-extraction",
-      MODEL_NAME,
-      {
-        quantized: true,
-        progress_callback: (progress) => {
-          console.log(`Model loading progress:`, progress);
+    worker.onmessage = (event) => {
+      const { id, type, embedding, error, progress, message } = event.data;
+      
+      if (type === 'load_progress') {
+        if (message) console.log(message);
+        if (progress) console.log(`Model loading progress:`, progress);
+      } else if (type === 'load_success') {
+        embeddingMemory.recordLoadSuccess();
+        console.log(`✓ Embedding model loaded successfully`);
+        embeddingMemory.setModelLoading(false);
+      } else if (type === 'embedding_result' || type === 'embedding_error' || type === 'clear_cache_result') {
+        const promiseCallbacks = pendingRequests.get(id);
+        if (promiseCallbacks) {
+          if (type === 'embedding_error') {
+            promiseCallbacks.reject(new Error(error));
+          } else {
+            promiseCallbacks.resolve(type === 'embedding_result' ? embedding : null);
+          }
+          pendingRequests.delete(id);
         }
       }
-    );
-    
-    extractor = instance;
-    embeddingMemory.recordLoadSuccess();
-    console.log(`✓ Embedding model loaded successfully`);
-    embeddingMemory.setModelLoading(false);
-    return instance;
-  } catch (err) {
-    embeddingMemory.setModelLoading(false);
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    console.error(`Failed to load embedding model:`, errorMsg);
-    embeddingMemory.recordLoadFailure(errorMsg);
-
-    // Retry logic with exponential backoff
-    if (embeddingMemory.canRetry() && retryCount < embeddingMemory.MAX_RETRIES) {
-      const delay = embeddingMemory.getRetryDelay();
-      console.log(`Retrying model load in ${delay}ms... (attempt ${retryCount + 2})`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return loadExtractor(retryCount + 1);
-    } else {
-      console.error(`Max retries exceeded for embedding model`);
-      throw new Error(
-        `Failed to load embedding model after ${retryCount + 1} attempts. Last error: ${errorMsg}`
-      );
-    }
+    };
   }
+  return worker;
 }
+
+// ensure worker is initialized
+getWorker();
 
 export async function getEmbedding(text) {
   // Check cache first
@@ -93,25 +66,26 @@ export async function getEmbedding(text) {
     return cached;
   }
 
-  // Load model if not already loaded
-  if (!extractor) {
-    extractor = await loadExtractor();
-  }
-
   console.log(`Generating embedding for text: "${text.substring(0, 30)}..."`);
   
-  const output = await extractor(text, {
-    pooling: "mean",
-    normalize: true
+  const id = ++messageIdCounter;
+  
+  const promise = new Promise((resolve, reject) => {
+    pendingRequests.set(id, { resolve, reject });
   });
-
-  const embedding = Array.from(output.data);
   
-  // Cache the result
-  embeddingMemory.cacheEmbedding(text, embedding);
+  getWorker().postMessage({ id, type: "get_embedding", text });
   
-  console.log(`✓ Embedding generated (dimensions: ${embedding.length})`);
-  return embedding;
+  try {
+    const embedding = await promise;
+    // Cache the result
+    embeddingMemory.cacheEmbedding(text, embedding);
+    console.log(`✓ Embedding generated (dimensions: ${embedding.length})`);
+    return embedding;
+  } catch (err) {
+    console.error(`Failed to generate embedding:`, err.message);
+    throw err;
+  }
 }
 
 export function getEmbeddingSystemState() {
@@ -120,6 +94,9 @@ export function getEmbeddingSystemState() {
 
 export function clearEmbeddingCache() {
   embeddingMemory.clear();
-  extractor = null;
+  if (worker) {
+    const id = ++messageIdCounter;
+    worker.postMessage({ id, type: "clear_cache" });
+  }
   console.log("Embedding cache and model cleared");
 }

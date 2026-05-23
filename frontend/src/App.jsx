@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { destroyViewer, initViewer, isAudioReady } from "./viewer/ViewerController.js";
 import { ConversationPanel } from "./ConversationPanel.jsx";
 
@@ -11,71 +11,22 @@ function MicIcon({ size = 20 }) {
 }
 
 function App() {
-  const [view, setView] = useState("viewer");
   const [showPermissionModal, setShowPermissionModal] = useState(false);
-  const commands = useMemo(
-    () => [
-      {
-        label: "Install Dependencies",
-        cmd: "./venv/bin/python -m pip install -r requirements.txt",
-      },
-      {
-        label: "Generate Motion (Offline)",
-        cmd: "./venv/bin/python generate_npz.py",
-      },
-      {
-        label: "Streamlit Viewer",
-        cmd: "./venv/bin/python -m streamlit run visualize_web.py",
-      },
-      {
-        label: "Render MP4",
-        cmd: "./venv/bin/python render.py",
-      },
-      {
-        label: "Start WebSocket Server",
-        cmd: "./venv/bin/python -m uvicorn server.app:app --reload --port 8000",
-      },
-      {
-        label: "Start Admin Server",
-        cmd: "./venv/bin/python -m uvicorn admin_server.main:app --reload --port 8001",
-      },
-      {
-        label: "Stream Audio (Simulator)",
-        cmd: "./venv/bin/python scripts/stream_audio_to_ws.py --audio input/viseme.mp3 --chunk 0.5",
-      },
-      {
-        label: "Export Faces (One-Time)",
-        cmd: "./venv/bin/python scripts/export_faces.py",
-      },
-    ],
-    []
-  );
 
   useEffect(() => {
-    if (view === "viewer") {
-      initViewer().then(() => {
-        // Short delay to allow onEnableAudio to complete if it can
-        setTimeout(() => {
-          if (!isAudioReady()) {
-            setShowPermissionModal(true);
-          }
-        }, 500);
-      });
-      return () => {
-        destroyViewer();
-        setShowPermissionModal(false);
-      };
-    }
-    destroyViewer();
-  }, [view]);
-
-  const copyCommand = async (cmd) => {
-    try {
-      await navigator.clipboard.writeText(cmd);
-    } catch (err) {
-      console.warn("Clipboard copy failed", err);
-    }
-  };
+    initViewer().then(() => {
+      // Short delay to allow onEnableAudio to complete if it can
+      setTimeout(() => {
+        if (!isAudioReady()) {
+          setShowPermissionModal(true);
+        }
+      }, 500);
+    });
+    return () => {
+      destroyViewer();
+      setShowPermissionModal(false);
+    };
+  }, []);
 
   const startExperience = () => {
     setShowPermissionModal(false);
@@ -85,7 +36,7 @@ function App() {
 
   return (
     <div id="app">
-      {showPermissionModal && view === "viewer" && (
+      {showPermissionModal && (
         <div className="cv-modal-overlay">
           <div className="cv-modal">
             <div className="cv-modal-header">
@@ -102,25 +53,9 @@ function App() {
           </div>
         </div>
       )}
-      <div id="topbar">
-        <div className="tabs">
-          <button
-            className={view === "viewer" ? "active" : ""}
-            onClick={() => setView("viewer")}
-          >
-            Viewer
-          </button>
-          <button
-            className={view === "utilities" ? "active" : ""}
-            onClick={() => setView("utilities")}
-          >
-            Utilities
-          </button>
-        </div>
-      </div>
 
       {/* ── Existing HUD (stats, view controls) ── */}
-      <div id="hud" className={view === "viewer" ? "" : "hidden"}>
+      <div id="hud">
         {/* Hidden debug statistics panel (kept in DOM to prevent Three.js controller crashes) */}
         <div style={{ display: "none" }}>
           <div className="row">
@@ -297,7 +232,7 @@ function App() {
           <span></span>
         </div>
         <div className="btns">
-          <button id="enableAudio">Enable Audio</button>
+          <button id="enableAudio" style={{ display: "none" }}>Enable Audio</button>
           {/*
             ── Ghost conversation control buttons ──
             These are visually hidden but remain in the DOM so ViewerController
@@ -314,31 +249,10 @@ function App() {
         </div>
       </div>
 
-      <canvas id="canvas" className={view === "viewer" ? "" : "hidden"}></canvas>
+      <canvas id="canvas"></canvas>
 
       {/* ── Premium conversation panel overlay ── */}
-      {view === "viewer" && <ConversationPanel />}
-
-      <div id="utilities" className={view === "utilities" ? "" : "hidden"}>
-        <h2>Command Runner (Copy to Terminal)</h2>
-        <p>
-          Browser cannot run shell commands directly. Use the buttons below to
-          copy commands, then paste in your terminal.
-        </p>
-        <div className="command-list">
-          {commands.map((item) => (
-            <div key={item.label} className="command-card">
-              <div className="command-title">{item.label}</div>
-              <div className="command-row">
-                <code>{item.cmd}</code>
-                <button onClick={() => copyCommand(item.cmd)}>
-                  Copy Command
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
+      <ConversationPanel />
     </div>
   );
 }

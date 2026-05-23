@@ -1283,6 +1283,10 @@ function initThree(canvasEl) {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0xffffff);
 
+  new THREE.TextureLoader().load("./assets/wallpaper.webp", (texture) => {
+    scene.background = texture;
+  });
+
   camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.01, 50);
   camera.position.set(1.2, 1.4, 2.5);
 

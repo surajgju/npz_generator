@@ -137,7 +137,7 @@ class ConversationRuntime:
             joined = b"".join(self._user_audio_chunks)
             self._user_audio_chunks = [joined[-max_bytes:]]
 
-    async def handle_ptt_end(self) -> None:
+    async def handle_ptt_end(self, payload: Optional[Dict[str, Any]] = None) -> None:
         self._cancel_ptt_guard()
         if not self._listening:
             return
@@ -148,16 +148,23 @@ class ConversationRuntime:
         self._user_audio_chunks = []
         total_samples = len(audio_bytes) // 2
         duration_sec = total_samples / max(1, self._user_audio_sr)
+        
+        # Extract RAG context from frontend
+        context = None
+        if payload:
+            context = payload.get("context")
+
         logger.info(
-            "Conversation PTT end: received %d bytes of audio (%.2f sec at sr=%d)",
+            "Conversation PTT end: received %d bytes of audio (%.2f sec at sr=%d, has_context=%s)",
             len(audio_bytes),
             duration_sec,
             self._user_audio_sr,
+            context is not None,
         )
         if self._reply_task and not self._reply_task.done():
             await self.interrupt(reason="new_ptt")
         self._reply_task = asyncio.create_task(
-            self._run_turn(audio_bytes, self._user_audio_sr)
+            self._run_turn(audio_bytes, self._user_audio_sr, context=context)
         )
 
     async def interrupt(self, reason: str = "interrupt") -> None:
@@ -187,7 +194,7 @@ class ConversationRuntime:
             }
         )
 
-    async def _run_turn(self, pcm_bytes: bytes, input_sr: int) -> None:
+    async def _run_turn(self, pcm_bytes: bytes, input_sr: int, context: Optional[str] = None) -> None:
         if not pcm_bytes:
             return
         stream_session_id: Optional[str] = None
@@ -202,6 +209,7 @@ class ConversationRuntime:
         )
         chunk_idx = 0
         stale_stream = False
+        accumulated_text = []
 
         try:
             await self._send({"type": "assistant_thinking_start"})
@@ -210,6 +218,13 @@ class ConversationRuntime:
             # Resolve tenant-scoped prompt
             tenant_config = resolve_tenant_config(self.servingid)
             final_prompt = tenant_config.get("system_prompt") if tenant_config else "You are a concise helpful voice assistant."
+            if context:
+                logger.info(
+                    "Conversation turn=%s: Injected local RAG context into prompt: %s",
+                    reply_id,
+                    context.replace("\n", " | "),
+                )
+                final_prompt = f"{final_prompt}\n\nHere is relevant context from the user's local memory/history to help you answer. Use it if relevant:\n{context}"
 
             async for raw_chunk, chunk_sr in self.adk.stream_audio_events(
                 conversation_id=self.conversation_id,
@@ -217,6 +232,11 @@ class ConversationRuntime:
                 input_sr=input_sr,
                 system_instruction=final_prompt,
             ):
+                if isinstance(raw_chunk, str):
+                    accumulated_text.append(raw_chunk)
+                    await self._send({"type": "assistant_text", "text": raw_chunk})
+                    continue
+
                 audio_i16 = np.frombuffer(raw_chunk, dtype=np.int16)
                 if audio_i16.size == 0:
                     continue
@@ -327,6 +347,15 @@ class ConversationRuntime:
                     }
                 )
                 emitted_speaking_end = True
+
+            # Send complete assistant response text back to client
+            if accumulated_text:
+                await self._send(
+                    {
+                        "type": "assistant_text_complete",
+                        "text": "".join(accumulated_text)
+                    }
+                )
 
         except asyncio.CancelledError:
             raise

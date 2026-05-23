@@ -213,6 +213,14 @@ export class ConversationClient {
         this._setLifecycle("idle");
         break;
 
+      case "assistant_text":
+        this._cb.onAssistantText?.(msg.text);
+        break;
+
+      case "assistant_text_complete":
+        this._cb.onAssistantTextComplete?.(msg.text);
+        break;
+
       case "interrupted":
       case "interrupt_ack":
         this._setLifecycle("idle");

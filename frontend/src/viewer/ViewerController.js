@@ -1418,6 +1418,10 @@ let pttActive = false;
 let pttPressed = false;
 let pttStarting = false;
 let pttSeq = 0;
+let latestUserTranscript = "";
+let latestAssistantResponseText = "";
+let recognition = null;
+let currentSpeechTranscript = "";
 let silentStartTime = null;
 let animOffsetSec = 0;
 let animOffsetSet = false;
@@ -2463,6 +2467,25 @@ function connectConversationSocket() {
           log("Conversation hello_ack", meta);
         }
       },
+      onAssistantText: (text) => {
+        latestAssistantResponseText += text;
+        console.log("[RAG Debug] Assistant text chunk:", text);
+      },
+      onAssistantTextComplete: async (fullText) => {
+        latestAssistantResponseText = fullText;
+        if (latestUserTranscript && fullText) {
+          console.log(`[RAG] Save Interaction: "${latestUserTranscript}" -> "${fullText}"`);
+          try {
+            const { addMemory } = await import("../rag/retrieval/ragService.js");
+            const interactionText = `User asked: "${latestUserTranscript}"\nAssistant replied: "${fullText}"`;
+            await addMemory(interactionText);
+          } catch (err) {
+            console.error("[RAG] Save Interaction error:", err);
+          }
+          latestUserTranscript = "";
+          latestAssistantResponseText = "";
+        }
+      },
       onAudioConnectionChange: (connected) => {
         if (!audioStatusEl) return;
         audioStatusEl.textContent = connected ? "connected" : "disconnected";
@@ -2496,9 +2519,100 @@ async function ensureConversationConnected(timeoutMs = 4000) {
   await conversationClient.ensureConnected(timeoutMs);
 }
 
+function initSpeechRecognition() {
+  if (recognition) return;
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    console.warn("[SpeechRecognition] SpeechRecognition is not supported in this browser.");
+    return;
+  }
+  recognition = new SpeechRecognition();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = "en-US";
+
+  recognition.onresult = (event) => {
+    let interim = "";
+    let final = "";
+    for (let i = event.resultIndex; i < event.results.length; ++i) {
+      if (event.results[i].isFinal) {
+        final += event.results[i][0].transcript;
+      } else {
+        interim += event.results[i][0].transcript;
+      }
+    }
+    currentSpeechTranscript = (final || interim || "").trim();
+    console.log("[SpeechRecognition] Real-time transcript:", currentSpeechTranscript);
+  };
+
+  recognition.onerror = (event) => {
+    console.error("[SpeechRecognition] Error:", event.error);
+  };
+
+  recognition.onend = () => {
+    console.log("[SpeechRecognition] Ended");
+  };
+}
+
+async function getFinalTranscriptAndSearch() {
+  if (recognition) {
+    try {
+      recognition.stop();
+    } catch (e) {
+      console.warn("[SpeechRecognition] Stop failed", e);
+    }
+  }
+
+  // Poll for transcript up to 500ms to allow final result to settle
+  let attempts = 0;
+  while (attempts < 5 && !currentSpeechTranscript) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    attempts++;
+  }
+
+  const transcript = currentSpeechTranscript.trim();
+  if (!transcript) {
+    return { transcript: "", context: "" };
+  }
+
+  console.log(`[RAG] Transcribed Query: "${transcript}"`);
+  try {
+    const { semanticSearch } = await import("../rag/retrieval/ragService.js");
+    const matches = await semanticSearch(transcript);
+    
+    // Filter matches with similarity score > 0.3
+    const relevant = matches.filter((m) => m.score > 0.3);
+    if (relevant.length > 0) {
+      const contextStr = relevant.map((m) => `- ${m.text}`).join("\n");
+      console.log(`[RAG] Found matching memories:`, contextStr);
+      return { transcript, context: contextStr };
+    } else {
+      console.log(`[RAG] No matching memories found above threshold`);
+    }
+  } catch (err) {
+    console.error("[RAG] Failed to search memories:", err);
+  }
+
+  return { transcript, context: "" };
+}
+
 async function startPushToTalk() {
   if (pttActive || pttStarting) return;
   pttStarting = true;
+  currentSpeechTranscript = ""; // Clear old transcript
+  latestAssistantResponseText = ""; // Clear old response
+
+  // Start speech recognition
+  initSpeechRecognition();
+  if (recognition) {
+    try {
+      recognition.start();
+      console.log("[SpeechRecognition] Started capturing...");
+    } catch (e) {
+      console.warn("[SpeechRecognition] Start error (already running?):", e);
+    }
+  }
+
   try {
     if (!audioEnabled) await onEnableAudio();
     await ensureConversationConnected();
@@ -2510,6 +2624,9 @@ async function startPushToTalk() {
     });
     if (!pttPressed) {
       // Pointer was released while async setup was in-flight.
+      if (recognition) {
+        try { recognition.stop(); } catch (e) {}
+      }
       sendConversationMessage({ type: "ptt_end" });
       return;
     }
@@ -2528,34 +2645,66 @@ async function startPushToTalk() {
   }
 }
 
-function stopPushToTalk({ forceSend = false } = {}) {
+async function stopPushToTalk({ forceSend = false } = {}) {
   if (!pttActive) {
     if (forceSend && conversationConnected) {
-      sendConversationMessage({ type: "ptt_end" });
       if (assistantLifecycleState === "listening") {
         assistantLifecycleState = "thinking";
         updateConversationHud();
+      }
+      const { transcript, context } = await getFinalTranscriptAndSearch();
+      latestUserTranscript = transcript;
+      sendConversationMessage({ type: "ptt_end", context, transcript });
+      
+      // Save transcript to local memory if it is a statement or fact (>= 3 words)
+      if (transcript && transcript.split(" ").length >= 3) {
+        try {
+          const { addMemory } = await import("../rag/retrieval/ragService.js");
+          await addMemory(transcript);
+        } catch (err) {
+          console.error("[RAG] Failed to save memory:", err);
+        }
       }
     }
     if (pttButton) pttButton.classList.remove("active");
     return;
   }
   pttActive = false;
-  sendConversationMessage({ type: "ptt_end" });
+  if (pttButton) pttButton.classList.remove("active");
+
   if (assistantLifecycleState === "listening") {
     assistantLifecycleState = "thinking";
     updateConversationHud();
   }
-  if (pttButton) pttButton.classList.remove("active");
+
+  const { transcript, context } = await getFinalTranscriptAndSearch();
+  latestUserTranscript = transcript;
+  sendConversationMessage({ type: "ptt_end", context, transcript });
+
+  // Save transcript to local memory if it is a statement or fact (>= 3 words)
+  if (transcript && transcript.split(" ").length >= 3) {
+    try {
+      const { addMemory } = await import("../rag/retrieval/ragService.js");
+      await addMemory(transcript);
+    } catch (err) {
+      console.error("[RAG] Failed to save memory:", err);
+    }
+  }
 }
 
 function onInterruptReply() {
+  if (recognition) {
+    try { recognition.stop(); } catch (e) {}
+  }
   sendConversationMessage({ type: "interrupt" });
   beginSessionRecovery("manual_interrupt");
 }
 
 function onDisconnectMic() {
   pttPressed = false;
+  if (recognition) {
+    try { recognition.stop(); } catch (e) {}
+  }
   stopPushToTalk({ forceSend: true });
   sendConversationMessage({ type: "interrupt" });
   teardownMicCapture();

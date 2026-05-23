@@ -426,15 +426,19 @@ class GeminiLiveAudioEngine:
                                 model_turn = getattr(server_content, "model_turn", None)
                                 if model_turn is not None:
                                     for part in getattr(model_turn, "parts", None) or []:
+                                        # Yield text parts if present
+                                        text_val = getattr(part, "text", None)
+                                        if text_val:
+                                            yield text_val, 0
+
                                         inline_data = getattr(part, "inline_data", None)
-                                        if inline_data is None:
-                                            continue
-                                        mime = getattr(inline_data, "mime_type", "") or ""
-                                        if not mime.startswith("audio/pcm"):
-                                            continue
-                                        data = getattr(inline_data, "data", None)
-                                        if isinstance(data, (bytes, bytearray)) and data:
-                                            yield bytes(data), self._parse_pcm_rate(mime)
+                                        if inline_data is not None:
+                                            mime = getattr(inline_data, "mime_type", "") or ""
+                                            if not mime.startswith("audio/pcm"):
+                                                continue
+                                            data = getattr(inline_data, "data", None)
+                                            if isinstance(data, (bytes, bytearray)) and data:
+                                                yield bytes(data), self._parse_pcm_rate(mime)
 
                             if self._is_turn_complete_response(response):
                                 logger.debug(

@@ -389,7 +389,7 @@ async def ws_conversation(websocket: WebSocket):
             elif mtype == "user_audio":
                 await runtime.handle_user_audio(msg)
             elif mtype == "ptt_end":
-                await runtime.handle_ptt_end()
+                await runtime.handle_ptt_end(msg)
             elif mtype == "interrupt":
                 await runtime.interrupt(reason="interrupt")
             elif mtype == "ping":

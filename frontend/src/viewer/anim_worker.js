@@ -610,7 +610,8 @@ function onTick(elapsed) {
 
 function connectAnim() {
   const host = wsHost || (self.location ? self.location.host : "127.0.0.1:8000");
-  ws = new WebSocket(`ws://${host}/ws/anim`);
+  const wsProtocol = self.location && self.location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${wsProtocol}://${host}/ws/anim`);
   ws.binaryType = "arraybuffer";
   let header = null;
   ws.onopen = () => {

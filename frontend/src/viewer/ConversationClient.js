@@ -48,7 +48,8 @@ export class ConversationClient {
   /** Open /ws/conversation if not already open. */
   connectConversation() {
     if (this._ws) return;
-    this._ws = new WebSocket(`ws://${this._wsHost}/ws/conversation`);
+    const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+    this._ws = new WebSocket(`${wsProtocol}://${this._wsHost}/ws/conversation`);
 
     this._ws.onopen = () => {
       this.connected = true;
@@ -84,7 +85,8 @@ export class ConversationClient {
   /** Open /ws/audio_out if not already open. */
   connectAudioOut() {
     if (this._audioWs) return;
-    this._audioWs = new WebSocket(`ws://${this._wsHost}/ws/audio_out`);
+    const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+    this._audioWs = new WebSocket(`${wsProtocol}://${this._wsHost}/ws/audio_out`);
     this._audioWs.binaryType = "arraybuffer";
 
     this._audioWs.onopen = () => {

@@ -1,0 +1,25 @@
+[Unit]
+Description=NPZ Generator Admin & RAG Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/var/www/npz-generator
+Restart=always
+RestartSec=5
+
+# Sourcing variables from env configurations
+EnvironmentFile=/var/www/npz-generator/server/.env.local
+Environment=PYTHONUNBUFFERED=1
+
+# Execute uvicorn mapping the Admin FastAPI app
+ExecStart=/var/www/npz-generator/venv/bin/python -m uvicorn admin_server.main:app --host 127.0.0.1 --port 8001
+
+# Logging management
+StandardOutput=append:/var/log/npz-admin.log
+StandardError=append:/var/log/npz-admin.log
+
+[Install]
+WantedBy=multi-user.target

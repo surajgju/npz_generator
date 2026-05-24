@@ -377,7 +377,7 @@ async def ws_conversation(websocket: WebSocket):
         server_clock_id=SERVER_CLOCK_ID,
         server_time_fn=_server_time_ms,
         conversation_protocol_version=CONVERSATION_PROTOCOL_VERSION,
-        create_audio_session_fn=lambda c, r: _create_audio_session(c, r, client_id),
+        create_audio_session_fn=lambda conversation_id=None, reply_id=None: _create_audio_session(conversation_id, reply_id, client_id),
         servingid=servingid
     )
     logger.info("Conversation WS connected: %s conversation=%s client_id=%s sid=%s", websocket.client, conversation_id, client_id, servingid)

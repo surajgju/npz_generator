@@ -344,7 +344,7 @@ class BroadcastLoopRegressionTests(unittest.IsolatedAsyncioTestCase):
         audio_pipeline.anim_queue = asyncio.Queue()
         async with session_state.sessions_lock:
             session_state.sessions.clear()
-            session_state.active_session_id = None
+            session_state.active_session_ids.clear()
         session_state.anim_clients.clear()
         session_state.anim_client_protocol.clear()
         session_state.anim_client_session.clear()
@@ -354,7 +354,7 @@ class BroadcastLoopRegressionTests(unittest.IsolatedAsyncioTestCase):
         audio_pipeline.anim_queue = self._original_anim_queue
         async with session_state.sessions_lock:
             session_state.sessions.clear()
-            session_state.active_session_id = None
+            session_state.active_session_ids.clear()
         session_state.anim_clients.clear()
         session_state.anim_client_protocol.clear()
         session_state.anim_client_session.clear()
@@ -373,15 +373,17 @@ class BroadcastLoopRegressionTests(unittest.IsolatedAsyncioTestCase):
                 session_id="session-a",
                 created_ms=0,
                 last_activity_ms=0,
+                client_id="test-client",
             )
             session_state.sessions["session-b"] = SessionState(
                 session_id="session-b",
                 created_ms=0,
                 last_activity_ms=0,
+                client_id="test-client",
             )
-            session_state.active_session_id = "session-b"
+            session_state.active_session_ids["test-client"] = "session-b"
 
-        session_state.anim_clients.add(ws)
+        session_state.anim_clients["test-client"].add(ws)
         session_state.anim_client_protocol[ws] = 2
         session_state.anim_client_session[ws] = "session-b"
 

@@ -504,7 +504,12 @@ async def broadcast_audio_control(
     server_clock_id: str,
     server_time_fn,
 ) -> None:
-    if not audio_clients:
+    async with sessions_lock:
+        st = sessions.get(stream_session_id)
+        client_id = st.client_id if st else None
+    
+    target_clients = list(audio_clients.get(client_id, set())) if client_id else []
+    if not target_clients:
         return
     header = {
         "type": "audio_control",
@@ -517,13 +522,14 @@ async def broadcast_audio_control(
         "server_clock_id": server_clock_id,
     }
     dead: List[WebSocket] = []
-    for ws in list(audio_clients):
+    for ws in target_clients:
         try:
             await ws.send_text(json.dumps(header))
         except Exception:
             dead.append(ws)
     for ws in dead:
-        audio_clients.discard(ws)
+        if client_id and ws in audio_clients.get(client_id, set()):
+            audio_clients[client_id].discard(ws)
 
 
 async def ingest_audio_chunk(
@@ -566,11 +572,13 @@ async def ingest_audio_chunk(
         if reply_id:
             st.reply_id = reply_id
         audio_cursor = st.latest_audio_cursor
+        client_id = st.client_id
 
     audio_int16 = np.clip(audio_np * 32768.0, -32768, 32767).astype(np.int16)
     audio_bytes = audio_int16.tobytes()
 
-    if audio_clients:
+    target_clients = list(audio_clients.get(client_id, set())) if client_id else []
+    if target_clients:
         header = {
             "type": "audio",
             "stream_session_id": stream_session_id,
@@ -589,17 +597,18 @@ async def ingest_audio_chunk(
             "server_clock_id": server_clock_id,
         }
         dead: List[WebSocket] = []
-        for ws in list(audio_clients):
+        for ws in target_clients:
             try:
                 await ws.send_text(json.dumps(header))
                 await ws.send_bytes(audio_bytes)
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            audio_clients.discard(ws)
+            if client_id and ws in audio_clients.get(client_id, set()):
+                audio_clients[client_id].discard(ws)
         logger.info(
             "Audio broadcast stream=%s chunk_id=%s samples=%d clients=%d source=%s",
-            stream_session_id, chunk_id, sample_count, len(audio_clients), source,
+            stream_session_id, chunk_id, sample_count, len(target_clients), source,
         )
 
     enqueue_monotonic_ns = time.monotonic_ns()
@@ -686,14 +695,16 @@ async def broadcast_anim_loop(server_clock_id: str, server_time_fn) -> None:
                     morphs=morphs,
                 )
             )
-            active_sid = session_state.active_session_id
+            client_id = st.client_id
+            active_sid = session_state.active_session_ids.get(client_id) if client_id else None
 
         if session_id != active_sid:
             continue
 
         payload = _payload_bytes(root_pos, bone_quats, morphs)
         dead: List[WebSocket] = []
-        for ws in list(anim_clients):
+        target_clients = list(anim_clients.get(client_id, set())) if client_id else []
+        for ws in target_clients:
             try:
                 header = {
                     "type": "anim",
@@ -716,7 +727,8 @@ async def broadcast_anim_loop(server_clock_id: str, server_time_fn) -> None:
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            anim_clients.discard(ws)
+            if client_id and ws in anim_clients.get(client_id, set()):
+                anim_clients[client_id].discard(ws)
             anim_client_protocol.pop(ws, None)
             sid = anim_client_session.pop(ws, None)
             if sid is None:

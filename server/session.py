@@ -10,9 +10,9 @@ import logging
 import math
 import os
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple, Set
 import sys
 import numpy as np
 from fastapi import WebSocket
@@ -63,6 +63,7 @@ class SessionState:
     generation_epoch: int = 0
     conversation_id: Optional[str] = None
     reply_id: Optional[str] = None
+    client_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -71,13 +72,13 @@ class SessionState:
 
 sessions_lock: asyncio.Lock = asyncio.Lock()
 sessions: Dict[str, SessionState] = {}
-active_session_id: Optional[str] = None
+active_session_ids: Dict[str, str] = {}
 
 # Anim client tracking lives here because session GC needs it.
-anim_clients: "set[WebSocket]" = set()
+anim_clients: Dict[str, Set[WebSocket]] = defaultdict(set)
 anim_client_protocol: Dict[WebSocket, int] = {}
 anim_client_session: Dict[WebSocket, Optional[str]] = {}
-audio_clients: "set[WebSocket]" = set()
+audio_clients: Dict[str, Set[WebSocket]] = defaultdict(set)
 logger = logging.getLogger(__name__)
 
 
@@ -113,18 +114,20 @@ async def create_audio_session(
     server_time_fn,
     conversation_id: Optional[str] = None,
     reply_id: Optional[str] = None,
+    client_id: Optional[str] = None,
 ) -> str:
-    global active_session_id
+    global active_session_ids
     now_ms = server_time_fn()
     sid = str(uuid.uuid4())
     protocol2_ws: List[WebSocket] = []
     async with sessions_lock:
-        if active_session_id and active_session_id in sessions:
-            prev = sessions[active_session_id]
+        active_id = active_session_ids.get(client_id) if client_id else None
+        if active_id and active_id in sessions:
+            prev = sessions[active_id]
             prev.deprecated_at_ms = now_ms
             prev.producer_connected = False
             prev.anim_subscriber_count = 0
-        for ws in list(anim_clients):
+        for ws in list(anim_clients.get(client_id, set()) if client_id else []):
             if anim_client_protocol.get(ws, 1) >= 2:
                 protocol2_ws.append(ws)
                 anim_client_session[ws] = sid
@@ -139,8 +142,10 @@ async def create_audio_session(
             generation_epoch=0,
             conversation_id=conversation_id,
             reply_id=reply_id,
+            client_id=client_id,
         )
-        active_session_id = sid
+        if client_id:
+            active_session_ids[client_id] = sid
     drained_anim = _drain_queue_nowait(anim_queue)
     drained_audio = _drain_queue_nowait(audio_in_queue)
     logger.info(
@@ -166,7 +171,8 @@ async def create_audio_session(
         if dead:
             async with sessions_lock:
                 for ws in dead:
-                    anim_clients.discard(ws)
+                    if client_id and ws in anim_clients.get(client_id, set()):
+                        anim_clients[client_id].discard(ws)
                     anim_client_protocol.pop(ws, None)
                     old_sid = anim_client_session.pop(ws, None)
                     if old_sid and old_sid in sessions:
@@ -201,13 +207,14 @@ async def session_snapshot(
             generation_epoch=st.generation_epoch,
             conversation_id=st.conversation_id,
             reply_id=st.reply_id,
+            client_id=st.client_id,
         )
         return snap, frames
 
 
 async def session_gc_loop(server_time_fn) -> None:
     """Periodically evict idle / deprecated sessions."""
-    global active_session_id
+    global active_session_ids
     import logging
     logger = logging.getLogger(__name__)
     while True:
@@ -250,12 +257,13 @@ async def session_gc_loop(server_time_fn) -> None:
                 removable.extend(st.session_id for st in candidates[:overflow])
             for sid in removable:
                 if sid in sessions:
+                    st = sessions[sid]
+                    if st.client_id and active_session_ids.get(st.client_id) == sid:
+                        del active_session_ids[st.client_id]
                     del sessions[sid]
-                    if sid == active_session_id:
-                        active_session_id = None
             if removable:
                 logger.info(
-                    "Session GC evicted=%s active=%s", removable, active_session_id
+                    "Session GC evicted=%s active=%s", removable, list(active_session_ids.keys())
                 )
 
             total_mem = 0

@@ -65,7 +65,7 @@ Our streaming architecture allows you to live-stream audio to a server and get b
 ### 1. Start the Live Server
 ```bash
 # Set base FPS via environment variable
-STREAM_FPS=20 python3 -m uvicorn server.app:app --reload --port 8000
+STREAM_FPS=20 ./venv/bin/python3 -m uvicorn server.app:app --reload --port 8000
 ```
 
 For browser Push-to-Talk conversation, set:
@@ -78,8 +78,8 @@ The Three.js viewer will be live at: `http://localhost:5173/`. Ensure the FastAP
 ### 3. Stream Audio (Example Simulator)
 Use our utility script to simulate a live audio stream from a file:
 ```bash
-python3 scripts/stream_audio_to_ws.py --audio ./input/romantic_narration.mp3 --chunk 0.5
-python3 scripts/stream_audio_to_ws.py --audio ./input/swara_2.mp3 --chunk 0.5
+./venv/bin/python3 scripts/stream_audio_to_ws.py --audio ./input/romantic_narration.mp3 --chunk 0.5
+./venv/bin/python3 scripts/stream_audio_to_ws.py --audio ./input/swara_2.mp3 --chunk 0.5
 ```
 
 ### 4. Protocol v2 Reconnect Flow (Implemented)

@@ -1,10 +1,24 @@
 # 🕺 NPZ Generator & Real-Time SMPL-X Streaming Pipeline
 
+[![Raxon Labs](https://img.shields.io/badge/Developed%20By-Raxon%20Labs-FF5722?style=for-the-badge&logo=rocket&logoColor=white)](https://raxlabs.com)
 [![Gemini Ready](https://img.shields.io/badge/Gemini-Live%20Ready-blue?style=for-the-badge&logo=google-gemini&logoColor=white)](https://ai.google.dev/)
 [![React](https://img.shields.io/badge/Frontend-React%20%2B%20Three.js-61DAFB?style=for-the-badge&logo=react&logoColor=white)](https://reactjs.org/)
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 
 An end-to-end pipeline for generating expressive SMPL-X motion from audio. This repository supports high-fidelity **offline NPZ generation**, **MP4 rendering**, and a **real-time WebSocket pipeline** for 3D avatar streaming (Gemini Live ready).
+
+---
+
+## 🚀 Built by Raxon Labs
+
+This project is open-sourced and maintained by [Raxon Labs](https://raxlabs.com) (or visit us at [raxonlabs.com](https://raxonlabs.com)). 
+
+At Raxon Labs, we build production-grade, state-of-the-art AI systems, including:
+- **Interactive Multi-Modal Agents**: Low-latency voice, vision, and animation agents.
+- **Custom Generative AI Pipelines**: Real-time motion synthesis, expressions, and speech-to-avatar technologies.
+- **Enterprise-Grade AI Architectures**: Custom solutions tailored to scale your product.
+
+Need a custom AI streaming solution, virtual avatar integration, or bespoke AI agent development? **[Get in Touch with Our Team](https://raxlabs.com)**.
 
 ---
 
@@ -250,3 +264,9 @@ To apply changes, simply edit `server/.env.local` and restart the server.
 - **EMAGE**: Expressive Motion Generation from Audio via Latent Cross-Modal Transformer.
 - **SMPL-X**: A joint body, face, and hand model for human motion research.
 - **Three.js**: The rendering system for the real-time WebGL viewer.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. Developed with ❤️ by [Raxon Labs](https://raxlabs.com).

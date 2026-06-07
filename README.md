@@ -1,10 +1,24 @@
 # 🕺 NPZ Generator & Real-Time SMPL-X Streaming Pipeline
 
+[![Raxon Labs](https://img.shields.io/badge/Developed%20By-Raxon%20Labs-FF5722?style=for-the-badge&logo=rocket&logoColor=white)](https://raxlabs.com)
 [![Gemini Ready](https://img.shields.io/badge/Gemini-Live%20Ready-blue?style=for-the-badge&logo=google-gemini&logoColor=white)](https://ai.google.dev/)
 [![React](https://img.shields.io/badge/Frontend-React%20%2B%20Three.js-61DAFB?style=for-the-badge&logo=react&logoColor=white)](https://reactjs.org/)
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 
 An end-to-end pipeline for generating expressive SMPL-X motion from audio. This repository supports high-fidelity **offline NPZ generation**, **MP4 rendering**, and a **real-time WebSocket pipeline** for 3D avatar streaming (Gemini Live ready).
+
+---
+
+## 🚀 Built by Raxon Labs
+
+This project is open-sourced and maintained by [Raxon Labs](https://raxlabs.com) (or visit us at [raxonlabs.com](https://raxonlabs.com)). 
+
+At Raxon Labs, we build production-grade, state-of-the-art AI systems, including:
+- **Interactive Multi-Modal Agents**: Low-latency voice, vision, and animation agents.
+- **Custom Generative AI Pipelines**: Real-time motion synthesis, expressions, and speech-to-avatar technologies.
+- **Enterprise-Grade AI Architectures**: Custom solutions tailored to scale your product.
+
+Need a custom AI streaming solution, virtual avatar integration, or bespoke AI agent development? **[Get in Touch with Our Team](https://raxlabs.com)**.
 
 ---
 
@@ -65,7 +79,7 @@ Our streaming architecture allows you to live-stream audio to a server and get b
 ### 1. Start the Live Server
 ```bash
 # Set base FPS via environment variable
-STREAM_FPS=20 python3 -m uvicorn server.app:app --reload --port 8000
+STREAM_FPS=20 ./venv/bin/python3 -m uvicorn server.app:app --reload --port 8000
 ```
 
 For browser Push-to-Talk conversation, set:
@@ -78,8 +92,8 @@ The Three.js viewer will be live at: `http://localhost:5173/`. Ensure the FastAP
 ### 3. Stream Audio (Example Simulator)
 Use our utility script to simulate a live audio stream from a file:
 ```bash
-python3 scripts/stream_audio_to_ws.py --audio ./input/romantic_narration.mp3 --chunk 0.5
-python3 scripts/stream_audio_to_ws.py --audio ./input/swara_2.mp3 --chunk 0.5
+./venv/bin/python3 scripts/stream_audio_to_ws.py --audio ./input/romantic_narration.mp3 --chunk 0.5
+./venv/bin/python3 scripts/stream_audio_to_ws.py --audio ./input/swara_2.mp3 --chunk 0.5
 ```
 
 ### 4. Protocol v2 Reconnect Flow (Implemented)
@@ -168,6 +182,26 @@ flowchart TD
 | `emage_utils/` | Core EMAGE model implementation and VQ-VAE utils. |
 | `scripts/` | Export utilities and audio streaming simulators. |
 | `models/` | SMPL-X and EMAGE model weight storage path. |
+| `admin_server/` | **Admin & RAG Backend**: Multi-tenant config, web crawling, and RAG pipeline. |
+
+---
+
+## 🛠️ Command Runner (Quick Reference)
+
+Use these commands to manage the various components of the pipeline. Most commands assume you are using the provided virtual environment (`./venv`).
+
+| Action | Command |
+| :--- | :--- |
+| **Install Dependencies** | `./venv/bin/python -m pip install -r requirements.txt` |
+| **Start WebSocket Server** | `./venv/bin/python -m uvicorn server.app:app --reload --port 8000` |
+| **Start Admin & RAG Server** | `./venv/bin/python -m uvicorn admin_server.main:app --reload --port 8001` |
+| **Generate Motion (Offline)** | `./venv/bin/python generate_npz.py` |
+| **Streamlit Viewer** | `./venv/bin/python -m streamlit run visualize_web.py` |
+| **Render MP4** | `./venv/bin/python render.py` |
+| **Stream Audio (Simulator)** | `./venv/bin/python scripts/stream_audio_to_ws.py --audio input/viseme.mp3 --chunk 0.5` |
+| **Export Faces (One-Time)** | `./venv/bin/python scripts/export_faces.py` |
+
+---
 
 ---
 
@@ -230,3 +264,9 @@ To apply changes, simply edit `server/.env.local` and restart the server.
 - **EMAGE**: Expressive Motion Generation from Audio via Latent Cross-Modal Transformer.
 - **SMPL-X**: A joint body, face, and hand model for human motion research.
 - **Three.js**: The rendering system for the real-time WebGL viewer.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. Developed with ❤️ by [Raxon Labs](https://raxlabs.com).

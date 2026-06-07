@@ -267,6 +267,7 @@ async def _shutdown():
 async def _create_audio_session(
     conversation_id: Optional[str] = None,
     reply_id: Optional[str] = None,
+    client_id: Optional[str] = None,
 ) -> str:
     session_id = await create_audio_session(
         server_boot_id=SERVER_BOOT_ID,
@@ -275,6 +276,7 @@ async def _create_audio_session(
         server_time_fn=_server_time_ms,
         conversation_id=conversation_id,
         reply_id=reply_id,
+        client_id=client_id,
     )
     await reset_inference_service_session(
         getattr(app.state, "inference_service", None),
@@ -345,19 +347,27 @@ async def ws_audio(websocket: WebSocket):
 
 @app.websocket("/ws/audio_out")
 async def ws_audio_out(websocket: WebSocket):
+    client_id = websocket.query_params.get("client_id")
     await websocket.accept()
-    audio_clients.add(websocket)
-    logger.info("Audio OUT WS connected: %s (clients=%d)", websocket.client, len(audio_clients))
+    if client_id:
+        audio_clients[client_id].add(websocket)
+    logger.info("Audio OUT WS connected: %s client=%s", websocket.client, client_id)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        audio_clients.discard(websocket)
-        logger.info("Audio OUT WS disconnected: %s (clients=%d)", websocket.client, len(audio_clients))
+        if client_id and websocket in audio_clients.get(client_id, set()):
+            audio_clients[client_id].discard(websocket)
+            if not audio_clients[client_id]:
+                del audio_clients[client_id]
+        logger.info("Audio OUT WS disconnected: %s client=%s", websocket.client, client_id)
 
 
 @app.websocket("/ws/conversation")
 async def ws_conversation(websocket: WebSocket):
+    # Extract sid from query params (e.g., /ws/conversation?sid=dev)
+    servingid = websocket.query_params.get("sid", "dev")
+    client_id = websocket.query_params.get("client_id")
     await websocket.accept()
     conversation_id = str(uuid.uuid4())
     runtime = ConversationRuntime(
@@ -367,9 +377,10 @@ async def ws_conversation(websocket: WebSocket):
         server_clock_id=SERVER_CLOCK_ID,
         server_time_fn=_server_time_ms,
         conversation_protocol_version=CONVERSATION_PROTOCOL_VERSION,
-        create_audio_session_fn=_create_audio_session,
+        create_audio_session_fn=lambda conversation_id=None, reply_id=None: _create_audio_session(conversation_id, reply_id, client_id),
+        servingid=servingid
     )
-    logger.info("Conversation WS connected: %s conversation=%s", websocket.client, conversation_id)
+    logger.info("Conversation WS connected: %s conversation=%s client_id=%s sid=%s", websocket.client, conversation_id, client_id, servingid)
     # await runtime.send_hello_ack() # Removed redundant call: loop handles "hello" message.
     try:
         while True:
@@ -386,7 +397,7 @@ async def ws_conversation(websocket: WebSocket):
             elif mtype == "user_audio":
                 await runtime.handle_user_audio(msg)
             elif mtype == "ptt_end":
-                await runtime.handle_ptt_end()
+                await runtime.handle_ptt_end(msg)
             elif mtype == "interrupt":
                 await runtime.interrupt(reason="interrupt")
             elif mtype == "ping":
@@ -402,8 +413,9 @@ async def ws_conversation(websocket: WebSocket):
 
 @app.websocket("/ws/anim")
 async def ws_anim(websocket: WebSocket):
+    client_id = websocket.query_params.get("client_id")
     await websocket.accept()
-    logger.info("Anim WS connected: %s", websocket.client)
+    logger.info("Anim WS connected: %s client_id=%s", websocket.client, client_id)
     protocol = 1
     subscribed_session: Optional[str] = None
     try:
@@ -432,7 +444,7 @@ async def ws_anim(websocket: WebSocket):
                 or subscribe_msg.get("known_session_id")
             )
             async with sessions_lock:
-                active_sid = session_state.active_session_id
+                active_sid = session_state.active_session_ids.get(client_id) if client_id else None
 
             if known_boot_id and known_boot_id != SERVER_BOOT_ID:
                 mode = "reset_required"
@@ -474,7 +486,8 @@ async def ws_anim(websocket: WebSocket):
             protocol = 1
             await websocket.send_text(json.dumps(retargeter.anim_init_header(STREAM_FPS)))
 
-        anim_clients.add(websocket)
+        if client_id:
+            anim_clients[client_id].add(websocket)
         anim_client_protocol[websocket] = protocol
         anim_client_session[websocket] = subscribed_session
         if subscribed_session:
@@ -495,7 +508,7 @@ async def ws_anim(websocket: WebSocket):
             if msg.get("type") == "resync_request":
                 req_session = _resolve_stream_session_id(msg)
                 async with sessions_lock:
-                    active_sid = session_state.active_session_id
+                    active_sid = session_state.active_session_ids.get(client_id) if client_id else None
                 if active_sid and req_session == active_sid:
                     logger.info(
                         "Resync request accepted session=%s reason=%s",
@@ -509,7 +522,10 @@ async def ws_anim(websocket: WebSocket):
                     )
 
     except WebSocketDisconnect:
-        anim_clients.discard(websocket)
+        if client_id and websocket in anim_clients.get(client_id, set()):
+            anim_clients[client_id].discard(websocket)
+            if not anim_clients[client_id]:
+                del anim_clients[client_id]
         anim_client_protocol.pop(websocket, None)
         sid = anim_client_session.pop(websocket, None)
         if sid:

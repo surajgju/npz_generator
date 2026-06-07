@@ -1,0 +1,26 @@
+[Unit]
+Description=NPZ Generator & Real-Time Avatar Streaming Core Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/var/www/npz-generator
+Restart=always
+RestartSec=5
+
+# Load all environment variables (including GEMINI_API_KEY) from the central config file
+EnvironmentFile=/var/www/npz-generator/server/.env.local
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTORCH_ENABLE_MPS_FALLBACK=1
+
+# Execute uvicorn using the virtual environment's Python interpreter
+ExecStart=/var/www/npz-generator/venv/bin/python -m uvicorn server.app:app --host 127.0.0.1 --port 8000
+
+# Logging management
+StandardOutput=append:/var/log/npz-backend.log
+StandardError=append:/var/log/npz-backend.log
+
+[Install]
+WantedBy=multi-user.target

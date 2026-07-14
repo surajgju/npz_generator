@@ -123,8 +123,7 @@ python3 scripts/stream_audio_to_ws.py --audio ./input/swara_2.mp3 --chunk 0.5
 
 ## 🧠 System Architecture
 
-```mermaid
-flowchart TD
+```flowchart TD
     subgraph AudioSource ["Audio Ingestion (Real-Time)"]
         A[Gemini Live API Bridge]
         B[Simulated WAV Streamer]

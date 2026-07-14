@@ -1,4 +1,4 @@
-# 🕺 NPZ Generator & Real-Time SMPL-X Streaming Pipeline
+# 🕺 This is a tool that converts audio into realistic 3D body movements
 
 [![Gemini Ready](https://img.shields.io/badge/Gemini-Live%20Ready-blue?style=for-the-badge&logo=google-gemini&logoColor=white)](https://ai.google.dev/)
 [![React](https://img.shields.io/badge/Frontend-React%20%2B%20Three.js-61DAFB?style=for-the-badge&logo=react&logoColor=white)](https://reactjs.org/)
